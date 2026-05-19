@@ -1,0 +1,1761 @@
+//! `SupertableWriter` — the single-writer append + commit path.
+//!
+//! **Naming convention.** `SupertableWriter` is a long-lived
+//! append handle — `append×N → commit`, repeated across many
+//! commits over its lifetime. Contrast
+//! [`crate::superfile::SuperfileBuilder`], which is a single-shot
+//! factory consuming `self` to produce one immutable artifact.
+//! Each `commit` here internally spawns many superfile builders,
+//! one per shard.
+//!
+//! Acquired via [`Supertable::writer`](super::Supertable::writer);
+//! at most one writer is outstanding per supertable at a time
+//! (enforced by the inner state's `writer_outstanding` flag, with
+//! release on `Drop`). Holds an in-memory buffer of
+//! `(scalar_batch, vectors_per_column)` payloads that
+//! [`SupertableWriter::commit`] partitions across the writer
+//! pool's rayon workers — each worker constructs its own
+//! [`SuperfileBuilder`], feeds its slice, and emits one
+//! self-contained superfile. All resulting superfiles are published
+//! in a single `ArcSwap` of the manifest at the end.
+//!
+//! ## Flow
+//!
+//! - `append(batch)` runs schema + null validation via
+//!   `vector_split`, pushes a `BufferedBatch` onto the writer's
+//!   buffer, and triggers an internal `commit()` if the running
+//!   buffer-byte estimate crosses the configured threshold.
+//! - `commit()` drains the buffer, partitions across the writer
+//!   pool, runs each shard build in parallel, and publishes all
+//!   shards as new superfiles in one manifest swap. Idempotent on
+//!   an empty buffer (no-op return Ok). The writer slot is
+//!   released on `Drop`; callers don't need a separate `finish()`
+//!   call.
+//!
+//! ## Buffer ownership
+//!
+//! Vectors arrive from the input `RecordBatch` as
+//! `FixedSizeListArray` columns; `vector_split` views them as
+//! `&[f32]` slices. To keep the buffer ownership clean across
+//! `append` calls (each input batch can be dropped by the caller
+//! once `append` returns), we Arc-clone the underlying
+//! `Float32Array` payloads into the buffer. At commit time we
+//! re-derive `&[f32]` slices from the Arc'd arrays for the
+//! per-shard `SuperfileBuilder::add_batch` call. No bytes copied;
+//! just Arc reference counts.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch,
+};
+use bytes::Bytes;
+use rayon::prelude::*;
+
+use crate::superfile::builder::SuperfileBuilder;
+
+use super::error::BuildError;
+use super::handle::{Supertable, SupertableInner};
+use super::manifest::bloom::BloomBuilder;
+use super::manifest::{FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary};
+use super::options::SupertableOptions;
+use super::utils::vector_split::split_vectors;
+
+/// Single-writer append + commit handle.
+///
+/// At most one outstanding per supertable. Acquire via
+/// [`Supertable::writer`]; uncommitted buffer data is **lost on
+/// drop** (no implicit flush) — callers must invoke `commit()`
+/// to publish.
+pub struct SupertableWriter {
+    inner: Arc<SupertableInner>,
+    /// Accumulated input from append() calls. The writer (not the
+    /// SuperfileBuilder) owns the buffer so commit() can rayon-
+    /// shard it across workers, each running its own builder.
+    buffer: Vec<BufferedBatch>,
+    /// Estimated byte cost of `buffer` so append() can auto-flush
+    /// when the buffer crosses the configured threshold.
+    buffer_bytes: usize,
+}
+
+impl std::fmt::Debug for SupertableWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupertableWriter")
+            .field("buffered_batches", &self.buffer.len())
+            .field("buffered_bytes", &self.buffer_bytes)
+            .field("manifest_id", &self.inner.manifest.load().manifest_id)
+            .finish()
+    }
+}
+
+/// One buffered append-call payload. Vectors stored as
+/// `Arc<Float32Array>` so the buffer owns its data outright;
+/// per-shard builders re-derive `&[f32]` slices via
+/// [`Float32Array::values`] without copying.
+struct BufferedBatch {
+    scalar: RecordBatch,
+    vectors: Vec<Arc<Float32Array>>,
+}
+
+/// Row-balanced split of the writer's buffered batches into
+/// `n_shards` shard inputs, each shaped as a `Vec<BufferedBatch>`
+/// that [`build_one_shard`] can consume directly. The split walks
+/// rows across the original buffer in order and emits zero-copy
+/// Arrow slices (`RecordBatch::slice` + `Float32Array::slice` —
+/// adjust buffer offsets only; underlying memory stays Arc-counted),
+/// so no payload bytes are copied even when a shard boundary falls
+/// in the middle of a `BufferedBatch`.
+///
+/// Row imbalance across shards is ≤ 1: with `total_rows = q·n + r`,
+/// the first `r` shards get `q+1` rows and the rest get `q`.
+///
+/// Trailing empty shards (only possible when `total_rows < n_shards`)
+/// are dropped before return; callers see exactly the shards that
+/// will produce a non-empty segment.
+fn split_buffer_into_row_shards(
+    buffer: Vec<BufferedBatch>,
+    n_shards: usize,
+    vector_dims: &[usize],
+) -> Vec<Vec<BufferedBatch>> {
+    debug_assert!(n_shards > 0);
+    let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
+    if total_rows == 0 {
+        return Vec::new();
+    }
+    let base = total_rows / n_shards;
+    let remainder = total_rows % n_shards;
+    let target = |i: usize| if i < remainder { base + 1 } else { base };
+
+    let mut shards: Vec<Vec<BufferedBatch>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut shard_idx = 0usize;
+    let mut shard_remaining = target(0);
+
+    for batch in buffer {
+        let n_rows = batch.scalar.num_rows();
+        if n_rows == 0 {
+            continue;
+        }
+        let mut row_cursor = 0;
+        while row_cursor < n_rows {
+            // Skip ahead over any zero-target shards (only happens
+            // when total_rows < n_shards, leaving trailing shards
+            // with target == 0).
+            while shard_remaining == 0 && shard_idx + 1 < n_shards {
+                shard_idx += 1;
+                shard_remaining = target(shard_idx);
+            }
+            let take = std::cmp::min(shard_remaining, n_rows - row_cursor);
+            let scalar = batch.scalar.slice(row_cursor, take);
+            let vectors: Vec<Arc<Float32Array>> = batch
+                .vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let dim = vector_dims[i];
+                    Arc::new(v.slice(row_cursor * dim, take * dim))
+                })
+                .collect();
+            shards[shard_idx].push(BufferedBatch { scalar, vectors });
+            row_cursor += take;
+            shard_remaining -= take;
+        }
+    }
+    shards.retain(|s| !s.is_empty());
+    shards
+}
+
+impl Supertable {
+    /// Acquire the single writer for this supertable.
+    ///
+    /// Returns [`BuildError::SupertableInUse`] if another
+    /// `SupertableWriter` is already outstanding (drop it before
+    /// acquiring a new one). Each `Supertable` has exactly one
+    /// active writer slot at a time, enforced atomically; when
+    /// the writer is dropped, the slot is released and a
+    /// subsequent `writer()` call succeeds.
+    pub fn writer(&self) -> Result<SupertableWriter, BuildError> {
+        match self.inner().writer_outstanding.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(SupertableWriter {
+                inner: Arc::clone(self.inner()),
+                buffer: Vec::new(),
+                buffer_bytes: 0,
+            }),
+            Err(_) => Err(BuildError::SupertableInUse),
+        }
+    }
+}
+
+impl SupertableWriter {
+    /// Number of buffered batches not yet committed. Useful for
+    /// tests + diagnostics; not part of the production hot path.
+    pub fn buffered_batches(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Estimated bytes of buffered (un-committed) data.
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffer_bytes
+    }
+
+    /// Add one batch to the in-memory buffer. Triggers an
+    /// internal `commit()` if the running buffer-byte estimate
+    /// crosses the configured threshold (or returns immediately
+    /// if `commit_threshold_size_mb == 0`).
+    ///
+    /// The supplied batch's schema must match
+    /// [`SupertableOptions::user_schema`] — i.e., it must NOT
+    /// contain the id column. This method injects the id column
+    /// unconditionally; the buffered batch's schema therefore
+    /// matches [`SupertableOptions::scalar_schema`] with the
+    /// id column at position 0.
+    pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+        let options = &self.inner.options;
+
+        // Validate + split. Batch schema is user_schema (no id col).
+        let (scalar_no_id, _vector_slices) = split_vectors(batch, options)?;
+
+        // Re-derive owned Arc<Float32Array> handles for each
+        // vector column. We can't keep the &[f32] slices from
+        // split_vectors in the buffer (their lifetime is tied to
+        // `batch`, which the caller reclaims after this returns).
+        // The Arc<Float32Array> shares the same underlying buffer
+        // — no bytes copied.
+        let mut vectors = Vec::with_capacity(options.vector_columns.len());
+        for vc in &options.vector_columns {
+            let col_idx = batch
+                .schema()
+                .index_of(&vc.column)
+                .map_err(|_| BuildError::BatchSchemaMismatch)?;
+            let fsl = batch
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or(BuildError::BatchSchemaMismatch)?;
+            let values = fsl.values();
+            let f32_arr = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or(BuildError::BatchSchemaMismatch)?
+                .clone();
+            vectors.push(Arc::new(f32_arr));
+        }
+
+        // Mint one id per row and prepend the id column. Lock
+        // is uncontended in practice (writer-slot exclusivity
+        // serializes append per supertable handle); held only
+        // long enough to drain N ids into the Vec.
+        let n_rows = scalar_no_id.num_rows();
+        let mut ids: Vec<i128> = Vec::with_capacity(n_rows);
+        {
+            let generator = self
+                .inner
+                .id_generator
+                .lock()
+                .expect("id_generator mutex poisoned");
+            for _ in 0..n_rows {
+                ids.push(generator.next_id());
+            }
+        }
+        let id_array = Decimal128Array::from(ids)
+            .with_precision_and_scale(
+                crate::supertable::options::DECIMAL128_PRECISION,
+                crate::supertable::options::DECIMAL128_SCALE,
+            )
+            .expect(
+                "invariant: precision 38 + scale 0 always valid \
+                 for any i128 payload",
+            );
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
+        columns.push(Arc::new(id_array));
+        columns.extend(scalar_no_id.columns().iter().cloned());
+        let scalar = RecordBatch::try_new(options.scalar_schema(), columns)
+            .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
+        // Estimate byte cost: Arrow scalar columns + f32 vector
+        // payload. RecordBatch::get_array_memory_size accounts
+        // for buffer allocations (rough but good enough for
+        // threshold gating).
+        let bytes = scalar.get_array_memory_size()
+            + vectors
+                .iter()
+                .map(|v| v.len() * std::mem::size_of::<f32>())
+                .sum::<usize>();
+
+        self.buffer.push(BufferedBatch { scalar, vectors });
+        self.buffer_bytes += bytes;
+
+        // Auto-flush if over threshold.
+        let threshold = (options.commit_threshold_size_mb as usize)
+            .saturating_mul(1024)
+            .saturating_mul(1024);
+        if threshold > 0 && self.buffer_bytes >= threshold {
+            self.commit()?;
+        }
+
+        Ok(())
+    }
+
+    /// Drain the buffer, partition across the writer pool, and
+    /// publish all shard outputs as new superfiles in one manifest
+    /// swap. No-op (returns Ok) if the buffer is empty.
+    ///
+    /// Shard count = `min(writer_pool.threads, total_rows)`. Rows
+    /// are balanced evenly across shards regardless of the user's
+    /// `append()` cadence — a single 10M-row `append` followed by
+    /// `commit` on an 8-thread pool produces 8 shards of ~1.25M
+    /// rows each, the same as 8 separate `append` calls of 1.25M
+    /// rows each. This decouples ingest parallelism from the
+    /// caller's batching pattern.
+    pub fn commit(&mut self) -> Result<(), BuildError> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let buffer = std::mem::take(&mut self.buffer);
+        self.buffer_bytes = 0;
+
+        let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
+        if total_rows == 0 {
+            return Ok(());
+        }
+
+        let writer_pool = Arc::clone(&self.inner.options.writer_pool);
+        let n_threads = writer_pool.current_num_threads().max(1);
+        let n_shards = n_threads.min(total_rows);
+
+        let vector_dims: Vec<usize> = self
+            .inner
+            .options
+            .vector_columns
+            .iter()
+            .map(|vc| vc.dim)
+            .collect();
+        let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
+
+        let outputs: Vec<ShardOutput> = writer_pool.install(|| {
+            shards
+                .par_iter()
+                .map(|slice| build_one_shard(slice.as_slice(), &self.inner.options))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+
+        publish_superfiles(&self.inner, outputs)?;
+        Ok(())
+    }
+
+}
+
+impl Drop for SupertableWriter {
+    fn drop(&mut self) {
+        // Release the writer slot. Uncommitted buffer is
+        // intentionally lost — callers must invoke commit()
+        // explicitly to publish.
+        self.inner
+            .writer_outstanding
+            .store(false, Ordering::Release);
+    }
+}
+
+/// Output of one rayon shard worker.
+///
+/// FTS + vector summaries are derived in [`publish_superfiles`] from
+/// the cached `SuperfileReader` (cheaper than re-walking buffered
+/// batches). `scalar_stats` is computed here, before the buffer is
+/// dropped, since the post-store `SuperfileReader` only exposes
+/// parquet row groups — Arrow batch min/max would require a full
+/// re-decode through DataFusion or parquet-rs's stats reader.
+struct ShardOutput {
+    bytes: Bytes,
+    n_docs: u64,
+    /// `id_min` / `id_max`: only meaningful when `n_docs > 0`.
+    /// For a 0-doc shard (empty slice — shouldn't happen given
+    /// chunk sizing, but defensive), both are 0. Stored as
+    /// `i128` to carry the 128-bit Snowflake-shaped ids
+    /// produced by [`crate::supertable::utils::idgen::IdGenerator`].
+    id_min: i128,
+    id_max: i128,
+    /// Per-scalar-column min/max for skip pruning. Computed from
+    /// the shard's `BufferedBatch` slice via Arrow per-type
+    /// aggregate kernels; types whose ordering isn't well-defined
+    /// (FixedSizeList, struct, etc.) are absent and treated as
+    /// "can't prune" by the skip planner.
+    scalar_stats: ScalarStatsTable,
+}
+
+/// Build one segment from one slice of buffered batches. Runs on
+/// a rayon worker thread inside the writer pool's `install`.
+fn build_one_shard(
+    slice: &[BufferedBatch],
+    options: &SupertableOptions,
+) -> Result<ShardOutput, BuildError> {
+    let mut builder = SuperfileBuilder::new(options.builder_options())?;
+
+    let scalar_schema = options.scalar_schema();
+    // The supertable always prepends the id column at index 0
+    // via `SupertableOptions::scalar_schema`, so we can skip
+    // the schema lookup here.
+    let id_idx = 0;
+
+    let mut id_min = i128::MAX;
+    let mut id_max = i128::MIN;
+    let mut n_docs: u64 = 0;
+
+    for buffered in slice {
+        let id_col = buffered
+            .scalar
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| {
+                BuildError::IdColumnWrongType(
+                    options.id_column.clone(),
+                    "<id column not Decimal128 at runtime>".to_string(),
+                )
+            })?;
+        for i in 0..id_col.len() {
+            let v = id_col.value(i);
+            id_min = id_min.min(v);
+            id_max = id_max.max(v);
+        }
+        n_docs += id_col.len() as u64;
+
+        // Float32Array::values() returns &ScalarBuffer<f32>;
+        // ScalarBuffer derefs to &[f32], so AsRef does the slice
+        // view without a copy.
+        let vector_slices: Vec<&[f32]> = buffered
+            .vectors
+            .iter()
+            .map(|fa| fa.values().as_ref())
+            .collect();
+        builder.add_batch(&buffered.scalar, &vector_slices)?;
+    }
+
+    // Compute per-scalar-column min/max BEFORE moving `slice`'s
+    // batches into the builder via `finish`. We pass references —
+    // `from_batches` doesn't take ownership.
+    let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
+    let scalar_stats = ScalarStatsTable::from_batches(&scalar_schema, &scalar_batches);
+
+    let bytes = Bytes::from(builder.finish()?);
+
+    let (id_min, id_max) = if n_docs == 0 {
+        (0, 0)
+    } else {
+        (id_min, id_max)
+    };
+
+    Ok(ShardOutput {
+        bytes,
+        n_docs,
+        id_min,
+        id_max,
+        scalar_stats,
+    })
+}
+
+/// Per-shard publish artifacts produced in parallel before the
+/// serial manifest swap. One entry per non-empty shard.
+struct PreparedSegment {
+    entry: Arc<SuperfileEntry>,
+    /// Bytes destined for the in-memory segment store. `Some` on
+    /// the in-memory-only path and the storage-without-cache
+    /// path; `None` on the cache-attached path (the disk cache
+    /// hydrates lazily from storage).
+    bytes_for_store: Option<(SuperfileUri, Bytes)>,
+    bytes_for_storage: Option<(SuperfileUri, Bytes)>,
+    bytes_for_cache: Option<(SuperfileUri, Bytes)>,
+}
+
+/// Build the per-shard publish artifacts: open a `SuperfileReader`
+/// on the shard bytes, derive FTS + vector summaries, and decide
+/// the bytes-disposition triplet. Pure per-shard work — no shared
+/// mutable state, safe to run in parallel across shards.
+fn prepare_segment(
+    inner: &SupertableInner,
+    shard: ShardOutput,
+) -> Result<Option<PreparedSegment>, BuildError> {
+    if shard.n_docs == 0 {
+        return Ok(None);
+    }
+
+    let uri = SuperfileUri::new_v4();
+
+    let bytes_for_storage = inner
+        .options
+        .storage
+        .is_some()
+        .then(|| shard.bytes.clone());
+    let cache_attached =
+        inner.options.disk_cache.is_some() && inner.options.storage.is_some();
+    let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
+    let bytes_for_cache = cache_attached.then(|| shard.bytes.clone());
+
+    // Open the reader directly on shard bytes (not via the
+    // in-memory `SuperfileReaderCache`). This lets the cache-attached
+    // path skip the in-memory tier entirely — the bytes can go
+    // straight to object storage without a RAM detour, which is
+    // what removes the 100GB OOM trap (the in-memory cache doesn't
+    // evict, so a long-running writer with cache + storage would
+    // otherwise accumulate every segment's bytes in RAM forever).
+    let reader = crate::superfile::SuperfileReader::open_with(
+        shard.bytes.clone(),
+        inner.options.superfile_open_options(),
+    )
+    .map_err(|e| BuildError::Store(format!("opening segment for summary: {e}")))?;
+
+    let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
+    if let Some(fts_reader) = reader.fts() {
+        for fc in &inner.options.fts_columns {
+            let terms = fts_reader.iter_column_terms(&fc.column);
+            let n_terms_distinct = terms.len() as u32;
+            let (min_term, max_term) = match (terms.first(), terms.last()) {
+                (Some(min), Some(max)) => (min.clone(), max.clone()),
+                _ => (Vec::new(), Vec::new()),
+            };
+            let mut bloom_builder = BloomBuilder::new();
+            for term in &terms {
+                bloom_builder.insert(term);
+            }
+            fts_summary.insert(
+                fc.column.clone(),
+                FtsSummary {
+                    term_bloom: bloom_builder.finish(),
+                    n_terms_distinct,
+                    term_range: (min_term, max_term),
+                },
+            );
+        }
+    }
+
+    let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
+    if let Some(vec_reader) = reader.vec() {
+        for vc in &inner.options.vector_columns {
+            if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
+                vector_summary.insert(
+                    vc.column.clone(),
+                    VectorSummary { centroid, radius },
+                );
+            }
+        }
+    }
+
+    let entry = Arc::new(SuperfileEntry {
+        superfile_id: uuid::Uuid::new_v4(),
+        uri,
+        n_docs: shard.n_docs,
+        id_min: shard.id_min,
+        id_max: shard.id_max,
+        scalar_stats: shard.scalar_stats,
+        fts_summary,
+        vector_summary,
+        // Partition assignment populated by the per-shard
+        // `PartitionStrategy` wiring elsewhere; superfiles
+        // emitted here remain unpartitioned (default).
+        partition_key: Vec::new(),
+        partition_hint: None,
+    });
+
+    Ok(Some(PreparedSegment {
+        entry,
+        bytes_for_store: bytes_for_store.map(|b| (uri, b)),
+        bytes_for_storage: bytes_for_storage.map(|b| (uri, b)),
+        bytes_for_cache: bytes_for_cache.map(|b| (uri, b)),
+    }))
+}
+
+/// Insert each shard's bytes into the segment store, derive
+/// per-segment summaries from the stored `SuperfileReader`, and
+/// publish all entries in one `ArcSwap` of the manifest.
+///
+/// Per-shard work (reader open, FTS bloom build, vector summary,
+/// `SuperfileEntry` construction) runs in parallel across the
+/// writer pool — for an FTS supertable the bloom build alone is
+/// O(n_terms_distinct) per FTS column per shard, which at 10M
+/// docs × 4 superfiles is the dominant cost. Manifest swap +
+/// storage write-through stay serial after the join.
+fn publish_superfiles(inner: &SupertableInner, outputs: Vec<ShardOutput>) -> Result<(), BuildError> {
+    let prepared: Vec<PreparedSegment> = inner.options.writer_pool.install(|| {
+        outputs
+            .into_par_iter()
+            .filter_map(|shard| prepare_segment(inner, shard).transpose())
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+
+    let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(prepared.len());
+    let mut pending_storage_writes: Vec<(SuperfileUri, Bytes)> = Vec::new();
+    let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
+
+    for p in prepared {
+        if let Some((uri, b)) = p.bytes_for_store {
+            inner
+                .options
+                .store
+                .insert(uri, b)
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+        }
+        if let Some(t) = p.bytes_for_storage {
+            pending_storage_writes.push(t);
+        }
+        if let Some(t) = p.bytes_for_cache {
+            pending_cache_inserts.push(t);
+        }
+        new_entries.push(p.entry);
+    }
+
+    if new_entries.is_empty() {
+        return Ok(());
+    }
+
+    let old = inner.manifest.load();
+
+    // Storage write-through: when storage is attached, persist
+    // each segment's bytes + the new manifest (parts + list +
+    // pointer) before swapping the in-memory state. If any
+    // storage operation fails the commit fails as a whole —
+    // the in-memory manifest is **not** updated, so callers
+    // see a clean rollback to the prior state.
+    if let Some(storage) = inner.options.storage.as_ref().cloned() {
+        // Drop the read-locked snapshot before entering
+        // persist_commit — the OCC retry loop will reload
+        // inner.manifest each iteration to incorporate any
+        // commits from other writers that won the race.
+        drop(old);
+        let new_manifest = persist_commit(inner, storage, new_entries, pending_storage_writes)
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        inner.manifest.store(Arc::new(new_manifest));
+
+        // Warm the cache with the superfiles we just persisted.
+        // Skips the cold-fetch round-trip on the producer's
+        // next query against its own superfiles (each segment
+        // otherwise costs one storage HEAD + parallel
+        // range-GETs to refetch what we already have in
+        // hand). Best-effort: a cache insert failure (e.g.,
+        // budget exhausted) is logged via the error path but
+        // doesn't fail the commit — the segment is durably
+        // in storage, and a subsequent query will cold-fetch
+        // it as if pre-population hadn't been attempted.
+        if !pending_cache_inserts.is_empty() {
+            if let Some(cache) = inner.options.disk_cache.as_ref().cloned() {
+                warm_cache_after_commit(inner, &cache, pending_cache_inserts);
+            }
+        }
+
+        // Best-effort memory-budget enforcement. Each commit
+        // pre-populates the cache (above); sustained writers
+        // grow the working set linearly, so a post-commit
+        // check + sweep keeps the working set under the
+        // configured budget. Pages re-fault from disk on next
+        // access if needed; the cache entries themselves are
+        // unaffected.
+        if let (Some(cache), Some(budget)) = (
+            inner.options.disk_cache.as_ref(),
+            inner.options.memory_budget_bytes,
+        ) {
+            cache.sweep_for_budget(budget);
+        }
+        return Ok(());
+    }
+
+    let new = old.with_appended(new_entries);
+    inner.manifest.store(Arc::new(new));
+
+    Ok(())
+}
+
+// OCC retry budget — read from
+// `SupertableOptions::max_commit_retries` (default 10) so
+// callers with high contention can raise it. The
+// `attempt + 1 < retries` check + the final
+// `WriteContentionExhausted` return keep the loop bounded
+// regardless of the configured value.
+
+/// Jittered exponential backoff between OCC retries.
+///
+/// Base 10 ms, doubling per attempt, capped at 1 s, with ±30%
+/// jitter to break up lockstep retries from racing writers.
+/// Jitter source is the low bits of the system's nanosecond
+/// clock — no `rand` dep needed.
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    const BASE_MS: u64 = 10;
+    const CAP_MS: u64 = 1000;
+    let exp = BASE_MS.saturating_mul(1u64 << attempt.min(6));
+    let capped = exp.min(CAP_MS);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter_pct = (nanos % 61) as i64 - 30; // -30..=30
+    let adjusted = ((capped as i64) + (capped as i64 * jitter_pct / 100)).max(1) as u64;
+    std::time::Duration::from_millis(adjusted)
+}
+
+/// Storage write-through with OCC retry. Persist the new
+/// superfiles + manifest to storage, returning the new
+/// in-memory `Manifest` with the fresh `ManifestList` +
+/// `ManifestPartLoader` installed.
+///
+/// **OCC retry semantics.** On each iteration:
+///  1. Reload `inner.manifest` to incorporate any commit a
+///     racing writer published since our last attempt.
+///  2. Derive `new_segment_list = old.superfile_list.with_appended(new_entries.clone())`.
+///  3. Try `try_commit_attempt` (write superfiles → write part +
+///     list → conditional pointer PUT).
+///  4. On `WriteContentionExhausted` with retries left: refresh
+///     `inner.manifest` from storage (inheriting unchanged
+///     parts via content-addressed Arc::clone), sleep with
+///     jittered backoff, loop.
+///  5. After `opts.max_commit_retries` exhausted: surface
+///     `CommitError::WriteContentionExhausted` to the caller.
+///
+/// **Idempotency across retries.** Segment URIs are UUID v4 —
+/// statically random, so a retry uses the same URIs as the
+/// prior attempt. The segment-bytes PUT swallows
+/// `PreconditionFailed` (URI already exists with bit-identical
+/// content from our prior attempt). Manifest parts are
+/// content-addressed; identical content yields identical URIs
+/// and the part-write path already swallows
+/// `PreconditionFailed`. Only the pointer PUT must win the
+/// CAS; everything below it is idempotent.
+///
+/// When no real partitioning is configured, all post-commit
+/// superfiles go into one `ManifestPart` with a fresh `PartId`.
+/// With a real `PartitionStrategy`, `try_commit_attempt` runs
+/// the per-partition part-reuse path described on that fn.
+fn persist_commit(
+    inner: &SupertableInner,
+    storage: Arc<dyn crate::storage::StorageProvider>,
+    new_entries: Vec<Arc<SuperfileEntry>>,
+    pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
+) -> Result<crate::supertable::Manifest, crate::supertable::CommitError> {
+    use crate::supertable::Manifest;
+    use crate::supertable::manifest::ManifestPartLoader;
+
+    let storage_async = Arc::clone(&storage);
+    let opts = Arc::clone(&inner.options);
+
+    // The writer's commit path is sync but the persistence
+    // layer is async. Two cases:
+    //
+    // - **Sync caller** (no ambient tokio runtime): drive
+    //   the future on the supertable's owned `sql_runtime`
+    //   (lazy-init the first time we hit this branch).
+    // - **Async caller** (inside a tokio runtime): use the
+    //   ambient runtime via `Handle::current().block_on`
+    //   wrapped in `block_in_place`. This avoids creating
+    //   (and later dropping) a second owned runtime — which
+    //   would otherwise panic at Drop with "cannot drop a
+    //   runtime in a context where blocking is not allowed".
+    //   Requires the ambient runtime to be `multi_thread`.
+    let max_retries = opts.max_commit_retries.max(1);
+    let drive = async move {
+        let mut last_err: Option<crate::supertable::CommitError> = None;
+        for attempt in 0..max_retries {
+            // Reload `inner.manifest` each iteration so a
+            // racing writer's commit (visible via
+            // `refresh_inner_state_async` below from a prior
+            // iteration) feeds into our successor's
+            // `new_segment_list`.
+            let old = inner.manifest.load_full();
+            let new_segment_list =
+                old.superfile_list.with_appended(new_entries.clone());
+            let pending_writes = pending_storage_writes.clone();
+
+            match try_commit_attempt(
+                Arc::clone(&storage_async),
+                Arc::clone(&opts),
+                Arc::clone(&old),
+                &new_entries,
+                new_segment_list.manifest_id,
+                pending_writes,
+            )
+            .await
+            {
+                Ok(new_list) => {
+                    return Ok::<_, crate::supertable::CommitError>((new_list, new_segment_list));
+                }
+                Err(crate::supertable::CommitError::WriteContentionExhausted)
+                    if attempt + 1 < max_retries =>
+                {
+                    // Lost the pointer CAS (or a sub-write
+                    // CAS, translated to the same variant).
+                    // Refresh local state to see the winner's
+                    // commit, sleep with jittered backoff,
+                    // retry.
+                    refresh_inner_state_async(inner, &storage_async).await?;
+                    last_err = Some(crate::supertable::CommitError::WriteContentionExhausted);
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
+    };
+
+    let (new_list, new_segment_list) = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // Ambient tokio runtime present — use it. Don't
+            // touch `inner.sql_runtime()` so we don't risk
+            // dropping our owned runtime from within
+            // another's worker context.
+            tokio::task::block_in_place(|| handle.block_on(drive))?
+        }
+        Err(_) => {
+            // Sync caller; lazy-init the supertable's
+            // owned runtime.
+            inner.sql_runtime().block_on(drive)?
+        }
+    };
+
+    // Build the new in-memory Manifest with the persisted
+    // list + a fresh ManifestPartLoader installed.
+    let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &new_list));
+    Ok(Manifest {
+        superfile_list: new_segment_list,
+        list: Some(new_list),
+        parts: dashmap::DashMap::new(),
+        loader: Some(loader),
+    })
+}
+
+/// One attempt at the commit sequence: write segment bytes
+/// → group new entries by partition → rewrite the latest part
+/// per touched partition (preserving untouched parts' URIs)
+/// → conditional pointer PUT. The retry loop in
+/// `persist_commit` wraps this to handle contention.
+///
+/// **Partition-aware path.** Each commit's new superfiles are
+/// routed by `assign_partition` into per-partition groups.
+/// For each touched partition, the writer finds the latest
+/// existing part (if any), rebuilds it with the union of its
+/// existing superfiles + the new ones, and emits a new
+/// `ManifestListEntry` that replaces the prior one (same
+/// `partition_key`, new `part_id` + content hash). Untouched
+/// partitions' list entries carry over verbatim — no
+/// re-encode, no PUT. A cold partition (no prior entry) gets
+/// a fresh part with just the new superfiles. The result: a
+/// single-partition commit rewrites exactly one part
+/// regardless of how many other partitions exist — the
+/// load-bearing property the part-reuse optimization relies
+/// on.
+async fn try_commit_attempt(
+    storage: Arc<dyn crate::storage::StorageProvider>,
+    opts: Arc<SupertableOptions>,
+    old: Arc<crate::supertable::Manifest>,
+    new_entries: &[Arc<SuperfileEntry>],
+    new_manifest_id: u64,
+    pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
+) -> Result<crate::supertable::manifest::list::ManifestList, crate::supertable::CommitError> {
+    use crate::supertable::manifest::commit::{self as commit_mod, POINTER_PATH};
+    use crate::supertable::manifest::list::{
+        FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
+    };
+    use crate::supertable::manifest::part::{self as part_mod, ManifestPart, PartId};
+    use crate::supertable::manifest::partition::{
+        assign_partition, encode_partition_key,
+    };
+    use crate::storage::StorageError;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    // 1. Write each new segment's bytes to storage in parallel.
+    //
+    // Swallow `PreconditionFailed` per-PUT: on a retry after a
+    // lost pointer-CAS, the same URI was already written by
+    // our prior attempt with bit-identical bytes (segment URIs
+    // are UUID v4 — collision rate 2^-122). A "URI exists"
+    // hit here means our own prior attempt; treat as success
+    // so the retry path is fully idempotent.
+    //
+    // Size-gated dispatch: superfiles ≥
+    // `put_multipart_threshold_bytes` route through
+    // `put_multipart` (S3 multipart upload, in-place
+    // streaming on LocalFS) instead of a single `put_atomic`
+    // PUT. Smaller superfiles stay on the single-PUT path —
+    // multipart has per-request overhead that isn't worth
+    // the parallelism below the threshold. The default
+    // threshold (100 MiB) matches the S3 SDK's standard
+    // cutoff.
+    let multipart_threshold = opts.put_multipart_threshold_bytes;
+    let put_futs = pending_storage_writes.into_iter().map(|(uri, bytes)| {
+        let storage = Arc::clone(&storage);
+        async move {
+            let path = segment_storage_path(&uri);
+            let result = if (bytes.len() as u64) >= multipart_threshold {
+                put_segment_multipart(storage.as_ref(), &path, bytes).await
+            } else {
+                storage.put_atomic(&path, bytes).await
+            };
+            match result {
+                Ok(()) => Ok(()),
+                Err(StorageError::PreconditionFailed { .. }) => Ok(()),
+                Err(e) => Err(crate::supertable::CommitError::from(e)),
+            }
+        }
+    });
+    for r in futures::future::join_all(put_futs).await {
+        r?;
+    }
+
+    // 2. Resolve the effective partition strategy. Locked at
+    //    first commit: read from the existing manifest list
+    //    if present, else use the options default.
+    let strategy: PartitionStrategy = old
+        .list
+        .as_ref()
+        .map(|l| l.partition_strategy.clone())
+        .unwrap_or_else(|| opts.effective_partition_strategy());
+
+    // 3. Group new entries by partition_key (the on-disk
+    //    encoding the list + parts carry).
+    let mut new_by_partition: BTreeMap<Vec<u8>, Vec<Arc<SuperfileEntry>>> = BTreeMap::new();
+    for entry in new_entries {
+        let pk = assign_partition(entry, &strategy)?;
+        new_by_partition
+            .entry(encode_partition_key(&pk))
+            .or_default()
+            .push(Arc::clone(entry));
+    }
+
+    // 4. Walk the existing list entries, classify each by
+    //    whether it's the *latest* entry for its partition.
+    //    The plan's "rewrite latest part" policy: only the
+    //    most recent entry per partition is a candidate for
+    //    rewrite; older entries for the same partition (from
+    //    a prior part-split) carry over unchanged.
+    let mut latest_index_for_partition: HashMap<Vec<u8>, usize> = HashMap::new();
+    if let Some(old_list) = old.list.as_ref() {
+        for (i, entry) in old_list.parts.iter().enumerate() {
+            latest_index_for_partition.insert(entry.partition_key.clone(), i);
+        }
+    }
+
+    // The output list entries — built incrementally as we
+    // walk existing entries + emit new ones for cold
+    // partitions. Order: existing entries (touched ones
+    // replaced in place; untouched preserved) followed by
+    // entries for cold partitions.
+    let mut out_list_entries: Vec<ManifestListEntry> = Vec::new();
+    let mut parts_to_write: Vec<ManifestPart> = Vec::new();
+    let mut handled_partitions: HashSet<Vec<u8>> = HashSet::new();
+
+    if let Some(old_list) = old.list.as_ref() {
+        for (i, entry) in old_list.parts.iter().enumerate() {
+            let is_latest_for_partition = latest_index_for_partition
+                .get(&entry.partition_key)
+                .copied()
+                == Some(i);
+            let touched = new_by_partition.contains_key(&entry.partition_key);
+
+            if is_latest_for_partition && touched {
+                // Rewrite path: rebuild this part with its
+                // existing superfiles + the new ones for this
+                // partition.
+                let new_for_pk = new_by_partition
+                    .remove(&entry.partition_key)
+                    .expect("touched implies present");
+                let existing_part = old.part(entry.part_id).await.map_err(|e| {
+                    crate::supertable::CommitError::PointerParse(format!(
+                        "loading existing part {} for partition rewrite: {e}",
+                        entry.part_id.0
+                    ))
+                })?;
+                let combined_n = existing_part.superfiles.len() + new_for_pk.len();
+                let combined_segments: Vec<Arc<SuperfileEntry>> = existing_part
+                    .superfiles
+                    .iter()
+                    .cloned()
+                    .chain(new_for_pk.into_iter())
+                    .collect();
+
+                if combined_n as u64 > opts.target_superfiles_per_partition {
+                    // Split: keep the existing entry as-is
+                    // (older split entry from now on) and
+                    // emit a fresh part with just the new
+                    // superfiles for this partition.
+                    out_list_entries.push(entry.clone());
+                    let new_segs: Vec<Arc<SuperfileEntry>> = combined_segments
+                        [existing_part.superfiles.len()..]
+                        .to_vec();
+                    let (fresh_entry, fresh_part) = build_part_and_entry(
+                        &opts,
+                        new_segs,
+                        entry.partition_key.clone(),
+                    )?;
+                    out_list_entries.push(fresh_entry);
+                    parts_to_write.push(fresh_part);
+                } else {
+                    // Rewrite: replace this entry with the
+                    // combined-superfiles part.
+                    let (rebuilt_entry, rebuilt_part) = build_part_and_entry(
+                        &opts,
+                        combined_segments,
+                        entry.partition_key.clone(),
+                    )?;
+                    out_list_entries.push(rebuilt_entry);
+                    parts_to_write.push(rebuilt_part);
+                }
+                handled_partitions.insert(entry.partition_key.clone());
+            } else {
+                // Carry over: either an older entry for a
+                // touched partition (handled when we hit the
+                // latest), or an entry for an untouched
+                // partition. Either way, content-hash + URI
+                // unchanged — no re-encode, no PUT.
+                out_list_entries.push(entry.clone());
+            }
+        }
+    }
+
+    // Cold partitions (touched but no prior entry): emit a
+    // fresh part with just the new superfiles.
+    for (pk, new_for_pk) in new_by_partition {
+        if handled_partitions.contains(&pk) {
+            continue;
+        }
+        let (fresh_entry, fresh_part) = build_part_and_entry(&opts, new_for_pk, pk)?;
+        out_list_entries.push(fresh_entry);
+        parts_to_write.push(fresh_part);
+    }
+
+    // 5. Build the new manifest list. The options_hash
+    //    digest covers (schema, id_column, fts/vector
+    //    column declarations, partition strategy);
+    //    Supertable::open validates the caller's options
+    //    against this so a schema mismatch surfaces as a
+    //    typed error rather than a downstream decode
+    //    failure.
+    let opts_hash =
+        crate::supertable::manifest::options_hash::compute_options_hash(
+            opts.as_ref(),
+            &strategy,
+        );
+    let new_list = ManifestList {
+        format_version: LIST_FORMAT_VERSION.into(),
+        manifest_id: new_manifest_id,
+        options_hash: opts_hash,
+        schema: Vec::new(),
+        id_column: opts.id_column.clone(),
+        fts_columns: opts
+            .fts_columns
+            .iter()
+            .map(|f| crate::supertable::manifest::list::FtsColumnInfo {
+                column: f.column.clone(),
+            })
+            .collect(),
+        vector_columns: opts
+            .vector_columns
+            .iter()
+            .map(|v| crate::supertable::manifest::list::VectorColumnInfo {
+                column: v.column.clone(),
+                dim: v.dim,
+                n_cent: v.n_cent,
+                rot_seed: v.rot_seed,
+                metric: format!("{:?}", v.metric).to_lowercase(),
+            })
+            .collect(),
+        partition_strategy: strategy,
+        parts: out_list_entries,
+    };
+
+    // 6. Read the prior pointer's etag for the CAS. Fresh
+    //    supertable → no pointer yet → None etag (initial
+    //    commit).
+    let prev_etag = match storage.head(POINTER_PATH).await {
+        Ok(meta) => meta.etag,
+        Err(StorageError::NotFound { .. }) => None,
+        Err(e) => return Err(crate::supertable::CommitError::from(e)),
+    };
+
+    // 7. Parallel-issue (touched parts) + list PUTs, then
+    //    conditional pointer PUT (the visibility barrier).
+    //    Untouched parts are NOT re-PUT — their URIs (and
+    //    content-hashes) are unchanged in the new list.
+    let parts_refs: Vec<&ManifestPart> = parts_to_write.iter().collect();
+    commit_mod::commit_manifest(
+        storage.as_ref(),
+        prev_etag.as_deref(),
+        &new_list,
+        &parts_refs,
+        3,
+    )
+    .await?;
+    // Silence the unused-import warning when no path uses
+    // `PartId` / `part_mod` directly (helpers consume them
+    // from inside `build_part_and_entry`).
+    let _ = std::marker::PhantomData::<(PartId, part_mod::ContentHash)>;
+
+    Ok(new_list)
+}
+
+/// M15a — build one `ManifestPart` from `superfiles` + the
+/// matching `ManifestListEntry`. Encodes the part once,
+/// content-hashes it, and computes the list-level aggregate
+/// skip summaries that `list_prune` reads at query time.
+fn build_part_and_entry(
+    opts: &SupertableOptions,
+    superfiles: Vec<Arc<SuperfileEntry>>,
+    partition_key: Vec<u8>,
+) -> Result<
+    (
+        crate::supertable::manifest::list::ManifestListEntry,
+        crate::supertable::manifest::part::ManifestPart,
+    ),
+    crate::supertable::CommitError,
+> {
+    use crate::supertable::manifest::commit as commit_mod;
+    use crate::supertable::manifest::list::ManifestListEntry;
+    use crate::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
+    let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
+
+    let part = ManifestPart {
+        format_version: part_mod::FORMAT_VERSION.into(),
+        part_id: PartId::new_v4(),
+        superfiles,
+    };
+    let compressed = part_mod::encode(&part, 3);
+    let size_compressed = compressed.len() as u64;
+    let content_hash = ContentHash::of(&compressed);
+    let size_uncompressed = zstd::stream::decode_all(compressed.as_slice())
+        .map(|v| v.len() as u64)
+        .unwrap_or(size_compressed);
+    let aggregates = crate::supertable::manifest::aggregates::compute(&part.superfiles);
+    let entry = ManifestListEntry {
+        part_id: part.part_id,
+        uri: commit_mod::part_uri(&content_hash),
+        n_superfiles: part.superfiles.len() as u64,
+        size_bytes_compressed: size_compressed,
+        size_bytes_uncompressed: size_uncompressed,
+        content_hash,
+        partition_key,
+        id_range: aggregates.id_range,
+        scalar_stats_agg: aggregates.scalar_stats_agg,
+        fts_summary_agg: aggregates.fts_summary_agg,
+        vector_summary_agg: aggregates.vector_summary_agg,
+    };
+    Ok((entry, part))
+}
+
+/// Re-read the manifest pointer from storage, load any newer
+/// manifest list, inherit unchanged parts from the current
+/// in-memory `Manifest` via content-addressed `Arc::clone`,
+/// eager-fetch newly-referenced parts, and `ArcSwap` the
+/// refreshed `Manifest` into `inner.manifest`.
+///
+/// Called from the OCC retry loop between attempts so the next
+/// iteration's `inner.manifest.load_full()` sees the winning
+/// writer's state — `with_appended` then chains our pending
+/// superfiles onto theirs at the new monotonic `manifest_id`.
+///
+/// Mirrors the logic in [`Supertable::refresh`] but operates
+/// on `&SupertableInner` so it can be called from inside the
+/// writer's commit path without holding a `Supertable` handle.
+async fn refresh_inner_state_async(
+    inner: &SupertableInner,
+    storage: &Arc<dyn crate::storage::StorageProvider>,
+) -> Result<(), crate::supertable::CommitError> {
+    use crate::supertable::manifest::commit::read_pointer;
+    use crate::supertable::manifest::list as list_mod;
+    use crate::supertable::manifest::{Manifest, SuperfileList};
+    use crate::supertable::manifest::ManifestPartLoader;
+
+    let pointer = match read_pointer(storage.as_ref()).await? {
+        Some(p) => p,
+        // No pointer yet means nobody has committed; our next
+        // attempt will write the initial pointer with
+        // expected_prev_etag = None.
+        None => return Ok(()),
+    };
+    let current = inner.manifest.load_full();
+    if pointer.manifest_id <= current.superfile_list.manifest_id {
+        // Pointer hasn't advanced past our in-memory state —
+        // our last CAS lost to a writer that has since been
+        // overwritten, or the lost-race writer's manifest_id
+        // is somehow ≤ ours. Either way, the next attempt's
+        // `inner.manifest.load_full()` is already correct.
+        return Ok(());
+    }
+
+    let list_bytes = storage
+        .get(&pointer.manifest_list_uri)
+        .await
+        .map_err(crate::supertable::CommitError::from)?;
+    let new_list = list_mod::decode(&list_bytes).map_err(|e| {
+        crate::supertable::CommitError::PointerParse(format!(
+            "manifest list decode during retry refresh: {e}"
+        ))
+    })?;
+
+    let new_loader = Arc::new(ManifestPartLoader::new(Arc::clone(storage), &new_list));
+    let new_parts: dashmap::DashMap<_, _> = dashmap::DashMap::new();
+    let mut missing_part_ids = Vec::new();
+    for entry in &new_list.parts {
+        if let Some(existing) = current.parts.get(&entry.part_id) {
+            new_parts.insert(entry.part_id, existing.value().clone());
+        } else {
+            missing_part_ids.push(entry.part_id);
+        }
+    }
+
+    let load_futs = missing_part_ids
+        .iter()
+        .map(|id| {
+            let loader = Arc::clone(&new_loader);
+            let pid = *id;
+            async move { loader.load(pid).await }
+        })
+        .collect::<Vec<_>>();
+    let loaded = futures::future::join_all(load_futs).await;
+    for (pid, result) in missing_part_ids.iter().zip(loaded) {
+        let part = result.map_err(|e| {
+            crate::supertable::CommitError::Encode(format!(
+                "manifest part load during retry refresh: part_id={} err={}",
+                pid.0, e
+            ))
+        })?;
+        let cell = tokio::sync::OnceCell::new();
+        cell.set(part).expect("fresh cell");
+        new_parts.insert(*pid, Arc::new(cell));
+    }
+
+    let mut all_segments: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
+    for entry in &new_list.parts {
+        let cell = new_parts
+            .get(&entry.part_id)
+            .expect("part inserted above");
+        let part = cell
+            .value()
+            .get()
+            .expect("eager-fetched or inherited; must be set");
+        all_segments.extend(part.superfiles.iter().cloned());
+    }
+
+    let mut new_segment_list = SuperfileList::empty(inner.options.clone());
+    new_segment_list.manifest_id = pointer.manifest_id;
+    new_segment_list.superfiles = all_segments;
+    let new_manifest = Manifest {
+        superfile_list: new_segment_list,
+        list: Some(new_list),
+        parts: new_parts,
+        loader: Some(new_loader),
+    };
+    inner.manifest.store(Arc::new(new_manifest));
+    Ok(())
+}
+
+/// Storage path for a segment's bytes. Lives under `data/`
+/// alongside the `_supertable/` manifest hierarchy.
+fn segment_storage_path(uri: &SuperfileUri) -> String {
+    format!("data/seg-{}.sf", uri.0)
+}
+
+/// Multipart-upload variant of the writer's per-segment put.
+/// Routes through [`crate::storage::StorageProvider::put_multipart`]
+/// for superfiles large enough that a single PUT is wasteful
+/// (slow on a backend stall, high RSS during the put).
+///
+/// Idempotency: segment URIs are UUID v4, so the only "URI
+/// exists" hit on retry comes from our own prior attempt
+/// with bit-identical bytes. Head-first lets us short-circuit
+/// that case before re-running the multipart dance. The
+/// single-PUT path achieves the same effect by returning
+/// `PreconditionFailed`, which the call-site swallows;
+/// multipart's `complete()` doesn't carry a precondition, so
+/// we need to detect "already there" explicitly.
+///
+/// Part size: 8 MiB — comfortably above S3's 5-MiB minimum
+/// and a clean fit for the cold-fetch coordinator's default
+/// 16-MiB chunk reads on the way back out. Parts are pushed
+/// in declaration order; the parts run concurrently inside
+/// `object_store` after their futures are polled.
+async fn put_segment_multipart(
+    storage: &dyn crate::storage::StorageProvider,
+    path: &str,
+    bytes: Bytes,
+) -> Result<(), crate::storage::StorageError> {
+    use crate::storage::StorageError;
+    use object_store::PutPayload;
+
+    const PART_BYTES: usize = 8 * (1 << 20);
+
+    // Same-bytes retry skip. Failures other than NotFound
+    // propagate so we don't paper over a degraded backend.
+    match storage.head(path).await {
+        Ok(_) => return Err(StorageError::PreconditionFailed { uri: path.into() }),
+        Err(StorageError::NotFound { .. }) => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut upload = storage.put_multipart(path).await?;
+    let total = bytes.len();
+    let mut parts: Vec<object_store::UploadPart> = Vec::with_capacity(total / PART_BYTES + 1);
+    let mut offset = 0;
+    while offset < total {
+        let end = std::cmp::min(offset + PART_BYTES, total);
+        let chunk = bytes.slice(offset..end);
+        parts.push(upload.put_part(PutPayload::from_bytes(chunk)));
+        offset = end;
+    }
+    // Drive part-uploads concurrently. `try_join_all` cancels
+    // remaining parts if one fails — semantically equivalent to
+    // abandoning the upload, with `abort()` below as cleanup.
+    if let Err(e) = futures::future::try_join_all(parts).await {
+        // Best-effort abort; ignore failure (the upload may
+        // already be in a terminal state, or the backend may
+        // have lost the multipart-upload ID).
+        let _ = upload.abort().await;
+        return Err(StorageError::Permanent {
+            uri: path.into(),
+            source: Box::new(e),
+        });
+    }
+    if let Err(e) = upload.complete().await {
+        let _ = upload.abort().await;
+        return Err(StorageError::Permanent {
+            uri: path.into(),
+            source: Box::new(e),
+        });
+    }
+    Ok(())
+}
+
+/// M14b.2 — drive `DiskCacheStore::insert_warm` for each
+/// just-published segment via the same sync→async bridge
+/// the rest of the writer uses (`block_in_place +
+/// Handle::block_on` when an ambient runtime is present;
+/// `inner.sql_runtime()` otherwise).
+///
+/// Failures are swallowed with an `eprintln!` log line —
+/// the superfiles are already durable in storage and the
+/// manifest commit has succeeded, so the cache miss
+/// becomes a "warm load fails → next query cold-fetches"
+/// degradation, not a correctness break.
+fn warm_cache_after_commit(
+    inner: &SupertableInner,
+    cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
+    pending: Vec<(SuperfileUri, Bytes)>,
+) {
+    let cache = Arc::clone(cache);
+    let drive = async move {
+        for (uri, bytes) in pending {
+            if let Err(e) = cache.insert_warm(&uri, bytes).await {
+                eprintln!(
+                    "supertable: M14b.2 warm cache pre-population failed for {}: {} \
+                     (segment is durable in storage; first query will cold-fetch)",
+                    uri.0, e
+                );
+            }
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(drive));
+        }
+        Err(_) => {
+            inner.sql_runtime().block_on(drive);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::{
+        FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use rayon::ThreadPoolBuilder;
+
+    use crate::superfile::builder::FtsConfig;
+    use crate::superfile::builder::VectorConfig;
+    
+    use crate::superfile::vector::distance::Metric;
+    use crate::supertable::SupertableOptions;
+    use crate::supertable::handle::Supertable;
+
+    fn schema_id_title() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]))
+    }
+
+    fn fixed_list_f32(dim: usize) -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+        )
+    }
+
+    fn schema_id_title_emb(dim: usize) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("emb", fixed_list_f32(dim), false),
+        ]))
+    }
+
+    use crate::test_helpers::default_tokenizer as tok;
+
+    fn options_id_title() -> SupertableOptions {
+        SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+    }
+
+    /// Force a single-threaded writer pool for deterministic
+    /// shard counts in tests.
+    fn options_id_title_serial() -> SupertableOptions {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("build pool"),
+        );
+        options_id_title().with_writer_pool(pool)
+    }
+
+    /// Build a writer pool with N threads.
+    fn writer_pool_with(n: usize) -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .expect("build pool"),
+        )
+    }
+
+    fn build_simple_batch(_start: u64, n: usize) -> RecordBatch {
+        // The supertable injects `_id` at append time; the
+        // user-facing batch carries only the user columns.
+        let titles =
+            LargeStringArray::from((0..n).map(|i| format!("doc {i} alpha")).collect::<Vec<_>>());
+        RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("build batch")
+    }
+
+    // ---- writer slot exclusion ---------------------------------------
+
+    #[test]
+    fn writer_slot_is_exclusive() {
+        let st = Supertable::create(options_id_title_serial());
+        let _w = st.writer().expect("first writer");
+        let err = st.writer().expect_err("second writer should fail");
+        assert!(matches!(err, BuildError::SupertableInUse));
+    }
+
+    #[test]
+    fn writer_slot_releases_on_drop() {
+        let st = Supertable::create(options_id_title_serial());
+        {
+            let _w = st.writer().expect("first writer");
+            // dropped at scope end
+        }
+        // Slot now free.
+        let _w2 = st.writer().expect("second writer after drop");
+    }
+
+    // ---- single-writer end-to-end (serial pool) ----------------------
+
+    #[test]
+    fn append_then_commit_publishes_one_segment() {
+        let st = Supertable::create(options_id_title_serial());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 4)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        assert_eq!(r.manifest_id(), 1);
+        assert_eq!(r.n_superfiles(), 1);
+        assert_eq!(r.n_docs_total(), 4);
+    }
+
+    #[test]
+    fn commit_with_empty_buffer_is_noop() {
+        let st = Supertable::create(options_id_title_serial());
+        let mut w = st.writer().expect("writer");
+        w.commit().expect("commit-empty");
+        assert_eq!(st.manifest_id(), 0, "no manifest swap on empty commit");
+        assert_eq!(st.reader().n_superfiles(), 0);
+    }
+
+    #[test]
+    fn segment_is_queryable_via_store() {
+        // The published segment's bytes are in the store; we
+        // can fetch a SuperfileReader and run bm25_search on it.
+        use crate::superfile::fts::reader::BoolMode;
+
+        let st = Supertable::create(options_id_title_serial());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 4)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let segment = &r.manifest().superfiles[0];
+        let store = &st.options().store;
+        let sf_reader = store.reader(&segment.uri).expect("reader");
+        let hits = sf_reader
+            .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .expect("bm25");
+        // All 4 docs contain "alpha"; should all be returned.
+        assert_eq!(hits.len(), 4);
+    }
+
+    // ---- id_min / id_max + n_docs ------------------------------------
+
+    #[test]
+    fn segment_entry_records_id_range_and_n_docs() {
+        let st = Supertable::create(options_id_title_serial());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(100, 3)).expect("a");
+        w.append(&build_simple_batch(50, 2)).expect("b");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        assert_eq!(seg.n_docs, 5);
+        // _id values are auto-injected via the supertable's
+        // monotonic generator. We don't know the exact values
+        // (timestamp-prefixed); we just assert that min < max
+        // and both are positive (high bit 0).
+        assert!(seg.id_min > 0);
+        assert!(seg.id_max > seg.id_min, "id_max should exceed id_min");
+    }
+
+    // ---- FTS summary --------------------------------------------------
+
+    #[test]
+    fn segment_entry_carries_fts_summary() {
+        let st = Supertable::create(options_id_title_serial());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 4)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        let fts = seg
+            .fts_summary
+            .get("title")
+            .expect("title FTS summary present");
+
+        // Each doc's title is "doc <i> alpha"; tokenized with
+        // ASCII-lower, distinct terms include "doc", "alpha",
+        // and digits 0-3. The FST will dedupe; n_terms_distinct
+        // is at least 3 (doc, alpha, plus some digit tokens).
+        assert!(
+            fts.n_terms_distinct >= 3,
+            "expected ≥ 3 distinct terms, got {}",
+            fts.n_terms_distinct,
+        );
+        // Bloom should report present for inserted terms.
+        assert!(fts.term_bloom.contains(b"alpha"));
+        assert!(fts.term_bloom.contains(b"doc"));
+        // Lex range should be non-empty and consistent.
+        assert!(!fts.term_range.0.is_empty());
+        assert!(!fts.term_range.1.is_empty());
+        assert!(
+            fts.term_range.0 <= fts.term_range.1,
+            "min_term <= max_term invariant",
+        );
+    }
+
+    // ---- vector summary ----------------------------------------------
+
+    fn build_vector_batch(_start: u64, n: usize, dim: usize) -> RecordBatch {
+        let titles = LargeStringArray::from((0..n).map(|i| format!("doc {i}")).collect::<Vec<_>>());
+        let mut flat = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            for j in 0..dim {
+                flat.push(((i + j) as f32) / 100.0);
+            }
+        }
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Float32Array::from(flat);
+        let fsl = FixedSizeListArray::try_new(item_field, dim as i32, Arc::new(values), None)
+            .expect("FSL");
+        RecordBatch::try_new(
+            schema_id_title_emb(dim),
+            vec![Arc::new(titles), Arc::new(fsl)],
+        )
+        .expect("batch")
+    }
+
+    fn options_with_vector(dim: usize) -> SupertableOptions {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("build pool"),
+        );
+        SupertableOptions::new(
+            schema_id_title_emb(dim),
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+            }],
+            None,
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    #[test]
+    fn segment_entry_carries_vector_summary() {
+        let dim = 16;
+        let st = Supertable::create(options_with_vector(dim));
+        let mut w = st.writer().expect("writer");
+        // Need at least n_cent docs so kmeans has data to cluster.
+        w.append(&build_vector_batch(0, 8, dim)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        let vs = seg
+            .vector_summary
+            .get("emb")
+            .expect("emb vector summary present");
+        assert_eq!(vs.centroid.len(), dim);
+        assert!(vs.radius >= 0.0);
+    }
+
+    // ---- rayon-shard parallelism -------------------------------------
+
+    #[test]
+    fn commit_produces_one_segment_per_writer_pool_thread() {
+        // With N writer-pool threads and a buffer of M >= N
+        // batches, commit should emit N superfiles (one per
+        // shard).
+        for n_threads in [1usize, 2, 4] {
+            let opts = options_id_title().with_writer_pool(writer_pool_with(n_threads));
+            let st = Supertable::create(opts);
+            let mut w = st.writer().expect("writer");
+            // Push enough batches to fill every shard.
+            for i in 0..n_threads * 2 {
+                w.append(&build_simple_batch(i as u64 * 10, 3))
+                    .expect("append");
+            }
+            w.commit().expect("commit");
+
+            let r = st.reader();
+            assert_eq!(
+                r.n_superfiles(),
+                n_threads,
+                "expected {n_threads} superfiles for {n_threads}-thread pool",
+            );
+            assert_eq!(r.n_docs_total(), (n_threads * 2 * 3) as u64);
+        }
+    }
+
+    #[test]
+    fn commit_with_fewer_batches_than_threads_skips_empty_shards() {
+        // 4 threads, only 2 batches — chunk_size = 1, two chunks
+        // get one batch each, the other two get nothing.
+        // Should produce 2 superfiles, not 4.
+        let opts = options_id_title().with_writer_pool(writer_pool_with(4));
+        let st = Supertable::create(opts);
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 1)).expect("a");
+        w.append(&build_simple_batch(1, 1)).expect("b");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        assert_eq!(r.n_superfiles(), 2);
+        assert_eq!(r.n_docs_total(), 2);
+    }
+
+    #[test]
+    fn apply_config_with_fixed_writer_threads_emits_that_many_segments() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        let yaml = r#"
+commit_threshold_size_mb: 1024
+supertable:
+  reader_threads: 1
+  writer_threads: 4
+"#;
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+
+        // End-to-end: build options, route them through apply_config,
+        // and verify the writer pool actually sized to the config's
+        // 4 threads (one segment per shard).
+        let opts = options_id_title().apply_config(&cfg).expect("apply_config");
+        let st = Supertable::create(opts);
+        let mut w = st.writer().expect("writer");
+        for i in 0..8u64 {
+            w.append(&build_simple_batch(i * 10, 3)).expect("append");
+        }
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        assert_eq!(r.n_superfiles(), 4, "writer_threads=4 should yield 4 shards");
+        assert_eq!(r.n_docs_total(), 24);
+    }
+
+    // ---- threshold auto-flush ----------------------------------------
+
+    #[test]
+    fn append_auto_flushes_when_buffer_crosses_threshold() {
+        // 1 MiB threshold; one append > 1 MiB should auto-commit.
+        let opts = options_id_title_serial().with_commit_threshold_size_mb(1);
+        let st = Supertable::create(opts);
+        let mut w = st.writer().expect("writer");
+
+        // Build a large batch: 50K docs × ~50-byte titles ≈ 2.5 MiB.
+        let batch = build_simple_batch(0, 50_000);
+        w.append(&batch).expect("append");
+
+        // Threshold should have tripped; manifest_id has advanced.
+        assert_eq!(st.manifest_id(), 1, "auto-flush should fire");
+        assert_eq!(w.buffered_batches(), 0, "buffer drained on auto-flush");
+
+        // No further commit should land an empty segment.
+        w.commit().expect("commit-empty");
+        assert_eq!(st.manifest_id(), 1);
+    }
+
+    #[test]
+    fn append_does_not_auto_flush_when_threshold_zero() {
+        let opts = options_id_title_serial().with_commit_threshold_size_mb(0);
+        let st = Supertable::create(opts);
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 50_000)).expect("append");
+        assert_eq!(st.manifest_id(), 0, "no auto-flush at threshold=0");
+        assert!(w.buffered_batches() > 0);
+    }
+
+    // ---- manifest copy-on-write across multiple commits -------------
+
+    #[test]
+    fn each_commit_appends_to_existing_segments() {
+        let st = Supertable::create(options_id_title_serial());
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 2)).expect("a1");
+        w.commit().expect("c1");
+        w.append(&build_simple_batch(10, 3)).expect("a2");
+        w.commit().expect("c2");
+        w.append(&build_simple_batch(20, 1)).expect("a3");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        assert_eq!(r.manifest_id(), 3);
+        assert_eq!(r.n_superfiles(), 3);
+        assert_eq!(r.n_docs_total(), 6);
+    }
+}

@@ -1,0 +1,475 @@
+//! 003 M14b — disk-cache integration in the supertable
+//! reader path.
+//!
+//! Covers the load-bearing M14b invariants:
+//!
+//!   - **Cache routing on cross-process consumer.** A
+//!     producer commits superfiles through storage + cache.
+//!     The producer drops; a fresh `Supertable::open`
+//!     consumer (with its own cache, sharing the storage
+//!     root) queries via SQL → reader bytes flow through
+//!     `DiskCacheStore::reader` → cold-fetch from storage.
+//!     The cache's `n_cold_fetches` counter grows.
+//!   - **Warm-hit on second query.** A repeat of the same
+//!     query against the consumer hits the warm cache —
+//!     `n_cold_fetches` is unchanged.
+//!   - **Skip-in-memory writer path doesn't break local
+//!     reads.** The producer queries its own superfiles
+//!     after committing. With cache attached, the writer
+//!     bypasses `options.store.put`; the cache hydrates
+//!     lazily on the producer's first read.
+//!   - **No-cache path unchanged.** A supertable without
+//!     `with_disk_cache` still uses the in-memory store
+//!     directly (no cache plumbing engaged). This is the
+//!     legacy path; the existing test suite continues to
+//!     cover it. We assert it here too as a regression
+//!     check.
+
+#![deny(clippy::unwrap_used)]
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+
+use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::supertable::reader_cache::{
+    ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
+};
+use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
+use infino::supertable::Supertable;
+use tempfile::TempDir;
+
+
+
+fn make_cache(storage: Arc<dyn StorageProvider>, cache_root: &std::path::Path) -> Arc<DiskCacheStore> {
+    let cfg = DiskCacheConfig {
+        cache_root: cache_root.to_path_buf(),
+        disk_budget_bytes: 1 << 30, // 1 GiB — plenty for tests
+        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        cold_fetch_streams: 4,
+        cold_fetch_chunk_bytes: 1 << 20, // 1 MiB
+        mmap_cold_threshold_secs: 0,     // disable sweep for tests
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        verify_crc_on_open: true,
+    };
+    // No-op pinned_fn for tests — pinning is a perf
+    // optimization, not a correctness requirement (cf. M14b
+    // commit notes: Arc<SuperfileReader> keeps the
+    // Arc<Mmap> alive even after the cache evicts the
+    // entry, so in-flight queries finish correctly).
+    let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> =
+        Arc::new(HashSet::new);
+    DiskCacheStore::new(storage, cfg, pinned_fn).expect("cache")
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_process_consumer_routes_reads_through_disk_cache() {
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+
+    // ---- Producer: commit + drop. -----------------------------
+    // Producer doesn't need a cache for this test — we're
+    // validating the consumer's read path.
+    {
+        let producer = Supertable::create(
+            default_supertable_options().with_storage(Arc::clone(&storage)),
+        );
+        let mut w = producer.writer().expect("producer writer");
+        w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
+            .expect("append");
+        w.commit().expect("producer commit");
+    }
+
+    // ---- Consumer: open with disk cache attached. -------------
+    let consumer_cache_dir = TempDir::new().expect("cache tempdir");
+    let cache = make_cache(Arc::clone(&storage), consumer_cache_dir.path());
+    let consumer_opts = default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache));
+    let consumer = Supertable::open(consumer_opts).await.expect("open");
+    assert_eq!(consumer.manifest_id(), 1);
+
+    // Cache starts cold: zero cold-fetches.
+    let pre_stats = cache.stats();
+    assert_eq!(pre_stats.n_cold_fetches, 0);
+    assert_eq!(pre_stats.n_entries, 0);
+
+    // First query against the consumer routes through the
+    // disk cache → cold-fetch from storage.
+    let batches = consumer
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("first query");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    let mid_stats = cache.stats();
+    assert!(
+        mid_stats.n_cold_fetches >= 1,
+        "first query must cold-fetch through the cache; got n_cold_fetches={}",
+        mid_stats.n_cold_fetches
+    );
+    assert!(
+        mid_stats.n_entries >= 1,
+        "cache must hold at least one entry after cold-fetch; got n_entries={}",
+        mid_stats.n_entries
+    );
+    assert!(
+        mid_stats.current_bytes > 0,
+        "cache must hold some bytes after cold-fetch; got current_bytes={}",
+        mid_stats.current_bytes
+    );
+
+    // Second query against the same segment — warm hit.
+    let _batches = consumer
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("second query");
+    let post_stats = cache.stats();
+    assert_eq!(
+        post_stats.n_cold_fetches, mid_stats.n_cold_fetches,
+        "second query must hit the warm cache; cold-fetches grew from {} to {}",
+        mid_stats.n_cold_fetches, post_stats.n_cold_fetches
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn producer_with_cache_reads_through_cache_path() {
+    // The producer commits with both storage AND cache
+    // attached. The writer's M14b refactor extracts
+    // summaries directly from the segment bytes (no
+    // round-trip through options.store.put), so the
+    // in-memory tier is NOT populated. With M14b.2, the
+    // writer additionally pre-populates the cache after
+    // commit succeeds → the producer's own first query
+    // hits the warm cache.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+    let mut w = producer.writer().expect("writer");
+    w.append(&build_title_batch(&["alpha"])).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+
+    // M14b.2: post-commit the cache holds the warmed
+    // segment. n_cold_fetches stays 0; n_entries == 1.
+    let pre = cache.stats();
+    assert_eq!(pre.n_cold_fetches, 0);
+    assert_eq!(pre.n_entries, 1, "writer should have warmed the cache");
+
+    let batches = producer
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("query");
+    assert_eq!(batches.len(), 1);
+    let post = cache.stats();
+    assert_eq!(
+        post.n_cold_fetches, 0,
+        "producer's query must hit the warm cache; got n_cold_fetches={}",
+        post.n_cold_fetches
+    );
+}
+
+#[test]
+fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
+    // M14b.2: with cache attached, the writer pre-populates
+    // the cache after each successful commit. The
+    // producer's own queries on its just-committed superfiles
+    // hit the warm cache directly — no cold-fetch
+    // round-trip through storage.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+
+    // Pre-commit: cache empty.
+    assert_eq!(cache.stats().n_entries, 0);
+    assert_eq!(cache.stats().n_cold_fetches, 0);
+
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["alpha"])).expect("append");
+        w.commit().expect("commit");
+    }
+
+    // Post-commit: writer pre-populated the cache.
+    let post_commit = cache.stats();
+    assert_eq!(
+        post_commit.n_entries, 1,
+        "writer must have warmed the cache with the just-committed segment"
+    );
+    assert_eq!(
+        post_commit.n_cold_fetches, 0,
+        "warming is a direct insert; no cold-fetches recorded"
+    );
+    assert!(
+        post_commit.current_bytes > 0,
+        "cache must hold the warmed segment's bytes; got current_bytes={}",
+        post_commit.current_bytes
+    );
+
+    // Producer's query hits the warm cache — no cold-fetch.
+    let batches = st
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("query");
+    assert_eq!(batches.len(), 1);
+
+    let post_query = cache.stats();
+    assert_eq!(
+        post_query.n_cold_fetches, 0,
+        "producer query must hit warm cache; cold-fetches stayed at 0"
+    );
+    assert_eq!(post_query.n_entries, 1);
+}
+
+#[test]
+fn writer_warm_cache_is_idempotent_under_writer_retry() {
+    // The writer's warm-insert path swallows
+    // already-cached URIs as a no-op. Sanity-check by
+    // committing twice with the same supertable handle —
+    // the second commit's pre-populated entries are
+    // distinct URIs (UUID v4), so each lands a fresh entry,
+    // but the cache itself never panics or double-inserts.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+
+    for _i in 0..3 {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["title"])).expect("append");
+        w.commit().expect("commit");
+    }
+
+    // 3 commits → 3 warm-inserted entries → 0 cold-fetches.
+    let stats = cache.stats();
+    assert_eq!(stats.n_entries, 3);
+    assert_eq!(stats.n_cold_fetches, 0);
+}
+
+#[test]
+fn manifest_segments_are_auto_pinned_by_supertable_create() {
+    // M14b.1: Supertable::create / Supertable::open install
+    // a Weak<SupertableInner>-based pinned_fn on the
+    // attached cache. The closure returns the current
+    // manifest's segment URI set. Pre-commit: empty.
+    // Post-commit: contains the published segment's URI.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+
+    // Before any commit: empty segment list → empty pinned
+    // set.
+    let pre = cache.current_pinned_uris();
+    assert!(pre.is_empty(), "expected empty pinned set; got {pre:?}");
+
+    // Commit one segment.
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["pinned alpha"])).expect("append");
+        w.commit().expect("commit");
+    }
+
+    // Pinned set must now contain the committed segment's
+    // URI.
+    let post = cache.current_pinned_uris();
+    assert_eq!(post.len(), 1, "expected 1 pinned URI; got {post:?}");
+    let reader = st.reader();
+    let segment_uri = reader
+        .manifest()
+        .superfile_list
+        .superfiles
+        .first()
+        .expect("segment exists")
+        .uri;
+    assert!(
+        post.contains(&segment_uri),
+        "pinned set must contain committed segment {segment_uri:?}; got {post:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_segments_are_auto_pinned_by_supertable_open() {
+    // The auto-pinning path runs from Supertable::open
+    // too — important because the cross-process consumer
+    // wires the cache + supertable in open, not in create.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+
+    // Producer (no cache attached): commit + drop.
+    {
+        let producer = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)));
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(&["from producer"])).expect("append");
+        w.commit().expect("commit");
+    }
+
+    // Consumer with cache.
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let consumer = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)))
+    .await
+    .expect("open");
+
+    let pinned = cache.current_pinned_uris();
+    assert_eq!(pinned.len(), 1);
+    let segment_uri = consumer
+        .reader()
+        .manifest()
+        .superfile_list
+        .superfiles
+        .first()
+        .expect("segment exists")
+        .uri;
+    assert!(pinned.contains(&segment_uri));
+}
+
+#[test]
+fn pinned_fn_releases_via_weak_when_supertable_drops() {
+    // Cache outliving its supertable is supported: the
+    // Weak<SupertableInner>-based closure detects the drop
+    // (via Weak::upgrade returning None) and falls through
+    // to the empty pinned set. Eviction then treats every
+    // entry as evictable. This is the "no leak via cache
+    // holding inner alive" property.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    {
+        let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["temp"])).expect("append");
+        w.commit().expect("commit");
+        assert_eq!(cache.current_pinned_uris().len(), 1);
+        // st drops at end of scope.
+    }
+
+    // Supertable dropped → Weak::upgrade returns None → pinned
+    // set is empty. Cache survives without the supertable.
+    assert!(
+        cache.current_pinned_uris().is_empty(),
+        "pinned set must be empty after supertable drops"
+    );
+}
+
+#[test]
+fn memory_budget_drives_post_commit_madvise_sweep() {
+    // M14c: with both with_disk_cache + with_memory_budget,
+    // the writer's post-commit path triggers
+    // sweep_for_budget. With a budget below the working
+    // set, the n_madvise_calls counter grows; without a
+    // budget, it doesn't.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    // Budget of 1 byte → every commit's mmap exceeds it
+    // → sweep fires.
+    let st = Supertable::create(
+        default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache))
+            .with_memory_budget(1),
+    );
+
+    let before = cache.stats().n_madvise_calls;
+
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["alpha"])).expect("append");
+        w.commit().expect("commit");
+    }
+
+    let after = cache.stats().n_madvise_calls;
+    assert!(
+        after > before,
+        "post-commit sweep must have called madvise; n_madvise_calls {} → {}",
+        before, after
+    );
+
+    // Confirm the budget + mmap_resident shows up in stats.
+    let stats = st.stats();
+    assert_eq!(stats.memory_budget_bytes, Some(1));
+    assert!(stats.mmap_resident_bytes.is_some());
+}
+
+#[test]
+fn memory_budget_unset_does_not_force_sweep() {
+    // Without with_memory_budget, the post-commit sweep
+    // doesn't fire — the cache's M8 idle-threshold sweep
+    // is the only mechanism, and a sub-second test won't
+    // trigger it.
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        LocalFsStorageProvider::new(storage_dir.path()).expect("provider"),
+    );
+    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)).with_disk_cache(Arc::clone(&cache)));
+
+    let before = cache.stats().n_madvise_calls;
+
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["alpha"])).expect("append");
+        w.commit().expect("commit");
+    }
+
+    let after = cache.stats().n_madvise_calls;
+    assert_eq!(
+        after, before,
+        "no budget → no forced sweep; n_madvise_calls {} → {}",
+        before, after
+    );
+
+    let stats = st.stats();
+    assert_eq!(stats.memory_budget_bytes, None);
+}
+
+#[test]
+fn no_cache_path_still_uses_in_memory_store() {
+    // Regression check: a supertable WITHOUT
+    // with_disk_cache still queries via the in-memory
+    // store. This is the 002 / legacy path; covered by the
+    // broader test suite, but reasserted here so a future
+    // refactor that accidentally engages the cache plumbing
+    // unconditionally is caught.
+    let st = Supertable::create(default_supertable_options());
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["only"])).expect("append");
+    w.commit().expect("commit");
+
+    let batches = st
+        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .expect("query");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    // The cache field is None; the path can't engage it.
+    // No counters to assert; the legacy in-memory store
+    // doesn't expose any.
+}

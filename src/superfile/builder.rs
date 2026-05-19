@@ -1,0 +1,924 @@
+//! Top-level superfile builder.
+//!
+//! **Naming convention.** `SuperfileBuilder` is a single-shot
+//! factory — `new → add_batch×N → finish(self) → Vec<u8>`,
+//! consumes self, produces one immutable artifact. Contrast
+//! [`crate::supertable::SupertableWriter`], which is a long-lived
+//! append handle (`append×N → commit`, repeated). The supertable
+//! writer internally constructs many superfile builders, one per
+//! shard per commit.
+//!
+//! `SuperfileBuilder` accepts user rows (Arrow batches + per-column
+//! vector slices), routes FTS-text columns into a unified `FtsBuilder`,
+//! routes vectors into a unified `VectorBuilder`, accumulates the
+//! Parquet-bound rows, and on `finish()` produces a single byte buffer
+//! that is a valid Parquet file with embedded BM25 + vector blobs
+//! between the last row group and a rewritten footer carrying `inf.*`
+//! KV metadata pointers.
+//!
+//! ## Row storage: `Vec<RecordBatch>`
+//!
+//! Accumulated rows are held as `Vec<RecordBatch>` rather than as
+//! per-column Arrow `ArrayBuilder`s. Why:
+//!
+//!   1. The natural calling pattern at scale is "I already have a
+//!      `RecordBatch`" — readers materialize batches, ETL pipelines
+//!      build them. Accepting batches end-to-end avoids forcing
+//!      callers to decompose into per-column scalars.
+//!   2. `add_batch` becomes a zero-copy push: Arrow column buffers
+//!      are reference-counted, so we `Arc::clone` the columns
+//!      instead of memcpy-ing into builders. O(num_columns) atomic
+//!      increments per batch, independent of row count or column
+//!      width.
+//!   3. Per-column `Box<dyn ArrayBuilder>` would require a typed
+//!      downcast per cell on append — a `DataType` match statement
+//!      we'd have to maintain as Arrow grows types (decimals,
+//!      dictionaries, lists, structs, …).
+//!   4. `ArrowWriter::write` takes `RecordBatch` directly, so
+//!      `finish()` just iterates and forwards — no intermediate
+//!      "drain builders into one big RecordBatch" step.
+//!
+//! Tradeoff: we hold strong `Arc` references to the caller's column
+//! buffers until `finish()`. Callers who hand us a batch can't drop
+//! it to reclaim memory mid-build; they share the buffer with us
+//! until the build completes. For batch-ETL this is invisible (the
+//! caller hands off and forgets); for streaming-with-backpressure it
+//! could matter. There is no `add_row(scalars, vectors)` API today
+//! — row-at-a-time callers must construct 1-row `RecordBatch`es
+//! themselves. A typed `add_row(&[ScalarValue], ...)` helper can be
+//! added later if profiling shows row-at-a-time callers need it.
+//!
+//! ## Tokenizer scope: one shared instance
+//!
+//! `BuilderOptions` carries a single `tokenizer: Option<Arc<dyn
+//! Tokenizer>>` used for every FTS column. `FtsConfig` carries only
+//! the column name. Why:
+//!
+//!   1. There is one tokenizer implementation today
+//!      (`AsciiLowerTokenizer`); per-column variation has no caller.
+//!   2. The underlying `FtsBuilder` takes one tokenizer for the
+//!      whole index. Threading per-column tokenizers through it
+//!      without inner refactor leaves only awkward options
+//!      (silently use the first column's tokenizer; `Arc::ptr_eq`
+//!      validate that all columns share an instance; or extend
+//!      `FtsBuilder` to hold `Vec<Arc<dyn Tokenizer>>` indexed by
+//!      column_id and dispatch per (col, doc) pair).
+//!   3. The third is the right shape when we ship a second tokenizer
+//!      — but it's a real interior refactor across `FtsBuilder`,
+//!      `FtsReader`, and the `inf.fts.columns` JSON, and there is no
+//!      caller asking for it.
+//!
+//! Forward-compat: when a second tokenizer ships (Unicode segmenter,
+//! language-specific stemmers, …), `FtsConfig` grows a `tokenizer`
+//! field, `BuilderOptions.tokenizer` becomes a per-column override
+//! or is removed, and `FtsBuilder::new` becomes
+//! `FtsBuilder::with_tokenizers(Vec<Arc<dyn Tokenizer>>)`. The
+//! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
+//! each entry (currently always `"ascii_lower"`), so the on-disk
+//! format is forward-compatible without a file rewrite.
+
+use crate::superfile::BuildError;
+use crate::superfile::format::footer::{ParquetParts, write_parquet_with_blobs};
+use crate::superfile::format::{self, kv};
+use crate::superfile::fts::builder::FtsBuilder;
+use crate::superfile::fts::tokenize::Tokenizer;
+use crate::superfile::vector::builder::{VectorBuilder, VectorConfig as VecBuildConfig};
+use crate::superfile::vector::distance::Metric;
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::{DataType, Schema};
+use parquet::basic::Compression;
+use std::sync::Arc;
+
+/// Per-column FTS configuration. The `column` must exist in
+/// `BuilderOptions.schema` and be `LargeUtf8`.
+#[derive(Clone)]
+pub struct FtsConfig {
+    pub column: String,
+}
+
+/// Per-column vector configuration. Mirrors the inner
+/// [`VecBuildConfig`] but uses `column` to match the FTS naming for
+/// API consistency at the superfile level.
+#[derive(Clone)]
+pub struct VectorConfig {
+    pub column: String,
+    pub dim: usize,
+    pub n_cent: usize,
+    pub rot_seed: u64,
+    pub metric: Metric,
+}
+
+/// All knobs needed to build a superfile.
+pub struct BuilderOptions {
+    /// Arrow schema. Must contain `id_column` (typed
+    /// `Decimal128(38, 0)`) and every FTS column listed in
+    /// `fts_columns` (typed `LargeUtf8`).
+    ///
+    /// **Layering note.** When `SuperfileBuilder` is driven
+    /// from the supertable, the schema passed here is the
+    /// supertable's *effective* schema — the user's schema
+    /// with the id column prepended. The supertable hides
+    /// the id column from its public API surface;
+    /// `SuperfileBuilder` sees it as a normal required field
+    /// because the format spec carries primary keys in the
+    /// Parquet body alongside scalar data.
+    pub schema: Arc<Schema>,
+    /// Name of the primary-key column in `schema`. Must be
+    /// `Decimal128(38, 0)`.
+    pub id_column: String,
+    /// FTS columns. Each `column` must exist in `schema` as
+    /// `LargeUtf8`; the same field stays in the Parquet body
+    /// (readable via SQL `SELECT title …` / scalar
+    /// predicates like `WHERE title LIKE …`) AND is indexed
+    /// into the embedded FTS blob for BM25 ranking
+    /// (`bm25_search(column, …)`). Storage cost is mild
+    /// double-storage: raw text in Parquet plus the FST +
+    /// PFOR-delta posting structures in the FTS blob, which
+    /// dedupe terms.
+    ///
+    /// Contrast with [`Self::vector_columns`]: vector
+    /// columns leave the Parquet body (stripped by the
+    /// supertable's `vector_split` at commit time) and live
+    /// only in the embedded vector blob, so they are
+    /// invisible to SQL.
+    ///
+    /// May be empty.
+    pub fts_columns: Vec<FtsConfig>,
+    /// Vector columns. `column` must NOT collide with a
+    /// column in `schema`, and must be unique across both
+    /// `fts_columns` and `vector_columns`. May be empty.
+    ///
+    /// At this layer (superfile), a vector "column" is a
+    /// **logical name only** — the f32 slices are passed
+    /// separately to `add_batch(scalar_batch, &[&[f32]])` and
+    /// the name lives in `inf.vec.columns` KV metadata, not
+    /// in the Parquet schema. The "must NOT collide with a
+    /// column in `schema`" rule is the format-layer
+    /// disambiguation that keeps vector names out of the
+    /// Parquet column namespace.
+    ///
+    /// At the supertable layer the constraint reads
+    /// differently: there, vector columns ARE schema fields
+    /// (typed `FixedSizeList<Float32, dim>`). The supertable's
+    /// `vector_split` strips them at commit time and forwards
+    /// `(scalar_only_batch, &[&[f32]])` down to this builder
+    /// — so by the time a `BuilderOptions` reaches us, the
+    /// vector names have already left the scalar schema. The
+    /// supertable enforces the same cross-list uniqueness
+    /// against its FTS columns at construction.
+    ///
+    /// To run both FTS and vector against the same business
+    /// concept (e.g. semantic + lexical "description"
+    /// search), model it as **two columns** — one
+    /// `LargeUtf8` for the text and one `FixedSizeList<f32>`
+    /// for the externally-computed embedding. Hybrid retrieval
+    /// fuses results from `bm25_search(text_col, ...)` and
+    /// `vector_search(emb_col, ...)`.
+    pub vector_columns: Vec<VectorConfig>,
+    /// Shared tokenizer for all FTS columns. Required iff
+    /// `fts_columns` is non-empty.
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// Parquet target row-group size (number of rows).
+    pub row_group_size: usize,
+    /// Parquet column-chunk compression.
+    pub compression: Compression,
+}
+
+impl BuilderOptions {
+    /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
+    ///
+    /// TODO: expose `row_group_size` and `compression` as
+    /// `supertable.parquet.*` fields in `config.yaml` so
+    /// operators can tune them per deployment without
+    /// recompiling. Follow the existing pattern of
+    /// `supertable.commit_threshold_size_mb` →
+    /// `SupertableOptions::apply_config` (which already
+    /// lives at the config layer with its own default).
+    pub fn new(
+        schema: Arc<Schema>,
+        id_column: impl Into<String>,
+        fts_columns: Vec<FtsConfig>,
+        vector_columns: Vec<VectorConfig>,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+    ) -> Self {
+        Self {
+            schema,
+            id_column: id_column.into(),
+            fts_columns,
+            vector_columns,
+            tokenizer,
+            row_group_size: 65_536,
+            compression: Compression::ZSTD(
+                parquet::basic::ZstdLevel::try_new(3)
+                    .expect("zstd level 3 is in the valid 1..=22 range"),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for SuperfileBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuperfileBuilder")
+            .field("id_column", &self.opts.id_column)
+            .field("n_fts_columns", &self.opts.fts_columns.len())
+            .field("n_vector_columns", &self.opts.vector_columns.len())
+            .field("n_batches", &self.batches.len())
+            .field("next_local_doc_id", &self.next_local_doc_id)
+            .finish()
+    }
+}
+
+pub struct SuperfileBuilder {
+    opts: BuilderOptions,
+    /// Cached column indices for FTS columns, parallel to `opts.fts_columns`.
+    fts_col_idxs: Vec<usize>,
+    /// Accumulated input batches. Drained at `finish()`.
+    batches: Vec<RecordBatch>,
+    /// FtsBuilder accumulating tokens across every `add_batch`.
+    /// `None` if `opts.fts_columns` is empty.
+    fts_builder: Option<FtsBuilder>,
+    /// VectorBuilder accumulating vectors across every `add_batch`.
+    /// `None` if `opts.vector_columns` is empty.
+    vec_builder: Option<VectorBuilder>,
+    /// Running local doc-id counter, increments with every row in
+    /// every `add_batch`.
+    next_local_doc_id: u32,
+}
+
+impl SuperfileBuilder {
+    /// Construct from options. Validates schema + names; returns
+    /// `BuildError::*` on any inconsistency.
+    pub fn new(opts: BuilderOptions) -> Result<Self, BuildError> {
+        // 1. id_column must exist and be `Decimal128(38, 0)`.
+        //    Precision 38 + scale 0 carries every 128-bit
+        //    signed integer value without truncation; that's
+        //    the type the supertable injects via its
+        //    snowflake-shaped IdGenerator.
+        let id_idx = opts
+            .schema
+            .index_of(&opts.id_column)
+            .map_err(|_| BuildError::MissingIdColumn(opts.id_column.clone()))?;
+        let id_field = opts.schema.field(id_idx);
+        let expected = DataType::Decimal128(38, 0);
+        if id_field.data_type() != &expected {
+            return Err(BuildError::IdColumnWrongType(
+                opts.id_column.clone(),
+                format!("{:?}", id_field.data_type()),
+            ));
+        }
+
+        // 2. Each FTS column must exist and be LargeUtf8.
+        let mut fts_col_idxs = Vec::with_capacity(opts.fts_columns.len());
+        for fc in &opts.fts_columns {
+            let idx = opts
+                .schema
+                .index_of(&fc.column)
+                .map_err(|_| BuildError::FtsColumnMissing(fc.column.clone()))?;
+            let f = opts.schema.field(idx);
+            if f.data_type() != &DataType::LargeUtf8 {
+                return Err(BuildError::FtsColumnMustBeLargeUtf8 {
+                    column: fc.column.clone(),
+                    actual: format!("{:?}", f.data_type()),
+                });
+            }
+            fts_col_idxs.push(idx);
+        }
+
+        // 3. No reserved separator / prefix / duplication across the
+        //    combined logical-name namespace (FTS + vector + any
+        //    schema-name-vs-vector collision).
+        let mut seen_logical: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for fc in &opts.fts_columns {
+            check_user_column_name(&fc.column)?;
+            if !seen_logical.insert(fc.column.as_str()) {
+                return Err(BuildError::DuplicateLogicalName(fc.column.clone()));
+            }
+        }
+        for vc in &opts.vector_columns {
+            check_user_column_name(&vc.column)?;
+            if !seen_logical.insert(vc.column.as_str()) {
+                return Err(BuildError::DuplicateLogicalName(vc.column.clone()));
+            }
+            // Vector logical name must not collide with a schema column.
+            if opts.schema.index_of(&vc.column).is_ok() {
+                return Err(BuildError::DuplicateLogicalName(vc.column.clone()));
+            }
+        }
+
+        // 4. FTS requires a tokenizer.
+        if !opts.fts_columns.is_empty() && opts.tokenizer.is_none() {
+            return Err(BuildError::FtsColumnTypeInvalid {
+                column: opts.fts_columns[0].column.clone(),
+                actual: "missing tokenizer in BuilderOptions".to_string(),
+            });
+        }
+
+        // 5. Wire up the unified FTS + vector sub-builders.
+        let fts_builder = if opts.fts_columns.is_empty() {
+            None
+        } else {
+            let tk = opts
+                .tokenizer
+                .as_ref()
+                .expect("validated non-empty FTS implies Some tokenizer")
+                .clone();
+            let mut fb = FtsBuilder::new(tk);
+            for fc in &opts.fts_columns {
+                fb.register_column(fc.column.clone())?;
+            }
+            Some(fb)
+        };
+
+        let vec_builder = if opts.vector_columns.is_empty() {
+            None
+        } else {
+            let mut vb = VectorBuilder::new();
+            for vc in &opts.vector_columns {
+                vb.register_column(VecBuildConfig {
+                    name: vc.column.clone(),
+                    dim: vc.dim,
+                    n_cent: vc.n_cent,
+                    rot_seed: vc.rot_seed,
+                    metric: vc.metric,
+                })?;
+            }
+            Some(vb)
+        };
+
+        Ok(Self {
+            opts,
+            fts_col_idxs,
+            batches: Vec::new(),
+            fts_builder,
+            vec_builder,
+            next_local_doc_id: 0,
+        })
+    }
+
+    /// Append a `RecordBatch`. Its schema must match
+    /// `opts.schema` field-for-field. `vectors[i]` is the flat f32
+    /// buffer for `opts.vector_columns[i]`, length
+    /// `batch.num_rows() * vector_columns[i].dim`.
+    pub fn add_batch(&mut self, batch: &RecordBatch, vectors: &[&[f32]]) -> Result<(), BuildError> {
+        if batch.schema().fields() != self.opts.schema.fields() {
+            return Err(BuildError::BatchSchemaMismatch);
+        }
+        if vectors.len() != self.opts.vector_columns.len() {
+            return Err(BuildError::VectorCountMismatch {
+                expected: self.opts.vector_columns.len(),
+                actual: vectors.len(),
+            });
+        }
+        let n_rows = batch.num_rows() as u32;
+
+        // Validate vector slice lengths up-front before mutating any state.
+        for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+            let expected_total = (n_rows as usize) * vc.dim;
+            if vectors[i].len() != expected_total {
+                return Err(BuildError::VectorDimMismatch {
+                    column: vc.column.clone(),
+                    expected: expected_total,
+                    actual: vectors[i].len(),
+                });
+            }
+        }
+
+        // Route FTS columns. Pull each column's LargeStringArray once.
+        if let Some(fb) = self.fts_builder.as_mut() {
+            for (col_id, &schema_idx) in self.fts_col_idxs.iter().enumerate() {
+                let arr = batch.column(schema_idx);
+                let strs = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .expect("schema validated as LargeUtf8");
+                for row in 0..(n_rows as usize) {
+                    let local_doc_id = self.next_local_doc_id + row as u32;
+                    // Null-as-empty: we still index a 0-token doc so doc_lengths
+                    // stays in lock-step with Parquet rows.
+                    let text = if strs.is_null(row) {
+                        ""
+                    } else {
+                        strs.value(row)
+                    };
+                    fb.add_doc(col_id as u32, local_doc_id, text)?;
+                }
+            }
+        }
+
+        // Route vectors.
+        if let Some(vb) = self.vec_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    vb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
+        }
+
+        self.next_local_doc_id += n_rows;
+        self.batches.push(batch.clone());
+        Ok(())
+    }
+
+    /// Consume the builder and emit one self-contained superfile.
+    ///
+    /// If no `add_batch` calls have landed any rows, returns an
+    /// empty `Vec<u8>` — there's no Parquet body to write and no
+    /// FTS/vector blobs to embed.
+    pub fn finish(mut self) -> Result<Vec<u8>, BuildError> {
+        if self.next_local_doc_id == 0 {
+            return Ok(Vec::new());
+        }
+        let n_docs = self.next_local_doc_id as u64;
+
+        let fts_blob: Vec<u8> = self
+            .fts_builder
+            .take()
+            .map(FtsBuilder::finish)
+            .unwrap_or_default();
+        let vec_blob: Vec<u8> = self
+            .vec_builder
+            .take()
+            .map(VectorBuilder::finish)
+            .unwrap_or_default();
+
+        // Assemble inf.* KV metadata.
+        let mut kvs: Vec<(String, String)> = vec![
+            (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
+            (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
+            (kv::ID_COLUMN.into(), self.opts.id_column.clone()),
+            (kv::N_DOCS.into(), n_docs.to_string()),
+            (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
+        ];
+        if !self.opts.fts_columns.is_empty() {
+            kvs.push((
+                kv::FTS_COLUMNS.into(),
+                fts_columns_json(&self.opts.fts_columns),
+            ));
+        }
+        if !self.opts.vector_columns.is_empty() {
+            kvs.push((
+                kv::VEC_COLUMNS.into(),
+                vec_columns_json(&self.opts.vector_columns),
+            ));
+        }
+
+        let parts: ParquetParts = write_parquet_with_blobs(
+            &self.opts.schema,
+            &self.batches,
+            &fts_blob,
+            &vec_blob,
+            &kvs,
+            self.opts.compression,
+            self.opts.row_group_size,
+        )?;
+        Ok(parts.bytes)
+    }
+}
+
+/// Reject user-supplied column names that would collide with
+/// infino's internal byte-protocol or KV-key conventions:
+///
+/// - `\x1F` (ASCII Unit Separator) is the FST dictionary's
+///   `(column_id, term)` separator. A column name containing
+///   it would break the FST decode path that splits on it.
+/// - The `inf.` prefix is reserved for the infino-managed
+///   Parquet KV metadata keys (`inf.format`, `inf.fts.columns`,
+///   etc.). Allowing a user column to start with it would risk
+///   collision with future infino-defined keys.
+///
+/// Called at `SuperfileBuilder::new` for every FTS and vector
+/// column. The supertable layer carries the same check (under
+/// the same name) on its own column lists so callers see the
+/// typed error at the earliest possible construction point.
+fn check_user_column_name(name: &str) -> Result<(), BuildError> {
+    if name.as_bytes().contains(&format::FST_SEPARATOR) {
+        return Err(BuildError::ReservedSeparatorInColumnName(name.to_string()));
+    }
+    if name.starts_with(format::RESERVED_PREFIX) {
+        return Err(BuildError::ReservedPrefixInColumnName(name.to_string()));
+    }
+    Ok(())
+}
+
+/// Serialize `[FtsConfig]` to the JSON form stored in the
+/// Parquet KV metadata key `inf.fts.columns`. Hand-rolled
+/// because the shape is fixed + small and `serde_derive` on
+/// `FtsConfig` would add a derived `Serialize` impl across
+/// the format boundary purely to write five characters of
+/// JSON per column.
+///
+/// Output shape per column:
+/// `{"name":"<escaped>","tokenizer":"ascii_lower"}`.
+/// `ascii_lower` is hardcoded today because that's the only
+/// tokenizer the format supports.
+fn fts_columns_json(cols: &[FtsConfig]) -> String {
+    let mut s = String::from("[");
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(r#"{"name":""#);
+        s.push_str(&escape_json(&c.column));
+        s.push_str(r#"","tokenizer":"ascii_lower"}"#);
+    }
+    s.push(']');
+    s
+}
+
+/// Serialize `[VectorConfig]` to the JSON form stored in the
+/// Parquet KV metadata key `inf.vec.columns`. Same hand-rolled
+/// rationale as `fts_columns_json` — fixed shape, no derived
+/// `Serialize` needed.
+///
+/// Output shape per column:
+/// `{"name":"<escaped>","dim":<u>,"n_cent":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
+/// The reader at open time parses this back into
+/// `VectorConfig` to drive distance kernels + IVF probing.
+fn vec_columns_json(cols: &[VectorConfig]) -> String {
+    let mut s = String::from("[");
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(r#"{"name":""#);
+        s.push_str(&escape_json(&c.column));
+        s.push_str(r#"","dim":"#);
+        s.push_str(&c.dim.to_string());
+        s.push_str(r#","n_cent":"#);
+        s.push_str(&c.n_cent.to_string());
+        s.push_str(r#","rot_seed":"#);
+        s.push_str(&c.rot_seed.to_string());
+        s.push_str(r#","metric":""#);
+        s.push_str(metric_str(c.metric));
+        s.push_str("\"}");
+    }
+    s.push(']');
+    s
+}
+
+/// Stable string label for each `Metric` variant — the form
+/// stored in `inf.vec.columns` JSON. Matches the strings the
+/// reader's parser accepts; do not rename without updating
+/// both sides.
+fn metric_str(m: Metric) -> &'static str {
+    match m {
+        Metric::L2Sq => "l2sq",
+        Metric::Cosine => "cosine",
+        Metric::NegDot => "negdot",
+    }
+}
+
+/// Minimal JSON string-value escape: quote, backslash, the
+/// four whitespace escapes JSON requires, plus the
+/// `\u00XX`-encoded form for any other control character
+/// (< 0x20). All other characters (including all non-ASCII)
+/// pass through unchanged — column names are arbitrary
+/// UTF-8 and JSON strings are UTF-8 natively, so escaping
+/// non-control non-quote characters would only bloat the
+/// output.
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
+    use arrow_array::LargeStringArray;
+    use arrow_schema::Field;
+
+    fn schema_with_fts() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    fn opts_minimal() -> BuilderOptions {
+        BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        )
+    }
+
+    #[test]
+    fn new_rejects_missing_id_column() {
+        let mut opts = opts_minimal();
+        opts.id_column = "nope".into();
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::MissingIdColumn(_)));
+    }
+
+    #[test]
+    fn new_rejects_id_column_not_uint64() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            schema,
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::IdColumnWrongType(_, _)));
+    }
+
+    #[test]
+    fn new_rejects_fts_column_missing_from_schema() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "nope".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::FtsColumnMissing(_)));
+    }
+
+    #[test]
+    fn new_rejects_fts_column_wrong_type() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::Utf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            schema,
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::FtsColumnMustBeLargeUtf8 { .. }));
+    }
+
+    #[test]
+    fn new_rejects_duplicate_logical_name_across_fts_and_vector() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![default_vector_config("title", 1)],
+            Some(default_tokenizer()),
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::DuplicateLogicalName(_)));
+    }
+
+    #[test]
+    fn new_rejects_vector_column_collides_with_schema() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("body", 1)], // same name as a schema column
+            None,
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::DuplicateLogicalName(_)));
+    }
+
+    #[test]
+    fn new_rejects_reserved_prefix_in_logical_name() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("inf.bad", 1)],
+            None,
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::ReservedPrefixInColumnName(_)));
+    }
+
+    #[test]
+    fn new_with_fts_requires_tokenizer() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            None,
+        );
+        let err = SuperfileBuilder::new(opts).expect_err("expected error");
+        assert!(matches!(err, BuildError::FtsColumnTypeInvalid { .. }));
+    }
+
+    fn batch_two_rows(schema: &Arc<Schema>) -> RecordBatch {
+        let ids = decimal128_ids(vec![10u64, 11]);
+        let title = LargeStringArray::from(vec!["hello world", "rust async"]);
+        let body = LargeStringArray::from(vec!["foo bar", "baz quux"]);
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(title), Arc::new(body)],
+        )
+        .expect("build RecordBatch")
+    }
+
+    #[test]
+    fn add_batch_increments_next_local_doc_id() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b.add_batch(&batch, &[]).expect("add_batch");
+        assert_eq!(b.next_local_doc_id, 2);
+        b.add_batch(&batch, &[]).expect("add_batch");
+        assert_eq!(b.next_local_doc_id, 4);
+    }
+
+    #[test]
+    fn add_batch_rejects_schema_mismatch() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        // Intentionally mismatched: a single-column UInt64 schema
+        // whose type doesn't match the builder's
+        // Decimal128(38, 0) id column.
+        let other = Arc::new(Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::UInt64,
+            false,
+        )]));
+        let bad = RecordBatch::try_new(other, vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))])
+            .expect("build RecordBatch");
+        let err = b.add_batch(&bad, &[]).expect_err("expected error");
+        assert!(matches!(err, BuildError::BatchSchemaMismatch));
+    }
+
+    #[test]
+    fn add_batch_rejects_wrong_vector_count() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 1)],
+            None,
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let err = b.add_batch(&batch, &[]).expect_err("expected error");
+        assert!(matches!(err, BuildError::VectorCountMismatch { .. }));
+    }
+
+    #[test]
+    fn add_batch_rejects_wrong_vector_dim() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 1)],
+            None,
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        // Need 2 rows × 16 dim = 32 floats; pass 30 instead.
+        let bad: Vec<f32> = vec![0.0; 30];
+        let err = b
+            .add_batch(&batch, &[bad.as_slice()])
+            .expect_err("expected error");
+        assert!(matches!(err, BuildError::VectorDimMismatch { .. }));
+    }
+
+    #[test]
+    fn finish_with_no_indexes_produces_valid_parquet() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let ids = decimal128_ids(vec![1u64, 2, 3]);
+        let titles = LargeStringArray::from(vec!["a", "b", "c"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
+            .expect("build RecordBatch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+        // Must be a valid Parquet file.
+        assert_eq!(&bytes[..4], b"PAR1");
+        assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+    }
+
+    #[test]
+    fn finish_emits_required_kv_pointers_for_fts() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+        let kv =
+            crate::superfile::format::footer::read_kv_metadata(&bytes).expect("read kv metadata");
+        assert_eq!(
+            kv.get("inf.format").map(String::as_str),
+            Some("infino-superfile")
+        );
+        assert_eq!(kv.get("inf.id_column").map(String::as_str), Some("doc_id"));
+        assert_eq!(kv.get("inf.n_docs").map(String::as_str), Some("2"));
+        assert!(kv.contains_key("inf.fts.offset"));
+        assert!(kv.contains_key("inf.fts.length"));
+        assert!(kv.contains_key("inf.fts.columns"));
+        assert!(!kv.contains_key("inf.vec.offset"));
+    }
+
+    #[test]
+    fn finish_emits_kv_pointers_for_vectors() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+            None,
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        // 2 rows × 16 dim, normalized so cosine doesn't NaN — simple
+        // unit-axis vectors per row.
+        let mut v: Vec<f32> = vec![0.0; 32];
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+        let kv =
+            crate::superfile::format::footer::read_kv_metadata(&bytes).expect("read kv metadata");
+        assert!(kv.contains_key("inf.vec.offset"));
+        assert!(kv.contains_key("inf.vec.length"));
+        assert!(kv.contains_key("inf.vec.columns"));
+        assert!(!kv.contains_key("inf.fts.offset"));
+    }
+
+    #[test]
+    fn fts_columns_json_round_trip_shape() {
+        let cols = vec![
+            FtsConfig {
+                column: "title".into(),
+            },
+            FtsConfig {
+                column: "body".into(),
+            },
+        ];
+        let s = fts_columns_json(&cols);
+        assert!(s.starts_with('['));
+        assert!(s.contains(r#""name":"title""#));
+        assert!(s.contains(r#""name":"body""#));
+        assert!(s.contains(r#""tokenizer":"ascii_lower""#));
+    }
+
+    #[test]
+    fn vec_columns_json_round_trip_shape() {
+        let cols = vec![VectorConfig {
+            column: "emb".into(),
+            dim: 384,
+            n_cent: 64,
+            rot_seed: 99,
+            metric: Metric::L2Sq,
+        }];
+        let s = vec_columns_json(&cols);
+        assert!(s.contains(r#""name":"emb""#));
+        assert!(s.contains(r#""dim":384"#));
+        assert!(s.contains(r#""n_cent":64"#));
+        assert!(s.contains(r#""rot_seed":99"#));
+        assert!(s.contains(r#""metric":"l2sq""#));
+    }
+
+    #[test]
+    fn escape_json_handles_control_chars() {
+        assert_eq!(escape_json(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_json("a\\b"), "a\\\\b");
+        assert_eq!(escape_json("a\nb"), "a\\nb");
+        assert_eq!(escape_json("a\x01b"), "a\\u0001b");
+    }
+}

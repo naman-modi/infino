@@ -1,0 +1,483 @@
+//! LocalFS-backed [`StorageProvider`].
+//!
+//! Wraps `object_store::local::LocalFileSystem` so the same
+//! supertable code paths exercise both LocalFS (dev / tests /
+//! single-node) and S3 (production / multi-node) without
+//! backend-specific branching above the storage trait.
+//!
+//! The path scoping is: every URI handed to a method is
+//! relative to the `root` passed at construction. So
+//! `provider.get("data/seg-abc.sf")` reads
+//! `<root>/data/seg-abc.sf`. No upward traversal — paths with
+//! `..` get rejected by `object_store::path::Path`.
+
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use object_store::path::Path as ObjPath;
+use object_store::{
+    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+};
+
+use super::{ObjectMeta, StorageError, StorageProvider};
+
+#[derive(Debug)]
+pub struct LocalFsStorageProvider {
+    root: PathBuf,
+    store: Arc<object_store::local::LocalFileSystem>,
+}
+
+impl LocalFsStorageProvider {
+    /// Construct a new LocalFS-backed provider rooted at
+    /// `root`. The directory is created (recursively) if it
+    /// doesn't exist; surfacing
+    /// [`StorageError::Permanent`] only if creation fails
+    /// (permission denied, parent doesn't exist + we can't
+    /// mkdir, etc.).
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let root: PathBuf = root.into();
+        std::fs::create_dir_all(&root).map_err(|e| StorageError::Permanent {
+            uri: root.display().to_string(),
+            source: Box::new(e),
+        })?;
+        let store = object_store::local::LocalFileSystem::new_with_prefix(&root).map_err(|e| {
+            StorageError::Permanent {
+                uri: root.display().to_string(),
+                source: Box::new(e),
+            }
+        })?;
+        Ok(Self {
+            root,
+            store: Arc::new(store),
+        })
+    }
+
+    /// Filesystem root this provider is scoped to. Useful for
+    /// tests that need to inspect on-disk state directly.
+    pub fn root(&self) -> &PathBuf {
+        &self.root
+    }
+
+    fn path(uri: &str) -> Result<ObjPath, StorageError> {
+        ObjPath::parse(uri).map_err(|e| StorageError::Permanent {
+            uri: uri.into(),
+            source: Box::new(e),
+        })
+    }
+}
+
+/// Translate an `object_store::Error` to our `StorageError`.
+///
+/// The mapping:
+/// - `NotFound` → `NotFound`
+/// - `AlreadyExists` / `Precondition` → `PreconditionFailed`
+/// - everything else → `Permanent` (object_store has already
+///   retried transient failures internally per its
+///   `RetryConfig`; by the time we see one here it's
+///   exhausted)
+fn translate(uri: &str, e: ObjError) -> StorageError {
+    match e {
+        ObjError::NotFound { .. } => StorageError::NotFound { uri: uri.into() },
+        ObjError::AlreadyExists { .. } | ObjError::Precondition { .. } => {
+            StorageError::PreconditionFailed { uri: uri.into() }
+        }
+        ObjError::Generic { source, .. } => StorageError::TransientExhausted {
+            uri: uri.into(),
+            source,
+        },
+        other => StorageError::Permanent {
+            uri: uri.into(),
+            source: Box::new(other),
+        },
+    }
+}
+
+#[async_trait]
+impl StorageProvider for LocalFsStorageProvider {
+    async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+        let path = Self::path(uri)?;
+        let meta = self.store.head(&path).await.map_err(|e| translate(uri, e))?;
+        Ok(ObjectMeta {
+            size: meta.size as u64,
+            etag: meta.e_tag,
+        })
+    }
+
+    async fn get(&self, uri: &str) -> Result<Bytes, StorageError> {
+        let path = Self::path(uri)?;
+        let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
+        result.bytes().await.map_err(|e| translate(uri, e))
+    }
+
+    async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+        let path = Self::path(uri)?;
+        self.store
+            .get_range(&path, range)
+            .await
+            .map_err(|e| translate(uri, e))
+    }
+
+    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let path = Self::path(uri)?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        self.store
+            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+            .await
+            .map(|_| ())
+            .map_err(|e| translate(uri, e))
+    }
+
+    async fn put_if_match(
+        &self,
+        uri: &str,
+        bytes: Bytes,
+        expected_etag: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let path = Self::path(uri)?;
+        match expected_etag {
+            // None == create-only-if-absent. Same as put_atomic.
+            None => {
+                let opts = PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                };
+                self.store
+                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| translate(uri, e))
+            }
+            // Some(tag) == update-if-etag-matches.
+            //
+            // `object_store::LocalFileSystem` doesn't implement
+            // `PutMode::Update` directly (it surfaces `NotImplemented`).
+            // We implement etag-conditional update as
+            // read-then-overwrite, bracketed by an advisory
+            // `flock` on `<root>/_supertable/.lock` so two
+            // processes can't both observe the same prior etag
+            // and race the overwrite. POSIX `flock` releases on
+            // fd close, so the lock file drops at the end of
+            // this branch and the next contender proceeds.
+            // S3 / GCS providers use native conditional PUT and
+            // don't need this scaffolding — see
+            // `S3StorageProvider::put_if_match`.
+            Some(expected) => {
+                use fs4::tokio::AsyncFileExt;
+                let lock_path = self.root.join("_supertable").join(".lock");
+                // The pointer commit path already creates
+                // `_supertable/` on the first write; doing it
+                // here too is idempotent + makes the lock
+                // robust against any other call site that
+                // routes through put_if_match before the
+                // pointer commits.
+                if let Some(parent) = lock_path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let lock_file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_path)
+                    .await
+                    .map_err(|e| StorageError::Permanent {
+                        uri: uri.into(),
+                        source: Box::new(e),
+                    })?;
+                lock_file.lock_exclusive().map_err(|e| StorageError::Permanent {
+                    uri: uri.into(),
+                    source: Box::new(e),
+                })?;
+                // Lock held below until `lock_file` drops at
+                // end of branch (or early-return). Holding it
+                // across `.await` points blocks the
+                // tokio worker; head + put on LocalFS are
+                // microseconds, so the worst-case stall is
+                // bounded.
+
+                let result: Result<(), StorageError> = async {
+                    let current = self.store.head(&path).await.map_err(|e| translate(uri, e))?;
+                    let current_etag = current.e_tag.as_deref().unwrap_or("");
+                    if current_etag != expected {
+                        return Err(StorageError::PreconditionFailed { uri: uri.into() });
+                    }
+                    let opts = PutOptions {
+                        mode: PutMode::Overwrite,
+                        ..Default::default()
+                    };
+                    self.store
+                        .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| translate(uri, e))
+                }
+                .await;
+                // `lock_file` drops here → POSIX flock
+                // releases when the fd closes. Best-effort
+                // explicit unlock too, ignoring failures (the
+                // kernel cleans up regardless).
+                let _ = lock_file.unlock_async().await;
+                result
+            }
+        }
+    }
+
+    async fn put_multipart(
+        &self,
+        uri: &str,
+    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        let path = Self::path(uri)?;
+        self.store
+            .put_multipart(&path)
+            .await
+            .map_err(|e| translate(uri, e))
+    }
+
+    async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+        let path = Self::path(uri)?;
+        match self.store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(ObjError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(translate(uri, e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `StorageProvider` trait contract against
+    //! `LocalFsStorageProvider`.
+    //!
+    //! Covers: round-trip put + get; head returns accurate
+    //! size + etag presence; range-fetch over a known
+    //! object; `put_atomic` rejects an already-existing
+    //! target; `put_if_match` honors ETag preconditions
+    //! (success + failure paths) — the OCC primitive the
+    //! manifest-pointer commit rides on; `delete` is
+    //! idempotent on a missing target; `get` / `head` /
+    //! `get_range` return `NotFound` on missing; advisory
+    //! flock file is created on `put_if_match` (the TOCTOU-
+    //! closing path); `put_multipart` returns a handle.
+    use super::*;
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    fn provider() -> (TempDir, LocalFsStorageProvider) {
+        let dir = TempDir::new().expect("tempdir");
+        let p = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        (dir, p)
+    }
+
+    #[tokio::test]
+    async fn put_then_get_roundtrip() {
+        let (_dir, p) = provider();
+        let payload = Bytes::from_static(b"hello supertable storage");
+        p.put_atomic("data/seg-abc.sf", payload.clone())
+            .await
+            .expect("put");
+        let got = p.get("data/seg-abc.sf").await.expect("get");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn head_returns_accurate_size() {
+        let (_dir, p) = provider();
+        let payload = Bytes::from_static(&[0xABu8; 1024]);
+        p.put_atomic("data/seg-head.sf", payload).await.expect("put");
+
+        let meta = p.head("data/seg-head.sf").await.expect("head");
+        assert_eq!(meta.size, 1024);
+        // LocalFS surfaces an mtime-derived etag; other
+        // backends may not. Assert presence, not value.
+        assert!(meta.etag.is_some(), "LocalFS should surface an etag");
+    }
+
+    #[tokio::test]
+    async fn get_range_reads_exact_slice() {
+        let (_dir, p) = provider();
+        let payload: Vec<u8> = (0u8..=255).collect();
+        p.put_atomic("data/seg-range.sf", Bytes::from(payload.clone()))
+            .await
+            .expect("put");
+
+        let slice = p
+            .get_range("data/seg-range.sf", 32..64)
+            .await
+            .expect("range");
+        assert_eq!(slice.as_ref(), &payload[32..64]);
+
+        let tail = p
+            .get_range("data/seg-range.sf", 255..256)
+            .await
+            .expect("range tail");
+        assert_eq!(tail.as_ref(), &payload[255..256]);
+    }
+
+    #[tokio::test]
+    async fn put_atomic_rejects_existing() {
+        let (_dir, p) = provider();
+        let payload = Bytes::from_static(b"first writer wins");
+        p.put_atomic("manifest-lists/list-1.json", payload.clone())
+            .await
+            .expect("first put");
+
+        let err = p
+            .put_atomic("manifest-lists/list-1.json", Bytes::from_static(b"second"))
+            .await
+            .expect_err("second put must fail");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+
+        let got = p
+            .get("manifest-lists/list-1.json")
+            .await
+            .expect("get after losing put");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn put_if_match_with_correct_etag_succeeds() {
+        let (_dir, p) = provider();
+        p.put_atomic("ptr/current", Bytes::from_static(b"v1"))
+            .await
+            .expect("initial");
+        let meta = p.head("ptr/current").await.expect("head");
+        let etag = meta.etag.expect("LocalFS etag");
+
+        p.put_if_match("ptr/current", Bytes::from_static(b"v2"), Some(&etag))
+            .await
+            .expect("conditional update with correct etag");
+
+        let got = p.get("ptr/current").await.expect("get v2");
+        assert_eq!(got.as_ref(), b"v2");
+    }
+
+    #[tokio::test]
+    async fn put_if_match_with_stale_etag_fails() {
+        let (_dir, p) = provider();
+        p.put_atomic("ptr/current", Bytes::from_static(b"v1"))
+            .await
+            .expect("initial");
+        let stale_meta = p.head("ptr/current").await.expect("head v1");
+        let stale_etag = stale_meta.etag.clone().expect("etag v1");
+
+        // Legitimate writer wins the OCC race.
+        p.put_if_match(
+            "ptr/current",
+            Bytes::from_static(b"v_intermediate"),
+            Some(&stale_etag),
+        )
+        .await
+        .expect("legitimate update");
+
+        // Second writer with the now-stale etag must lose.
+        let err = p
+            .put_if_match(
+                "ptr/current",
+                Bytes::from_static(b"v_stale_writer"),
+                Some(&stale_etag),
+            )
+            .await
+            .expect_err("stale etag must fail");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+
+        let got = p.get("ptr/current").await.expect("get");
+        assert_eq!(got.as_ref(), b"v_intermediate");
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent() {
+        let (_dir, p) = provider();
+        p.put_atomic("data/orphan.sf", Bytes::from_static(b"x"))
+            .await
+            .expect("put");
+
+        p.delete("data/orphan.sf").await.expect("first delete");
+        p.delete("data/orphan.sf")
+            .await
+            .expect("second delete (idempotent)");
+        p.delete("data/never-existed.sf")
+            .await
+            .expect("delete of never-existing");
+    }
+
+    #[tokio::test]
+    async fn missing_object_returns_not_found() {
+        let (_dir, p) = provider();
+        let err = p
+            .head("data/no-such.sf")
+            .await
+            .expect_err("head missing");
+        assert!(matches!(err, StorageError::NotFound { .. }));
+
+        let err = p.get("data/no-such.sf").await.expect_err("get missing");
+        assert!(matches!(err, StorageError::NotFound { .. }));
+
+        let err = p
+            .get_range("data/no-such.sf", 0..1)
+            .await
+            .expect_err("get_range missing");
+        assert!(matches!(err, StorageError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn put_at_nested_path_creates_dirs() {
+        // Forward-slash-separated paths are object_store
+        // idiom; LocalFileSystem creates intermediate dirs.
+        let (_dir, p) = provider();
+        p.put_atomic("a/b/c/d/leaf.bin", Bytes::from_static(b"deep"))
+            .await
+            .expect("nested put");
+        let got = p.get("a/b/c/d/leaf.bin").await.expect("nested get");
+        assert_eq!(got.as_ref(), b"deep");
+    }
+
+    #[tokio::test]
+    async fn put_if_match_creates_supertable_lock_file() {
+        // `put_if_match`'s Some(etag) branch acquires an
+        // advisory flock on `<root>/_supertable/.lock` to
+        // close the read-then-overwrite TOCTOU window. The
+        // lock file persists (best-effort cleanup is not
+        // attempted), so its presence after a successful
+        // conditional update is a direct signal the lock
+        // path was exercised.
+        let dir = TempDir::new().expect("tempdir");
+        let p = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        p.put_atomic("ptr/current", Bytes::from_static(b"v1"))
+            .await
+            .expect("initial");
+        let etag = p.head("ptr/current").await.expect("head").etag.expect("etag");
+        p.put_if_match("ptr/current", Bytes::from_static(b"v2"), Some(&etag))
+            .await
+            .expect("conditional update");
+
+        let lock_path = dir.path().join("_supertable").join(".lock");
+        assert!(
+            lock_path.exists(),
+            "expected advisory lock file at {lock_path:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_multipart_returns_handle() {
+        // Surface check only — driving real part PUTs
+        // happens at the supertable commit layer.
+        let (_dir, p) = provider();
+        let mut upload = p
+            .put_multipart("data/multipart-test.sf")
+            .await
+            .expect("multipart handle");
+        upload.abort().await.expect("abort");
+    }
+}

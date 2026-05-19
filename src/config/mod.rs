@@ -1,0 +1,480 @@
+//! System-wide configuration for infino.
+//!
+//! ## Sources
+//!
+//! [`Config::load`] merges, in increasing precedence:
+//!
+//!   1. **Embedded defaults.** `config.yaml` in this module is
+//!      `include_str!`'d at compile time. Shipping with the binary
+//!      means there's always a usable floor.
+//!   2. **`/etc/infino/config.yaml`** — system-wide override.
+//!   3. **User config.** `$XDG_CONFIG_HOME/infino/config.yaml`
+//!      (or `$HOME/.config/infino/config.yaml` if `XDG_CONFIG_HOME`
+//!      is unset).
+//!   4. **`./infino.yaml`** — per-project / per-cwd override.
+//!   5. **Environment variables** prefixed `INFINO_`. Field names
+//!      are uppercased and nested keys join with `__`;
+//!      e.g. `supertable.commit_threshold_size_mb` is set by
+//!      `INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB`.
+//!
+//! Each layer is a partial override — keys absent from a higher
+//! layer fall through to lower layers. Unknown keys at any layer
+//! are accepted (figment's default leniency); typos in env vars
+//! therefore silently no-op. We document the published variables
+//! here and rely on tests + code review to keep them in sync.
+//!
+//! ## Adding a new field
+//!
+//! 1. Add the field to [`Config`] with a `serde` rename / default
+//!    if appropriate.
+//! 2. Add the same key to `config.yaml` with its default value.
+//! 3. Add a docstring and a unit test exercising the override path.
+
+use figment::Figment;
+use figment::providers::{Env, Format, Yaml};
+use serde::de::{self, Deserializer, Visitor};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+/// Embedded baseline. Compiled in via `include_str!`.
+const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
+
+/// Errors from config load + validation.
+///
+/// `figment::Error` is ~200 bytes; boxing keeps the `Result` size
+/// small (clippy `result_large_err`) and gives us room to add
+/// validation variants later.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("config load failed: {0}")]
+    Figment(Box<figment::Error>),
+}
+
+impl From<figment::Error> for ConfigError {
+    fn from(e: figment::Error) -> Self {
+        Self::Figment(Box::new(e))
+    }
+}
+
+/// System-wide infino settings.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Config {
+    /// Supertable runtime knobs (thread pools, id column,
+    /// commit threshold).
+    #[serde(default)]
+    pub supertable: SupertableSettings,
+}
+
+/// Supertable subsection of [`Config`]. Keeps supertable-
+/// specific knobs grouped so they don't crowd the top-level
+/// namespace as the layer grows.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SupertableSettings {
+    /// Reader fan-out pool size. `auto` resolves to `num_cpus`.
+    pub reader_threads: ThreadCount,
+    /// Writer commit-shard pool size. `auto` resolves to
+    /// `max(1, num_cpus / 2)`.
+    pub writer_threads: ThreadCount,
+    /// Name of the system-managed primary-key column the
+    /// supertable injects on every `append()`. Type is fixed
+    /// at the supertable layer; this knob is only the column
+    /// name as it appears in the schema and in SQL queries.
+    /// Leading underscore signals a system-owned field —
+    /// callers can override (e.g. `row_id`, `uuid`) when
+    /// `_id` collides with a business field name, but the
+    /// column type and generation semantics don't change.
+    pub id_column: String,
+    /// Threshold above which the supertable's writer triggers
+    /// an internal `commit()` to flush the in-memory buffer.
+    /// In mebibytes (1 MiB == 1024 × 1024 bytes). `0`
+    /// disables auto-flush — only caller-driven `commit()`
+    /// produces segments.
+    pub commit_threshold_size_mb: u64,
+    /// Verify the trailing whole-blob CRC and per-subsection
+    /// CRCs on every `SuperfileReader::open`. Defaults to
+    /// `true`. Set to `false` only when the underlying
+    /// storage already validates checksums (content-
+    /// addressed object store, ZFS, etc.) — skipping the
+    /// scan trades that storage-layer guarantee for faster
+    /// cold opens.
+    pub verify_crc_on_open: bool,
+}
+
+impl Default for SupertableSettings {
+    fn default() -> Self {
+        Self {
+            reader_threads: ThreadCount::default(),
+            writer_threads: ThreadCount::default(),
+            id_column: default_id_column(),
+            commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
+            verify_crc_on_open: DEFAULT_VERIFY_CRC_ON_OPEN,
+        }
+    }
+}
+
+const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
+
+fn default_id_column() -> String {
+    "_id".to_string()
+}
+
+/// Thread count specifier — either `auto` (defer to a runtime
+/// default) or an explicit positive integer.
+///
+/// In YAML / env, the value can be the string `"auto"` (case-
+/// insensitive) or a positive integer. The serialized form is
+/// `"auto"` for [`ThreadCount::Auto`] and the integer otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThreadCount {
+    /// Resolve at runtime to a hardware-aware default supplied by
+    /// the consumer (typically a function of `num_cpus`).
+    #[default]
+    Auto,
+    /// Use exactly this many threads. Clamped to `≥ 1` at
+    /// resolution time.
+    Fixed(usize),
+}
+
+impl ThreadCount {
+    /// Resolve to a concrete thread count. `Auto` falls back to
+    /// `default_for_auto`; both branches clamp the result to
+    /// `≥ 1` so we never construct a zero-thread rayon pool.
+    pub fn resolve_or_default(self, default_for_auto: usize) -> usize {
+        match self {
+            Self::Auto => default_for_auto.max(1),
+            Self::Fixed(n) => n.max(1),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThreadCount {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ThreadCount;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("\"auto\" or a positive integer")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.eq_ignore_ascii_case("auto") {
+                    Ok(ThreadCount::Auto)
+                } else {
+                    v.parse::<usize>().map(ThreadCount::Fixed).map_err(|e| {
+                        de::Error::custom(format!(
+                            "thread count must be \"auto\" or a positive integer; \
+                                 got {v:?} ({e})"
+                        ))
+                    })
+                }
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(ThreadCount::Fixed(v as usize))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    Err(de::Error::custom("thread count must be ≥ 0"))
+                } else {
+                    Ok(ThreadCount::Fixed(v as usize))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl Serialize for ThreadCount {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => s.serialize_str("auto"),
+            Self::Fixed(n) => s.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl Config {
+    /// Load from the standard hierarchy. See module docs for the
+    /// precedence order.
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::from_figment(default_figment())
+    }
+
+    /// Load from only the embedded defaults — no file or env
+    /// overrides. Useful for tests and for documenting what the
+    /// shipped default is independent of any host environment.
+    pub fn defaults() -> Result<Self, ConfigError> {
+        Ok(Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .extract()?)
+    }
+
+    /// Extract from a caller-provided figment. Used by tests so they
+    /// don't have to touch the real filesystem or env. Public so
+    /// downstream crates can build their own layered config (e.g. a
+    /// CLI that adds a `--config-file` source) without duplicating
+    /// the embedded-default + extraction machinery.
+    pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
+        Ok(fig.extract()?)
+    }
+}
+
+/// Build the standard layered figment used by [`Config::load`].
+fn default_figment() -> Figment {
+    let mut fig = Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT));
+
+    let etc = Path::new("/etc/infino/config.yaml");
+    if etc.is_file() {
+        fig = fig.merge(Yaml::file(etc));
+    }
+
+    if let Some(p) = user_config_path()
+        && p.is_file()
+    {
+        fig = fig.merge(Yaml::file(p));
+    }
+
+    let cwd = Path::new("./infino.yaml");
+    if cwd.is_file() {
+        fig = fig.merge(Yaml::file(cwd));
+    }
+
+    // `split("__")` lets nested fields be addressed in env, e.g.
+    // `INFINO_SUPERTABLE__READER_THREADS=8` maps to
+    // `supertable.reader_threads`. Single-underscore field names
+    // are unaffected.
+    fig.merge(Env::prefixed("INFINO_").split("__"))
+}
+
+/// Resolve the user-level config path. Honors `XDG_CONFIG_HOME`
+/// first; falls back to `$HOME/.config/infino/config.yaml`.
+fn user_config_path() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("infino/config.yaml"));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/infino/config.yaml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use figment::providers::Serialized;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate process-global env so they don't
+    /// race. `unsafe { std::env::set_var }` requires this in the 2024
+    /// edition.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn embedded_default_loads_with_expected_value() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    #[test]
+    fn env_overrides_default() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK; cleanup at end.
+        unsafe {
+            std::env::set_var(
+                "INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB",
+                "2048",
+            )
+        };
+        let cfg = Config::load().expect("load with env override");
+        assert_eq!(cfg.supertable.commit_threshold_size_mb, 2048);
+        unsafe { std::env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
+    }
+
+    #[test]
+    fn missing_env_falls_through_to_default() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK; we ensure the var is unset
+        // before reading.
+        unsafe { std::env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
+        let cfg = Config::load().expect("load with no env override");
+        assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    #[test]
+    fn from_figment_with_yaml_layer_overrides_default() {
+        let yaml = r#"
+supertable:
+  commit_threshold_size_mb: 512
+"#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("layered yaml");
+        assert_eq!(cfg.supertable.commit_threshold_size_mb, 512);
+    }
+
+    #[test]
+    fn last_yaml_wins_among_layers() {
+        // Layer order: A (default 1024) → B (set 256) → C (set 4096).
+        // Final value is 4096; the middle layer is shadowed.
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(
+                "supertable:\n  commit_threshold_size_mb: 256\n",
+            ))
+            .merge(Yaml::string(
+                "supertable:\n  commit_threshold_size_mb: 4096\n",
+            ));
+        let cfg = Config::from_figment(fig).expect("parse config");
+        assert_eq!(cfg.supertable.commit_threshold_size_mb, 4096);
+    }
+
+    #[test]
+    fn invalid_value_type_errors_clearly() {
+        // String where number expected → figment surfaces a typed
+        // deserialization error.
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(
+                "supertable:\n  commit_threshold_size_mb: \"not-a-number\"\n",
+            ));
+        let err = Config::from_figment(fig).expect_err("expected error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("commit_threshold_size_mb")
+                || msg.contains("invalid type")
+                || msg.contains("expected"),
+            "expected a typed-error message; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn programmatic_override_via_serialized_provider() {
+        // Demonstrates that downstream callers can layer a Rust
+        // struct override on top of the file/env stack. Used in tests
+        // and proves Serialized as a valid override surface.
+        #[derive(Serialize)]
+        struct SupertableOverride {
+            commit_threshold_size_mb: u64,
+        }
+        #[derive(Serialize)]
+        struct Override {
+            supertable: SupertableOverride,
+        }
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Serialized::defaults(Override {
+                supertable: SupertableOverride {
+                    commit_threshold_size_mb: 16,
+                },
+            }));
+        let cfg = Config::from_figment(fig).expect("parse config");
+        assert_eq!(cfg.supertable.commit_threshold_size_mb, 16);
+    }
+
+    #[test]
+    fn user_config_path_uses_xdg_when_set() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test") };
+        let p = user_config_path().expect("path");
+        assert_eq!(p, PathBuf::from("/tmp/xdg-test/infino/config.yaml"));
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn supertable_defaults_are_auto() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
+        assert_eq!(cfg.supertable.writer_threads, ThreadCount::Auto);
+    }
+
+    #[test]
+    fn thread_count_parses_auto_string() {
+        let yaml = r#"
+commit_threshold_size_mb: 1024
+supertable:
+  reader_threads: auto
+  writer_threads: AUTO
+"#;
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
+        assert_eq!(cfg.supertable.writer_threads, ThreadCount::Auto);
+    }
+
+    #[test]
+    fn thread_count_parses_integer() {
+        let yaml = r#"
+commit_threshold_size_mb: 1024
+supertable:
+  reader_threads: 8
+  writer_threads: 4
+"#;
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        assert_eq!(cfg.supertable.reader_threads, ThreadCount::Fixed(8));
+        assert_eq!(cfg.supertable.writer_threads, ThreadCount::Fixed(4));
+    }
+
+    #[test]
+    fn thread_count_rejects_garbage_string() {
+        let yaml = r#"
+commit_threshold_size_mb: 1024
+supertable:
+  reader_threads: banana
+"#;
+        let err = Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect_err("expected error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto") || msg.contains("positive integer") || msg.contains("banana"),
+            "expected a typed-error message; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn thread_count_resolve_clamps_to_one() {
+        assert_eq!(ThreadCount::Auto.resolve_or_default(0), 1);
+        assert_eq!(ThreadCount::Fixed(0).resolve_or_default(8), 1);
+        assert_eq!(ThreadCount::Auto.resolve_or_default(7), 7);
+        assert_eq!(ThreadCount::Fixed(3).resolve_or_default(8), 3);
+    }
+
+    #[test]
+    fn nested_env_var_overrides_supertable_field() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK; cleanup at end.
+        unsafe {
+            std::env::set_var("INFINO_SUPERTABLE__WRITER_THREADS", "4");
+            std::env::set_var("INFINO_SUPERTABLE__READER_THREADS", "auto");
+        }
+        let cfg = Config::load().expect("load with nested env override");
+        assert_eq!(cfg.supertable.writer_threads, ThreadCount::Fixed(4));
+        assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
+        unsafe {
+            std::env::remove_var("INFINO_SUPERTABLE__WRITER_THREADS");
+            std::env::remove_var("INFINO_SUPERTABLE__READER_THREADS");
+        }
+    }
+
+    #[test]
+    fn user_config_path_falls_back_to_home() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", "/tmp/home-test");
+        }
+        let p = user_config_path().expect("path");
+        assert_eq!(
+            p,
+            PathBuf::from("/tmp/home-test/.config/infino/config.yaml")
+        );
+        unsafe { std::env::remove_var("HOME") };
+    }
+}

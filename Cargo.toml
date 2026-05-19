@@ -1,0 +1,223 @@
+[package]
+name = "infino"
+version = "0.1.0"
+edition = "2024"
+# Disable cargo's auto-discovery of `benches/*.rs` as bench
+# binaries — every bench target is declared explicitly via
+# `[[bench]]` below. Without this, shared helper files like
+# `benches/common.rs` get compiled as standalone (empty) bench
+# binaries.
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Exposes `infino::test_helpers` — convenience builders for
+# Decimal128 id columns, default tokenizers, default vector
+# configs. Used by integration tests, benches, and (via
+# `cfg(test)`) unit tests so all three contexts share one
+# source of truth for boilerplate-heavy fixtures. NOT part
+# of infino's stable API; signatures may change between any
+# two versions. The `dev-dependencies` self-reference below
+# auto-enables this for test + bench builds.
+test-helpers = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+[dependencies]
+# Format / parquet
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+parquet = "58"
+
+# SIMD primitives
+bitpacking = "0.9"
+crc32c = "0.6"
+wide = "1"
+fst = "0.4"
+bytemuck = "1"
+
+# Allocator strategy: mimalloc as #[global_allocator], bumpalo for
+# per-query scratch, plus the custom MemoryArena in fts/arena.rs.
+mimalloc = { version = "0.1", default-features = false }
+bumpalo = { version = "3", features = ["collections"] }
+rustc-hash = "2"
+static_assertions = "1"
+
+# Numerics
+rand = "0.10"
+rand_distr = "0.6"
+rayon = "1"
+
+# Errors / serde
+thiserror = "2"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Supertable: lock-free manifest swap + segment ids + FTS bloom hash.
+# Manifest is held in ArcSwap<Manifest> for reader-writer isolation;
+# SegmentEntry.segment_id is a v4 UUID; the FTS term-presence bloom
+# uses XXH3-64 — terms come from a closed corpus (no HashDoS risk),
+# and XXH3 is significantly faster than SipHash on the miss path
+# where hash cost dominates.
+arc-swap = "1"
+uuid = { version = "1", features = ["v4"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+num_cpus = "1"
+
+# Hierarchical config (YAML defaults + file overrides + env). Used by
+# the `config` module; see infino/src/config/mod.rs.
+figment = { version = "0.10", features = ["yaml", "env"] }
+
+# Logging
+tracing = "0.1"
+
+# SQL surface (`Supertable::query_sql`). DataFusion's TableProvider /
+# ExecutionPlan trait surface is async, so a runtime is required even
+# though our public API stays sync — `block_on` runs DataFusion plans
+# against a per-Supertable cached Runtime. Tokio is single-worker
+# here: it drives DataFusion's I/O state machine, not CPU-bound work
+# (CPU work for skip + fan-out lives on the rayon reader pool).
+datafusion = "53"
+# `macros` enables `#[tokio::test]` for the async DataFusion
+# integration tests; runtime weight on a release build is just the
+# proc-macro, so we keep it in [dependencies] rather than re-listing
+# tokio in [dev-dependencies] solely for the macro feature.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+
+# Object-store backend (003 M1). `object_store` is already
+# transitive via DataFusion 53 (0.12.5) and parquet 58 (0.13.2);
+# we pin our direct usage to 0.13 to match parquet — which is the
+# version with the conditional-put surface we need for the
+# manifest pointer's OCC + atomic-create semantics.
+object_store = { version = "0.13", features = ["aws"] }
+# Async-trait erasure for `StorageProvider` (003 M1) and the
+# `LazyByteSource` trait that will land in M6. Both need to be
+# usable through `Arc<dyn ...>` for cross-layer sharing, which
+# requires boxed futures.
+async-trait = "0.1"
+
+# Manifest-part serde (003 M2a). Avro for the dense per-segment
+# tier (matches Iceberg's manifest-file choice at scale); zstd
+# for compression; blake3 for content-addressing.
+#
+# All three are already transitive — `apache-avro` is net new
+# but the rest are promoted to direct so versions don't drift
+# under us when transitive callers update.
+apache-avro = "0.17"
+blake3 = "1"
+zstd = "0.13"
+
+# Manifest list JSON (003 M2b). The list tier carries byte-valued
+# fields (arrow-ipc schema, per-part content_hash bytes, aggregate
+# skip summaries) as base64 strings — JSON arrays of bytes would
+# bloat the list by ~3-4× and break `jq` debuggability, which is
+# the whole reason the list is JSON and not Avro.
+base64 = "0.22"
+
+# In-memory hierarchical Manifest (003 M2c). The `parts` cache
+# is a DashMap<PartId, OnceCell<Arc<ManifestPart>>> so concurrent
+# queries on a cold part coalesce to a single StorageProvider::get.
+# DashMap's sharded locking lets the manifest part hot path (cache
+# hit on a known PartId) avoid contention.
+dashmap = "6"
+
+# Manifest commit parallel issue (003 M3). `futures::join_all`
+# fans out per-part PUTs alongside the manifest list PUT in
+# `commit_manifest` so hierarchical commits don't pay an extra
+# RTT vs the flat-manifest baseline.
+futures = "0.3"
+
+# Disk cache memory-map (003 M5). Tier 1 cache files are
+# mmap'd; `Bytes::from_owner(Mmap)` lets the rest of the read
+# path consume cached bytes through the same `Bytes` view that
+# the in-memory store uses today.
+memmap2 = "0.9"
+
+# Process RSS for `Supertable::stats()` (003 M13). Cross-
+# platform (macOS / Linux / Windows). The crate is tiny and
+# has no transitive deps — pulls in libc on Unix and uses
+# Mach task_info on macOS / /proc/self/statm on Linux. We
+# read it once per `stats()` call (cheap syscall) so the
+# observability hook stays allocation-free on the hot path.
+memory-stats = "1.2"
+
+# Advisory file locks for the LocalFs pointer-rename window
+# (003 D4). The LocalFs `put_if_match` is implemented as
+# read-then-overwrite (object_store::LocalFileSystem
+# doesn't support native PutMode::Update); without a lock,
+# two processes can both see the same prior etag and race
+# the overwrite. `fs4` exposes an `AsyncFileExt` trait on
+# `tokio::fs::File` so we can hold the lock across the
+# head + put_opts await points without spawning a separate
+# blocking task. Already a transitive dep — promoted here
+# so the version is pinned explicitly.
+fs4 = { version = "0.13", features = ["tokio"] }
+
+# 128-bit Snowflake id generator for the supertable's
+# auto-injected `_id` column. `ferroid::BasicSnowflakeGenerator`
+# is single-threaded by construction (interior-mutable `Cell`)
+# — exactly the shape the writer-slot-locked append() path
+# needs. We use the `define_snowflake_id!` macro to set our
+# own bit layout (64 ms + 40 worker + 24 seq) rather than
+# adopting a built-in Twitter/Discord variant.
+ferroid = { version = "2", features = ["std", "alloc", "snowflake", "basic"] }
+
+[dev-dependencies]
+# Self-reference with the `test-helpers` feature enabled so
+# integration tests + benches see `infino::test_helpers`.
+# Unit tests (inside src/) reach the module via `crate::
+# test_helpers` under `cfg(test)`, independent of this dep.
+infino = { path = ".", features = ["test-helpers"] }
+
+tempfile = "3"
+proptest = "1"
+criterion = "0.8"
+hdrhistogram = "7"
+# s3s + s3s-fs power the "real S3 wire protocol" smoke test.
+# s3s is the S3-compatible HTTP server library; s3s-fs is its
+# filesystem backend. The test crate spawns s3s-fs on a random
+# port in a tempdir; the supertable's S3StorageProvider talks to
+# it via object_store::aws::AmazonS3.
+s3s = "0.13"
+s3s-fs = "0.13"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+futures = "0.3"
+
+# Comparator for the supertable's FTS bloom — bench-only.
+fastbloom = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# Test profile uses Cargo's default opt-level (0). The realistic-
+# scale recall suites that previously forced opt-level=3 here
+# (recall.rs at 10K×384 dim, fts_recall_at_scale.rs at 20K docs)
+# have been moved to `benches/` where they compile + run under
+# release mode automatically. This keeps `cargo test`'s inner loop
+# fast for correctness work while preserving the scale-correctness
+# assertions on the bench lane.
+
+# Topic-bundled integration test binaries. One binary per
+# top-level layer keeps link time down at scale (10× faster
+# cold link than N per-file binaries) and amortizes the
+# tokio/rayon/fixture startup overhead. Run a subtree with
+# cargo's module-path filter, e.g.
+#   cargo test --test superfile fts::
+#   cargo test --test superfile format::crc_corruption
+[[test]]
+name = "superfile"
+path = "tests/superfile/main.rs"
+
+[[test]]
+name = "supertable"
+path = "tests/supertable/main.rs"
+
