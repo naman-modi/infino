@@ -221,3 +221,15 @@ path = "tests/superfile/main.rs"
 name = "supertable"
 path = "tests/supertable/main.rs"
 
+# Infino-only bench bundles. One criterion binary per topic, with
+# superfile + supertable sub-groups inside each. Head-to-head numbers
+# vs Tantivy / LanceDB live in the sibling retrievalbench repo —
+# nothing in this crate's bench tree depends on either competitor.
+[[bench]]
+name = "fts"
+path = "benches/fts/main.rs"
+
+[[bench]]
+name = "vector"
+path = "benches/vector/main.rs"
+
