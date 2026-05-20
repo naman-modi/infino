@@ -5,10 +5,8 @@ Infino-only performance + correctness benches. Two criterion binaries:
 - `fts` — superfile (1M docs Zipfian) + supertable (10M docs)
 - `vector` — superfile (1M × 384 cosine) + supertable (10M × 384, 4 superfiles)
 
-Head-to-head numbers against Tantivy / LanceDB live in the sibling
-`retrievalbench` repo. The deliberate split: anyone building against
-infino in isolation gets the perf surface here without pulling in any
-competitor crates as transitive deps.
+These benches measure infino in isolation — no third-party crates
+enter this tree's dependency graph.
 
 ## Invocation
 
@@ -41,10 +39,10 @@ markdown emitter rewrites the content between these markers when
 `INFINO_BENCH_UPDATE_README=1` is set. Re-running a single bench with
 a criterion filter refreshes only the matching section.
 
-The retrievalbench sibling reads infino's measurements from
-`target/criterion/<group>/<bench>/new/estimates.json` directly (no
-parsing of this markdown is involved); the markdown here exists purely
-for human readers.
+The markdown here is purely for human readers. Programmatic
+consumers should read criterion's own
+`target/criterion/<group>/<bench>/new/estimates.json` directly,
+which is the structured source of truth the markdown is derived from.
 
 ---
 

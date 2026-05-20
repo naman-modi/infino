@@ -7,10 +7,11 @@
 //! When `INFINO_BENCH_UPDATE_README=1` is set, the same block also
 //! replaces the matching section in `benches/README.md` in place.
 //!
-//! The retrievalbench sibling repo reads infino's measurements from
-//! `target/criterion/<group>/<bench>/new/estimates.json` directly — no
-//! parsing of this markdown is involved. The markdown here exists
-//! purely for human readers of infino's README.
+//! The markdown is purely for human readers. Programmatic consumers
+//! should read criterion's own
+//! `target/criterion/<group>/<bench>/new/estimates.json` directly —
+//! that's the structured source of truth this markdown is derived
+//! from.
 
 use serde_json::Value;
 use std::fs;

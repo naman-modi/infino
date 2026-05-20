@@ -2,12 +2,11 @@
 //! brute-force ground truth, recall calibration, and thin builder
 //! wrappers around infino's public API.
 //!
-//! Both `infino/benches/` (infino-only timings) and the head-to-head
-//! benches in the sibling `retrievalbench` repo source corpus,
-//! queries, and ground truth from here so the two harnesses measure
-//! the **same** workload. Without that shared source, comparison
-//! tables in retrievalbench would mix runs against different
-//! corpora.
+//! `infino/benches/` consumes these directly. Centralizing the
+//! generators here means a single deterministic source of truth for
+//! the corpus, queries, and ground truth — without that, every
+//! re-run would silently risk mixing measurements against drifted
+//! data.
 //!
 //! ## Scale knob
 //!
@@ -335,8 +334,8 @@ pub fn mean_recall_infino(
 // ─── Recall-floor calibration ─────────────────────────────────────────
 
 /// p50 wall time (microseconds) over `n_iter` repetitions of one closure.
-/// Accepts any `FnMut()` so it can wrap either engine's search call from
-/// retrievalbench's head-to-head.
+/// Generic over `FnMut()` so calibration can wrap any search call
+/// with one timing implementation.
 pub fn p50_micros<F: FnMut()>(mut f: F, n_iter: usize) -> f32 {
     let mut samples = Vec::with_capacity(n_iter);
     for _ in 0..n_iter {

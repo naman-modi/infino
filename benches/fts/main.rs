@@ -2,9 +2,8 @@
 //! supertable (10M docs) FTS benches in a single criterion binary so
 //! the topic has one `[[bench]]` stanza in `Cargo.toml`.
 //!
-//! Head-to-head numbers against Tantivy live in the sibling
-//! `retrievalbench` repo — this bench is purely infino-only timing and
-//! correctness, suitable for shipping with the public infino release.
+//! Infino-only timing and correctness — no third-party crates in
+//! the dependency graph of these benches.
 //!
 //! ## Invocation
 //!
