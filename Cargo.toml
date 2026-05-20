@@ -227,8 +227,10 @@ path = "tests/supertable/main.rs"
 [[bench]]
 name = "fts"
 path = "benches/fts/main.rs"
+harness = false
 
 [[bench]]
 name = "vector"
 path = "benches/vector/main.rs"
+harness = false
 
