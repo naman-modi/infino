@@ -255,6 +255,105 @@ impl SupertableReader {
 
         Ok(top_k_descending(per_unit, k))
     }
+
+    /// Unranked token match across the pinned snapshot. Returns
+    /// every row matching `query`'s tokens under `mode` (`Or` = any
+    /// token, `And` = every token) as [`SuperfileHit`]s — **no scoring**
+    /// (`score` is left `0.0`; these results are unordered). Segment
+    /// skip uses the same term-bloom prune as BM25.
+    ///
+    /// `pub(crate)` async kernel; the public surface is the sync
+    /// [`SupertableReader::token_match`].
+    pub(crate) async fn token_match_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
+        if term_strings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let kept = crate::supertable::query::prune::select_segments(
+            manifest.as_ref(),
+            &[crate::supertable::query::prune::PruneLeaf::TermPresence {
+                column: column.to_owned(),
+                terms: term_strings.clone(),
+                mode,
+            }],
+        )
+        .await?;
+        if kept.is_empty() {
+            return Ok(Vec::new());
+        }
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let column_arc = Arc::new(column.to_owned());
+        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+            let column_arc = Arc::clone(&column_arc);
+            let term_arc = Arc::clone(&term_arc);
+            async move {
+                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                let docs = r
+                    .token_match(&column_arc, &refs, mode)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+            }
+        };
+        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        Ok(per_unit.into_iter().flatten().collect())
+    }
+
+    /// Unranked two-pass exact match of the **raw string** `value`
+    /// against `column` across the pinned snapshot. Returns the rows
+    /// whose stored value equals `value` exactly as [`SuperfileHit`]s —
+    /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
+    /// for the per-segment two-pass (token-AND prune + raw verify).
+    ///
+    /// `pub(crate)` async kernel; the public surface is the sync
+    /// [`SupertableReader::exact_match`].
+    pub(crate) async fn exact_match_async(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        // Tokens prune segments via the term bloom (AND); a token-less
+        // value (e.g. punctuation only) can't prune, so keep all.
+        let leaves = if term_strings.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::supertable::query::prune::PruneLeaf::TermPresence {
+                column: column.to_owned(),
+                terms: term_strings,
+                mode: BoolMode::And,
+            }]
+        };
+        let kept =
+            crate::supertable::query::prune::select_segments(manifest.as_ref(), &leaves).await?;
+        if kept.is_empty() {
+            return Ok(Vec::new());
+        }
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let column_arc = Arc::new(column.to_owned());
+        let value_arc = Arc::new(value.to_owned());
+        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+            let column_arc = Arc::clone(&column_arc);
+            let value_arc = Arc::clone(&value_arc);
+            async move {
+                let docs = r
+                    .exact_match(&column_arc, &value_arc)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+            }
+        };
+        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        Ok(per_unit.into_iter().flatten().collect())
+    }
 }
 
 impl SupertableReader {
@@ -282,6 +381,31 @@ impl SupertableReader {
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         self.block_on(self.bm25_search_prefix_async(column, prefix, k))
+    }
+
+    /// Unranked token match over this reader's pinned snapshot. Returns
+    /// every row whose `column` matches `query`'s tokens under `mode`
+    /// (`Or` = any token, `And` = every token). The returned hits are
+    /// **unranked** — `score` is `0.0` and order is unspecified — unlike
+    /// the ranked [`SupertableReader::bm25_search`]. Drives the async
+    /// kernel via the sync→async bridge ([`SupertableReader::block_on`]).
+    pub fn token_match(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.block_on(self.token_match_async(column, query, mode))
+    }
+
+    /// Unranked exact match of the raw string `value` against `column`
+    /// over this reader's pinned snapshot — the two-pass index-pruned,
+    /// text-verified match (see
+    /// [`SuperfileReader::exact_match`](crate::superfile::SuperfileReader::exact_match)).
+    /// Returns the rows whose stored value equals `value` exactly;
+    /// hits are **unranked** (`score` is `0.0`).
+    pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.block_on(self.exact_match_async(column, value))
     }
 }
 
