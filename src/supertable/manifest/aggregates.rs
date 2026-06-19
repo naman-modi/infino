@@ -27,13 +27,15 @@
 //! deferred planner hint; a true HLL-based distinct-term union lands
 //! when measured.
 
-use std::cmp::{max, min};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::{
+    cmp::{max, min},
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::list::{
-    FtsSummaryAgg, ManifestListEntry, ScalarStatsAgg, VectorSummaryAgg,
+use crate::supertable::manifest::{
+    SuperfileEntry,
+    list::{FtsSummaryAgg, ManifestListEntry, ScalarStatsAgg, VectorSummaryAgg},
 };
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
@@ -201,13 +203,15 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
+
     use super::*;
-    use crate::supertable::manifest::part::{ContentHash, PartId};
     use crate::supertable::manifest::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+        part::{ContentHash, PartId},
     };
-    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
-    use std::collections::HashMap;
 
     /// A `ManifestListEntry` standing in for an existing part, carrying the
     /// given id range + per-column scalar aggregates (empty fts/vector aggs).

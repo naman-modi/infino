@@ -34,43 +34,50 @@ pub mod part;
 pub mod partition;
 pub mod term_range;
 
-/// Re-export the per-column skip aggregates so callers can refer to them as
-/// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
-/// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
-pub use list::{FtsSummaryAgg, ScalarStatsAgg};
-
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::DataType;
 use dashmap::DashMap;
 use futures::future;
+/// Re-export the per-column skip aggregates so callers can refer to them as
+/// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
+/// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
+pub use list::{FtsSummaryAgg, ScalarStatsAgg};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::storage::StorageProvider;
-use crate::supertable::CommitError;
-use crate::supertable::error::ManifestError;
-use crate::supertable::manifest::commit::{
-    EncodedPart, PointerFile, frame_content_size, part_uri, translate_contention,
-    write_manifest_list, write_part_bytes, write_pointer,
-};
-use crate::supertable::manifest::list::{
-    FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
-};
-use crate::supertable::manifest::part::{ContentHash, ManifestPart, PartId};
-use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
-use crate::supertable::query::prune::PruneLeaf;
+use super::options::SupertableOptions;
 use crate::{
+    storage::{StorageError, StorageProvider},
     superfile::vector::distance::{
         COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq,
     },
-    supertable::{manifest::commit::read_pointer, query::hierarchical_iter},
+    supertable::{
+        CommitError,
+        error::ManifestError,
+        manifest::{
+            commit::{
+                EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
+                translate_contention, write_manifest_list, write_part_bytes, write_pointer,
+            },
+            list::{
+                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
+                PartitionStrategy,
+            },
+            part::{ContentHash, ManifestPart, PartId},
+            partition::{assign_partition, encode_partition_key},
+        },
+        query::{hierarchical_iter, prune::PruneLeaf},
+    },
 };
-
-use super::options::SupertableOptions;
 
 /// Zstd compression level for manifest parts and the manifest list.
 /// Level 3 is zstd's own default — a balanced ratio/speed point that
@@ -168,16 +175,13 @@ impl SuperfileList {
 /// [`ManifestList`]: list::ManifestList
 pub struct Manifest {
     superfile_list: SuperfileList,
-    list: Option<list::ManifestList>,
-    parts: dashmap::DashMap<
-        part::PartId,
-        std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<part::ManifestPart>>>,
-    >,
-    loader: Option<std::sync::Arc<ManifestPartLoader>>,
+    list: Option<ManifestList>,
+    parts: DashMap<PartId, Arc<OnceCell<Arc<ManifestPart>>>>,
+    loader: Option<Arc<ManifestPartLoader>>,
 }
 
-impl std::fmt::Debug for Manifest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Manifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Manifest")
             .field("manifest_id", &self.superfile_list.manifest_id)
             .field("n_superfiles", &self.superfile_list.superfiles.len())
@@ -192,7 +196,7 @@ impl std::fmt::Debug for Manifest {
     }
 }
 
-impl std::ops::Deref for Manifest {
+impl Deref for Manifest {
     type Target = SuperfileList;
     fn deref(&self) -> &Self::Target {
         &self.superfile_list
@@ -204,8 +208,8 @@ impl Manifest {
         manifest_id: u64,
         options: Arc<SupertableOptions>,
         superfile_list: Vec<Arc<SuperfileEntry>>,
-        storage: Option<Arc<dyn crate::storage::StorageProvider>>,
-        list: Option<list::ManifestList>,
+        storage: Option<Arc<dyn StorageProvider>>,
+        list: Option<ManifestList>,
     ) -> Self {
         let superfile_list = SuperfileList {
             manifest_id,
@@ -219,14 +223,14 @@ impl Manifest {
             Self {
                 superfile_list,
                 list: Some(list),
-                parts: dashmap::DashMap::new(),
+                parts: DashMap::new(),
                 loader: Some(loader),
             }
         } else {
             Self {
                 superfile_list,
                 list: None,
-                parts: dashmap::DashMap::new(),
+                parts: DashMap::new(),
                 loader: None,
             }
         }
@@ -246,7 +250,7 @@ impl Manifest {
         Self {
             superfile_list: SuperfileList::empty(options),
             list: None,
-            parts: dashmap::DashMap::new(),
+            parts: DashMap::new(),
             loader: None,
         }
     }
@@ -263,7 +267,7 @@ impl Manifest {
         self.superfile_list.options.clone()
     }
 
-    pub fn get_partition_strategy(&self) -> list::PartitionStrategy {
+    pub fn get_partition_strategy(&self) -> PartitionStrategy {
         self.list
             .as_ref()
             .map(|l| l.partition_strategy.clone())
@@ -282,13 +286,13 @@ impl Manifest {
         self.list.is_none()
     }
 
-    pub fn get_cached_part_by_id(&self, part_id: &part::PartId) -> Option<Arc<part::ManifestPart>> {
+    pub fn get_cached_part_by_id(&self, part_id: &PartId) -> Option<Arc<ManifestPart>> {
         self.parts
             .get(part_id)
             .and_then(|cell| cell.value().get().cloned())
     }
 
-    pub fn get_cached_part_by_list_idx(&self, idx: usize) -> Option<Arc<part::ManifestPart>> {
+    pub fn get_cached_part_by_list_idx(&self, idx: usize) -> Option<Arc<ManifestPart>> {
         let Some(list) = &self.list else {
             return None;
         };
@@ -298,7 +302,7 @@ impl Manifest {
 
     pub(crate) async fn load(
         current_manifest: Option<Arc<Self>>,
-        storage: Arc<dyn crate::storage::StorageProvider>,
+        storage: Arc<dyn StorageProvider>,
         options: Option<Arc<SupertableOptions>>,
     ) -> Result<Arc<Self>, ManifestLoadError> {
         // 1. Read the pointer file.
@@ -321,7 +325,7 @@ impl Manifest {
         let (list_bytes, _) = storage
             .get(&pointer.manifest_list_uri)
             .await
-            .map_err(crate::supertable::ManifestLoadError::Storage)?;
+            .map_err(ManifestLoadError::Storage)?;
         let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
 
         let options = if let Some(options) = options {
@@ -339,14 +343,8 @@ impl Manifest {
         // manifest's stamped digest. The all-zero stored
         // hash bypasses validation (legacy + synthetic
         // fixtures).
-        let expected_hash = crate::supertable::manifest::options_hash::compute_options_hash(
-            &options,
-            &list.partition_strategy,
-        );
-        if let Err(mismatch) = crate::supertable::manifest::options_hash::verify_options_hash(
-            expected_hash,
-            list.options_hash,
-        ) {
+        let expected_hash = options_hash::compute_options_hash(&options, &list.partition_strategy);
+        if let Err(mismatch) = options_hash::verify_options_hash(expected_hash, list.options_hash) {
             return Err(ManifestLoadError::ContentHashMismatch {
                 expected: mismatch.expected,
                 actual: mismatch.actual,
@@ -355,8 +353,8 @@ impl Manifest {
 
         // 3. Build the loader, superfiles & parts
         let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
-        let parts: dashmap::DashMap<_, _> = DashMap::new();
-        let mut all_superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = Vec::new();
+        let parts: DashMap<_, _> = DashMap::new();
+        let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
         if let Some(current_manifest) = &current_manifest {
             // If we have an existing manifest, populate `parts` with
             // existing entries and track missing part IDs for lazy-load.
@@ -381,10 +379,10 @@ impl Manifest {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = futures::future::join_all(load_futs).await;
+                let loaded = future::join_all(load_futs).await;
                 for (pid, result) in missing_part_ids.iter().zip(loaded) {
                     let part = result?;
-                    let cell = tokio::sync::OnceCell::new();
+                    let cell = OnceCell::new();
                     cell.set(part).expect("fresh cell");
                     parts.insert(*pid, Arc::new(cell));
                 }
@@ -398,7 +396,7 @@ impl Manifest {
                 }
             } else {
                 for pid in &missing_part_ids {
-                    parts.insert(*pid, Arc::new(tokio::sync::OnceCell::new()));
+                    parts.insert(*pid, Arc::new(OnceCell::new()));
                 }
             }
         } else {
@@ -421,11 +419,11 @@ impl Manifest {
                         async move { loader.load(pid).await }
                     })
                     .collect::<Vec<_>>();
-                let loaded = futures::future::join_all(load_futs).await;
+                let loaded = future::join_all(load_futs).await;
                 for (pid, result) in part_ids.iter().zip(loaded) {
                     let part = result?;
                     all_superfiles.extend(part.superfiles.iter().cloned());
-                    let cell = tokio::sync::OnceCell::new();
+                    let cell = OnceCell::new();
                     cell.set(part).expect("fresh OnceCell");
                     parts.insert(*pid, Arc::new(cell));
                 }
@@ -439,7 +437,7 @@ impl Manifest {
                 // Callers in lazy mode today drive
                 // `Manifest::part().await` directly.
                 for entry in &list.parts {
-                    parts.insert(entry.part_id, Arc::new(tokio::sync::OnceCell::new()));
+                    parts.insert(entry.part_id, Arc::new(OnceCell::new()));
                 }
             }
         }
@@ -569,19 +567,14 @@ impl Manifest {
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         match &self.list {
             Some(list) => {
-                let kept = crate::supertable::manifest::list_prune::prune_parts_for_vector(
-                    list,
-                    column,
-                    query,
-                    f32::INFINITY,
-                );
+                let kept = list_prune::prune_parts_for_vector(list, column, query, f32::INFINITY);
                 hierarchical_iter::load_and_flatten(self, &kept).await
             }
             None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
         }
     }
 
-    pub fn get_all_list_entries(&self) -> &[list::ManifestListEntry] {
+    pub fn get_all_list_entries(&self) -> &[ManifestListEntry] {
         match &self.list {
             Some(list) => &list.parts,
             None => &[],
@@ -598,7 +591,7 @@ impl Manifest {
         Self {
             superfile_list: self.superfile_list.with_appended(new_entries),
             list: self.list.clone(),
-            parts: dashmap::DashMap::new(),
+            parts: DashMap::new(),
             loader: self.loader.clone(),
         }
     }
@@ -619,8 +612,8 @@ impl Manifest {
     ///   decode failures.
     pub async fn get_part_by_id(
         &self,
-        part_id: part::PartId,
-    ) -> Result<std::sync::Arc<part::ManifestPart>, ManifestLoadError> {
+        part_id: PartId,
+    ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         let loader = self
             .loader
             .as_ref()
@@ -628,10 +621,10 @@ impl Manifest {
         let cell = self
             .parts
             .entry(part_id)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
+            .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
         let loaded = cell.get_or_try_init(|| loader.load(part_id)).await?;
-        Ok(std::sync::Arc::clone(loaded))
+        Ok(Arc::clone(loaded))
     }
 
     /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
@@ -826,10 +819,7 @@ impl Manifest {
             out_list_entries_after_removal.push(fresh_entry);
         }
 
-        let opts_hash = crate::supertable::manifest::options_hash::compute_options_hash(
-            opts.as_ref(),
-            &strategy,
-        );
+        let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
         let new_list = ManifestList {
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
@@ -839,14 +829,14 @@ impl Manifest {
             fts_columns: opts
                 .fts_columns
                 .iter()
-                .map(|f| crate::supertable::manifest::list::FtsColumnInfo {
+                .map(|f| list::FtsColumnInfo {
                     column: f.column.clone(),
                 })
                 .collect(),
             vector_columns: opts
                 .vector_columns
                 .iter()
-                .map(|v| crate::supertable::manifest::list::VectorColumnInfo {
+                .map(|v| list::VectorColumnInfo {
                     column: v.column.clone(),
                     dim: v.dim,
                     n_cent: v.n_cent,
@@ -886,7 +876,7 @@ impl Manifest {
         // Surviving parts keep their warm cache entry (no refetch);
         // the freshly-written parts are seeded below.
         let live_part_ids: HashSet<_> = new_list.parts.iter().map(|e| e.part_id).collect();
-        let parts = dashmap::DashMap::new();
+        let parts = DashMap::new();
         for kv in self.parts.iter() {
             if live_part_ids.contains(kv.key()) {
                 parts.insert(*kv.key(), kv.value().clone());
@@ -896,7 +886,7 @@ impl Manifest {
             let part = part.part.clone();
             parts.insert(
                 part.part_id,
-                Arc::new(tokio::sync::OnceCell::new_with(Some(Arc::new(part)))),
+                Arc::new(OnceCell::new_with(Some(Arc::new(part)))),
             );
         }
 
@@ -923,8 +913,8 @@ fn rebuild_part_and_entry(
     partition_key: Vec<u8>,
     base_part: Option<&ManifestListEntry>,
 ) -> (
-    crate::supertable::manifest::list::ManifestListEntry,
-    crate::supertable::manifest::part::ManifestPart,
+    ManifestListEntry,
+    ManifestPart,
     Vec<u8>, // pre-encoded compressed bytes — reused by write path, no second encode
 ) {
     let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
@@ -943,6 +933,7 @@ fn rebuild_part_and_entry(
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
+
     let entry = ManifestListEntry {
         part_id: part.part_id,
         uri: part_uri(&content_hash),
@@ -966,18 +957,15 @@ fn rebuild_part_and_entry(
 /// StorageProvider>` is shared with the `DiskCacheStore` —
 /// one auth handshake, one connection pool.
 pub struct ManifestPartLoader {
-    storage: std::sync::Arc<dyn crate::storage::StorageProvider>,
+    storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri)`. Built from
     /// the manifest list at construction; immutable per-`Manifest`.
-    parts_index: std::collections::HashMap<part::PartId, (part::ContentHash, String)>,
+    parts_index: HashMap<PartId, (ContentHash, String)>,
 }
 
 impl ManifestPartLoader {
-    pub fn new(
-        storage: std::sync::Arc<dyn crate::storage::StorageProvider>,
-        list: &list::ManifestList,
-    ) -> Self {
-        let mut idx = std::collections::HashMap::with_capacity(list.parts.len());
+    pub fn new(storage: Arc<dyn StorageProvider>, list: &ManifestList) -> Self {
+        let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
             idx.insert(entry.part_id, (entry.content_hash, entry.uri.clone()));
         }
@@ -989,10 +977,7 @@ impl ManifestPartLoader {
 
     /// Fetch + verify + decode one part. Returns the parsed
     /// `Arc<ManifestPart>`.
-    pub async fn load(
-        &self,
-        part_id: part::PartId,
-    ) -> Result<std::sync::Arc<part::ManifestPart>, ManifestLoadError> {
+    pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         let (expected_hash, uri) = self
             .parts_index
             .get(&part_id)
@@ -1002,7 +987,7 @@ impl ManifestPartLoader {
             .get(uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
-        let actual_hash = part::ContentHash::of(&bytes);
+        let actual_hash = ContentHash::of(&bytes);
         if actual_hash != *expected_hash {
             return Err(ManifestLoadError::ContentHashMismatch {
                 expected: expected_hash.to_hex(),
@@ -1010,7 +995,7 @@ impl ManifestPartLoader {
             });
         }
         let parsed = part::decode(&bytes)?;
-        Ok(std::sync::Arc::new(parsed))
+        Ok(Arc::new(parsed))
     }
 }
 
@@ -1041,10 +1026,10 @@ pub enum ManifestLoadError {
     /// passed a stale id (pre-refresh) or the manifest list is
     /// missing an entry.
     #[error("part_id not in manifest list: {part_id}")]
-    PartNotInList { part_id: part::PartId },
+    PartNotInList { part_id: PartId },
     /// Storage backend returned an error.
     #[error("storage error during part load: {0}")]
-    Storage(#[source] crate::storage::StorageError),
+    Storage(#[source] StorageError),
     /// Computed blake3 of the loaded bytes didn't match the
     /// manifest list's recorded `content_hash`. The bad bytes
     /// are **not** auto-refetched — a mismatch indicates
@@ -1368,7 +1353,7 @@ pub(crate) fn merge_min_max_arrays(
 /// floats → `Float64`). `None` for non-summable types (utf8, bool,
 /// decimal) or when the exact total overflows the result type —
 /// consumers treat missing as "no statistics".
-pub(crate) fn column_sum(col: &arrow_array::ArrayRef) -> Option<ArrayRef> {
+pub(crate) fn column_sum(col: &ArrayRef) -> Option<ArrayRef> {
     macro_rules! signed {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
@@ -1436,7 +1421,7 @@ pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
 /// `None` for types the sketch doesn't cover. Values hash by their
 /// canonical byte representation (little-endian for numerics, raw
 /// bytes for strings, IEEE bits for floats).
-pub(crate) fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> {
+pub(crate) fn column_hll(col: &ArrayRef) -> Option<hll::HllSketch> {
     let mut sketch = hll::HllSketch::new();
     macro_rules! ints {
         ($array_ty:ty) => {{
@@ -1484,7 +1469,7 @@ pub(crate) fn column_hll(col: &arrow_array::ArrayRef) -> Option<hll::HllSketch> 
     Some(sketch)
 }
 
-pub(crate) fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
+pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     macro_rules! prim {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
@@ -1608,7 +1593,7 @@ pub struct ClusterCentroids {
     /// reconstruct `‖centroid‖²` without dequantizing. Populated on
     /// first L2 query (one pass over `codes`), 8 bytes per cluster;
     /// never serialized (decode starts it empty).
-    pub code_moments: std::sync::OnceLock<Vec<(f32, f32)>>,
+    pub code_moments: OnceLock<Vec<(f32, f32)>>,
 }
 
 impl ClusterCentroids {
@@ -1669,7 +1654,7 @@ impl ClusterCentroids {
             mins,
             scales,
             counts,
-            code_moments: std::sync::OnceLock::new(),
+            code_moments: OnceLock::new(),
         }
     }
 
@@ -1747,19 +1732,24 @@ impl ClusterCentroids {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
+    use std::{hint::black_box, slice::from_ref, sync::Arc};
 
     use arrow_array::Array;
     use arrow_schema::{DataType, Field, Schema};
+    use dashmap::DashMap;
     use tempfile::TempDir;
     use tokio::sync::OnceCell;
 
-    use crate::storage::LocalFsStorageProvider;
-    use crate::superfile::builder::FtsConfig;
-    use crate::superfile::vector::distance::distance;
-    use crate::supertable::manifest::commit::write_manifest_part;
-    use crate::supertable::manifest::list::PartitionStrategy;
+    use super::*;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        superfile::{builder::FtsConfig, vector::distance::distance},
+        supertable::manifest::{
+            commit::{PartWriteResult, write_manifest_part},
+            list::PartitionStrategy,
+        },
+        test_helpers::default_tokenizer,
+    };
 
     /// Deterministic synthetic fp32 centroids for the folded-scoring
     /// tests: distinct per-cluster ranges so per-cluster Sq8
@@ -1845,7 +1835,7 @@ mod tests {
             for _ in 0..iters {
                 let mut acc = 0f32;
                 cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |_, s| acc += s);
-                std::hint::black_box(acc);
+                black_box(acc);
             }
             let folded_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
@@ -1860,7 +1850,7 @@ mod tests {
                     cc.dequantize_into(c, &mut deq);
                     acc += distance(metric, &query, &deq);
                 }
-                std::hint::black_box(acc);
+                black_box(acc);
             }
             let dequant_us = t0.elapsed().as_micros() as f64 / iters as f64;
             println!(
@@ -1879,7 +1869,7 @@ mod tests {
     }
 
     fn opts() -> Arc<SupertableOptions> {
-        let tk = crate::test_helpers::default_tokenizer();
+        let tk = default_tokenizer();
         Arc::new(
             SupertableOptions::new(
                 schema(),
@@ -2036,22 +2026,38 @@ mod tests {
     // ============================================================
 
     mod lazy_load {
-        use super::super::*;
+        use std::{
+            collections::HashMap,
+            error::Error,
+            ops::Range,
+            slice::from_ref,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::SystemTime,
+        };
+
+        use arrow_schema::{DataType, Field, Schema};
         use async_trait::async_trait;
         use bytes::Bytes;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::SystemTime;
+        use dashmap::DashMap;
+        use tokio::spawn;
         use uuid::Uuid;
 
-        use crate::storage::{ObjectMeta, StorageError, StorageProvider};
-        use crate::supertable::manifest::list::{
-            FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
-            PartitionStrategy,
-        };
-        use crate::supertable::manifest::part::{
-            self as part_mod, ContentHash, ManifestPart, PartId,
+        use super::super::*;
+        use crate::{
+            storage::{ObjectMeta, StorageError, StorageProvider},
+            supertable::{
+                SupertableOptions,
+                manifest::{
+                    list::{
+                        FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
+                        PartitionStrategy,
+                    },
+                    part::{self as part_mod, ContentHash, ManifestPart, PartId},
+                },
+            },
         };
 
         #[derive(Debug)]
@@ -2104,7 +2110,7 @@ mod tests {
             async fn get_range(
                 &self,
                 uri: &str,
-                _range: std::ops::Range<u64>,
+                _range: Range<u64>,
             ) -> Result<Bytes, StorageError> {
                 Err(permanent(uri, "get_range unimplemented for mock"))
             }
@@ -2139,7 +2145,7 @@ mod tests {
         }
 
         fn permanent(uri: &str, msg: &'static str) -> StorageError {
-            let boxed: Box<dyn std::error::Error + Send + Sync> = msg.into();
+            let boxed: Box<dyn Error + Send + Sync> = msg.into();
             StorageError::Permanent {
                 uri: uri.into(),
                 source: boxed,
@@ -2199,9 +2205,7 @@ mod tests {
             }
         }
 
-        fn options_for_test() -> Arc<crate::supertable::SupertableOptions> {
-            use crate::supertable::SupertableOptions;
-            use arrow_schema::{DataType, Field, Schema};
+        fn options_for_test() -> Arc<SupertableOptions> {
             let s = Arc::new(Schema::new(vec![Field::new(
                 "title",
                 DataType::LargeUtf8,
@@ -2216,9 +2220,9 @@ mod tests {
         ) -> Manifest {
             let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
             Manifest {
-                superfile_list: crate::supertable::SuperfileList::empty(options_for_test()),
+                superfile_list: SuperfileList::empty(options_for_test()),
                 list: Some(list),
-                parts: dashmap::DashMap::new(),
+                parts: DashMap::new(),
                 loader: Some(loader),
             }
         }
@@ -2226,7 +2230,7 @@ mod tests {
         #[tokio::test]
         async fn part_first_touch_loads_and_caches() {
             let part = make_test_part(7);
-            let (objects, entries) = encode_and_index(std::slice::from_ref(&part));
+            let (objects, entries) = encode_and_index(from_ref(&part));
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
             let manifest =
@@ -2240,7 +2244,7 @@ mod tests {
         #[tokio::test]
         async fn second_touch_hits_cache_zero_additional_gets() {
             let part = make_test_part(11);
-            let (objects, entries) = encode_and_index(std::slice::from_ref(&part));
+            let (objects, entries) = encode_and_index(from_ref(&part));
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
             let manifest =
@@ -2261,7 +2265,7 @@ mod tests {
         #[tokio::test]
         async fn concurrent_loaders_coalesce_to_one_get() {
             let part = make_test_part(13);
-            let (objects, entries) = encode_and_index(std::slice::from_ref(&part));
+            let (objects, entries) = encode_and_index(from_ref(&part));
             let storage = Arc::new(CountingMockStorage::new(objects));
             let list = fresh_list(entries);
             let manifest = Arc::new(build_manifest_with_loader(
@@ -2274,7 +2278,7 @@ mod tests {
             for _ in 0..100 {
                 let m = Arc::clone(&manifest);
                 let pid = part.part_id;
-                handles.push(tokio::spawn(async move { m.get_part_by_id(pid).await }));
+                handles.push(spawn(async move { m.get_part_by_id(pid).await }));
             }
             let mut first: Option<Arc<ManifestPart>> = None;
             for h in handles {
@@ -2297,7 +2301,7 @@ mod tests {
         #[tokio::test]
         async fn content_hash_mismatch_surfaces_typed_error_without_refetch() {
             let part = make_test_part(17);
-            let (mut objects, entries) = encode_and_index(std::slice::from_ref(&part));
+            let (mut objects, entries) = encode_and_index(from_ref(&part));
             // Tamper with the stored bytes — content_hash on
             // the list entry no longer matches.
             let bytes = objects.values().next().expect("one obj").clone();
@@ -2306,7 +2310,7 @@ mod tests {
             tampered[last] ^= 0xff;
             let uri = entries[0].uri.clone();
             objects.insert(uri, Bytes::from(tampered));
-            let (_, fresh_entries) = encode_and_index(std::slice::from_ref(&part));
+            let (_, fresh_entries) = encode_and_index(from_ref(&part));
             let list = fresh_list(fresh_entries);
 
             let storage = Arc::new(CountingMockStorage::new(objects));
@@ -2441,7 +2445,7 @@ mod tests {
         let m = Manifest {
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
-            parts: dashmap::DashMap::new(),
+            parts: DashMap::new(),
             loader: None,
         };
         let dbg = format!("{m:?}");
@@ -2541,15 +2545,15 @@ mod tests {
         vec![0, 0, 0, 0]
     }
 
-    fn simple_schema() -> std::sync::Arc<arrow_schema::Schema> {
-        std::sync::Arc::new(arrow_schema::Schema::new(vec![Field::new(
+    fn simple_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
             "text",
             DataType::LargeUtf8,
             false,
         )]))
     }
 
-    fn make_opts() -> std::sync::Arc<SupertableOptions> {
+    fn make_opts() -> Arc<SupertableOptions> {
         SupertableOptions::new(simple_schema(), vec![], vec![], None)
             .map(Arc::new)
             .expect("valid options")
@@ -2557,7 +2561,7 @@ mod tests {
 
     fn empty_manifest(opts: &Arc<SupertableOptions>) -> Arc<Manifest> {
         Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList::empty(opts.clone()),
+            superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
@@ -2572,7 +2576,7 @@ mod tests {
                 },
                 parts: vec![],
             }),
-            parts: dashmap::DashMap::new(),
+            parts: DashMap::new(),
             loader: None,
         })
     }
@@ -2677,15 +2681,15 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
+        let loader = ManifestPartLoader::new(storage, &list);
 
-        let parts = dashmap::DashMap::new();
+        let parts = DashMap::new();
         parts.insert(
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![old_superfile],
@@ -2754,10 +2758,7 @@ mod tests {
             pk: &[u8],
             hint: u32,
             docs: [u64; 2],
-        ) -> (
-            ManifestPart,
-            crate::supertable::manifest::commit::PartWriteResult,
-        ) {
+        ) -> (ManifestPart, PartWriteResult) {
             let part = ManifestPart {
                 format_version: part::FORMAT_VERSION.into(),
                 part_id: PartId::new_v4(),
@@ -2779,9 +2780,7 @@ mod tests {
         let (part_b, pw_b) = two_superfile_part(storage.as_ref(), &pk_b, 1, [200, 210]).await;
 
         // Build a list entry mirroring a persisted part.
-        let entry_for = |pw: &crate::supertable::manifest::commit::PartWriteResult,
-                         pk: &[u8]|
-         -> ManifestListEntry {
+        let entry_for = |pw: &PartWriteResult, pk: &[u8]| -> ManifestListEntry {
             ManifestListEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
@@ -2818,17 +2817,17 @@ mod tests {
                 entry_for(&pw_b, &pk_b),
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
+        let loader = ManifestPartLoader::new(storage, &list);
 
         // Only the latest A part is needed in-cache for the rewrite to
         // load + combine; the loader serves the rest from storage.
-        let parts_map = dashmap::DashMap::new();
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: part_a_old
@@ -2847,7 +2846,7 @@ mod tests {
         // around — the second phase below removes it again.
         let new_entry = make_superfile_entry_hinted(140, pk_a.clone(), 0);
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(std::slice::from_ref(&new_entry), &[])
+            .rebalance(from_ref(&new_entry), &[])
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -2920,7 +2919,7 @@ mod tests {
             .part_id;
 
         let (after_removal, removal_parts) = new_manifest
-            .rebalance(&[], std::slice::from_ref(&new_entry))
+            .rebalance(&[], from_ref(&new_entry))
             .await
             .expect("rebalance removal");
         let entries_after = after_removal.get_all_list_entries();
@@ -3032,15 +3031,15 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
+        let loader = ManifestPartLoader::new(storage, &list);
 
-        let parts = dashmap::DashMap::new();
+        let parts = DashMap::new();
         parts.insert(
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
@@ -3124,15 +3123,15 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
+        let loader = ManifestPartLoader::new(storage, &list);
 
-        let parts = dashmap::DashMap::new();
+        let parts = DashMap::new();
         parts.insert(
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1, sf2],
@@ -3268,15 +3267,15 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
+        let loader = ManifestPartLoader::new(storage, &list);
 
-        let parts = dashmap::DashMap::new();
+        let parts = DashMap::new();
         parts.insert(
             part_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_old, sf_latest],
@@ -3394,8 +3393,8 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a)))),
@@ -3405,7 +3404,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a, sf_b],
@@ -3522,8 +3521,8 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a)))),
@@ -3533,7 +3532,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a, sf_b],
@@ -3697,8 +3696,8 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
@@ -3708,7 +3707,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a_old, sf_a_latest, sf_b_old, sf_b_latest],
@@ -3809,14 +3808,14 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_keep.clone(), sf_remove.clone()],
@@ -3827,7 +3826,7 @@ mod tests {
         });
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&[], std::slice::from_ref(&sf_remove))
+            .rebalance(&[], from_ref(&sf_remove))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -3897,14 +3896,14 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_keep.clone(), sf_remove.clone()],
@@ -3918,7 +3917,7 @@ mod tests {
         let new_entries = vec![sf_new.clone()];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, std::slice::from_ref(&sf_remove))
+            .rebalance(&new_entries, from_ref(&sf_remove))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -4016,8 +4015,8 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a)))),
@@ -4027,7 +4026,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf_a_keep.clone(), sf_a_remove.clone(), sf_b.clone()],
@@ -4038,7 +4037,7 @@ mod tests {
         });
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&[], std::slice::from_ref(&sf_a_remove))
+            .rebalance(&[], from_ref(&sf_a_remove))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -4151,8 +4150,8 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a_old.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_old)))),
@@ -4162,7 +4161,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![
@@ -4177,7 +4176,7 @@ mod tests {
         });
 
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(&[], std::slice::from_ref(&sf_a_latest_remove))
+            .rebalance(&[], from_ref(&sf_a_latest_remove))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -4261,14 +4260,14 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1.clone(), sf2.clone()],
@@ -4340,14 +4339,14 @@ mod tests {
                 vector_summary_agg: Default::default(),
             }],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![sf1.clone(), sf2.clone()],
@@ -4361,7 +4360,7 @@ mod tests {
         let sf_ghost = make_superfile_entry(50, pk.clone());
 
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(&[], std::slice::from_ref(&sf_ghost))
+            .rebalance(&[], from_ref(&sf_ghost))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -4455,8 +4454,8 @@ mod tests {
                 },
             ],
         };
-        let loader = crate::supertable::manifest::ManifestPartLoader::new(storage, &list);
-        let parts_map = dashmap::DashMap::new();
+        let loader = ManifestPartLoader::new(storage, &list);
+        let parts_map = DashMap::new();
         parts_map.insert(
             part_a_old.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_old)))),
@@ -4466,7 +4465,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
-            superfile_list: crate::supertable::manifest::SuperfileList {
+            superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
                 superfiles: vec![
@@ -4481,7 +4480,7 @@ mod tests {
         });
 
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(&[], std::slice::from_ref(&sf_a_old_remove))
+            .rebalance(&[], from_ref(&sf_a_old_remove))
             .await
             .expect("rebalance");
         let list_entries = new_manifest.get_all_list_entries();
@@ -4555,7 +4554,7 @@ mod tests {
         Manifest {
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
-            parts: dashmap::DashMap::new(),
+            parts: DashMap::new(),
             loader: None,
         }
     }
