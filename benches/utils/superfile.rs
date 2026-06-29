@@ -146,7 +146,7 @@ pub mod fts {
         },
         harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index},
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss::{self, RssStats},
         supertable::Phases,
         tiers,
@@ -181,8 +181,8 @@ pub mod fts {
     /// near-full-corpus unions cost ~1 s per fresh-cache iteration for no
     /// added count signal (the count battery runs warm).
     const LARGE_UNION_NAMES: &[&str] = &["twenty_term_or", "forty_term_or"];
-    /// Timed warm-search repetitions per query (after one warmup). `run_fts`
-    /// reports the p50 over these.
+    /// Timed warm-search samples per query (after a short warmup); min /
+    /// p50 / p90 are computed over these.
     pub const WARM_ITERS: usize = 50;
     /// Cold-tier repetitions per query — each pays a fresh cache + full S3
     /// cold open, so this is deliberately small.
@@ -495,9 +495,9 @@ pub mod fts {
                         "Superfile FTS — search, single-superfile / in-memory ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on \
-                     object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). \
-                     Δ is vs the previous run.",
+                    "Warm = `SuperfileReader::open` in memory (per-query min / p50 / p90; Δ gates on \
+                     `min`); cold = same `.parquet` on object storage via `DiskCacheStore::reader` -> \
+                     `bm25_search` (production cold path). Δ is vs the previous run.",
                     warm.as_deref(),
                     None,
                     probes.as_deref(),
@@ -564,7 +564,7 @@ pub mod fts {
                             .iter()
                             .map(|(name, d)| {
                                 let ns = d.as_secs_f64() * 1e9;
-                                vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+                                vec![text(*name), context(ns, fmt_time(ns), Better::Lower)]
                             })
                             .collect(),
                     }],
@@ -804,8 +804,8 @@ pub mod fts {
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
-            metric(thr, fmt_throughput(thr), Better::Higher),
-            metric(bw, fmt_bandwidth(bw), Better::Higher),
+            context(thr, fmt_throughput(thr), Better::Higher),
+            context(bw, fmt_bandwidth(bw), Better::Higher),
             corpus_cell,
             stored_cell,
             metric(
@@ -813,12 +813,12 @@ pub mod fts {
                 rss::fmt_bytes(stats.peak_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.median_rss_bytes as f64,
                 rss::fmt_bytes(stats.median_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.p90_rss_bytes as f64,
                 rss::fmt_bytes(stats.p90_rss_bytes),
                 Better::Lower,
@@ -923,7 +923,7 @@ pub mod vector {
             VectorRunConfig, run_vector_with_index,
         },
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss,
         supertable::Phases,
         tiers,
@@ -1046,8 +1046,8 @@ pub mod vector {
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
-            metric(thr, fmt_throughput(thr), Better::Higher),
-            metric(bw, fmt_bandwidth(bw), Better::Higher),
+            context(thr, fmt_throughput(thr), Better::Higher),
+            context(bw, fmt_bandwidth(bw), Better::Higher),
             corpus_cell,
             stored_cell,
             metric(
@@ -1055,12 +1055,12 @@ pub mod vector {
                 rss::fmt_bytes(stats.peak_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.median_rss_bytes as f64,
                 rss::fmt_bytes(stats.median_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.p90_rss_bytes as f64,
                 rss::fmt_bytes(stats.p90_rss_bytes),
                 Better::Lower,
@@ -1834,7 +1834,7 @@ pub mod sql {
                     "Superfile SQL — query, single superfile / in-memory ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm p50 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here). Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
+                "Warm min / p50 / p90 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here); Δ gates on `min`. Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
                 &sets,
             );
             let b = result

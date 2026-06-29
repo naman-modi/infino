@@ -53,7 +53,7 @@ use crate::{
     cost,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-    report::{Better, Block, Cell, Report, Section, metric, text},
+    report::{Better, Block, Cell, Report, Section, context, metric, text},
     rss::{self, PeakSampler},
     storage_meter, tiers,
 };
@@ -301,8 +301,8 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     vec![
         text(label),
         metric(m.wall_ns, fmt_time(m.wall_ns), Better::Lower),
-        metric(thr, fmt_throughput(thr), Better::Higher),
-        metric(bw, fmt_bandwidth(bw), Better::Higher),
+        context(thr, fmt_throughput(thr), Better::Higher),
+        context(bw, fmt_bandwidth(bw), Better::Higher),
         text(rss::fmt_bytes(m.corpus_bytes)),
         metric(
             m.index_bytes as f64,
@@ -315,12 +315,12 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
             rss::fmt_bytes(m.peak_rss_bytes),
             Better::Lower,
         ),
-        metric(
+        context(
             m.median_rss_bytes as f64,
             rss::fmt_bytes(m.median_rss_bytes),
             Better::Lower,
         ),
-        metric(
+        context(
             m.p90_rss_bytes as f64,
             rss::fmt_bytes(m.p90_rss_bytes),
             Better::Lower,
@@ -589,9 +589,10 @@ pub mod fts {
                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
-                "Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query \
-                 p50 over repeated bm25_search). Cold = fresh disk cache + consumer per iteration, so \
-                 each read pays the object-store cold open. Δ is vs the previous run.",
+                "Warm = shared consumer + disk cache (prewarm + wait_until_warm, then per-query \
+                 min / p50 / p90 over repeated bm25_search; Δ gates on `min`). Cold = fresh disk \
+                 cache + consumer per iteration, so each read pays the object-store cold open. Δ is vs \
+                 the previous run.",
                 warm.as_deref(),
                 cold.as_ref(),
                 None,
@@ -1244,7 +1245,7 @@ pub mod vector {
                                 text(format!("p={nprobe}, r={effective_rerank}")),
                                 text(format!("{:.1}%", selectivity * 100.0)),
                                 text(format!("{mean_recall:.3}")),
-                                metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                                context(p50_ns, fmt_time(p50_ns), Better::Lower),
                             ]],
                         }],
                     });
@@ -1369,7 +1370,7 @@ pub mod sql {
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                "Warm = committed table reopened with a disk cache sized to the index; min / p50 / p90 over repeated `query_sql` calls (Δ gates on `min`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
             );
             emit_cost_warm(

@@ -14,6 +14,23 @@
 
 use std::time::{Duration, Instant};
 
+use crate::{
+    markdown::fmt_time,
+    report::{Better, Cell, context, metric, text},
+    rss::{self, RssStats},
+};
+
+/// A warm-latency cell. All three warm metrics (min / p50 / p90) are
+/// Δ-tracked equally here; which one *gates* the A/B regression decision is
+/// chosen downstream by the summary, not at measurement time.
+fn warm_time_cell(ns: f64) -> Cell {
+    if ns.is_finite() {
+        metric(ns, fmt_time(ns), Better::Lower)
+    } else {
+        text("—")
+    }
+}
+
 /// p50 of a sample set (lower-median; matches the historical bench
 /// definition shared by every runner).
 pub fn p50(samples: &mut [Duration]) -> Duration {
@@ -22,6 +39,79 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     }
     samples.sort_unstable();
     samples[(samples.len() - 1) / 2]
+}
+
+/// Min / p50 / p90 of a timed-sample set.
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    pub min: Duration,
+    pub p50: Duration,
+    pub p90: Duration,
+}
+
+/// Batch sub-µs ops up to this span so per-call `Instant::now` overhead
+/// (tens of ns) can't dominate the sample.
+const MIN_SAMPLE_NS: u64 = 50_000;
+/// Cap on the auto-chosen batch size.
+const MAX_BATCH: u64 = 100_000;
+
+/// Collect `iters` per-call timings of `op`, batching calls so each timed
+/// window spans at least [`MIN_SAMPLE_NS`]. A heavy op runs one call per
+/// sample; a sub-µs op runs many and divides out — accurate either way.
+pub fn sample_batched<T>(iters: usize, mut op: impl FnMut() -> T) -> Vec<Duration> {
+    let probe = Instant::now();
+    std::hint::black_box(op());
+    let per_call_ns = (probe.elapsed().as_nanos() as u64).max(1);
+    let batch = (MIN_SAMPLE_NS / per_call_ns).clamp(1, MAX_BATCH) as u32;
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        for _ in 0..batch {
+            std::hint::black_box(op());
+        }
+        samples.push(t.elapsed() / batch);
+    }
+    samples
+}
+
+/// Peak / median / p90 RSS cells. Peak gates; median and p90 are context.
+fn rss_cells(stats: &RssStats) -> Vec<Cell> {
+    vec![
+        metric(
+            stats.peak_rss_bytes as f64,
+            rss::fmt_bytes(stats.peak_rss_bytes),
+            Better::Lower,
+        ),
+        context(
+            stats.median_rss_bytes as f64,
+            rss::fmt_bytes(stats.median_rss_bytes),
+            Better::Lower,
+        ),
+        context(
+            stats.p90_rss_bytes as f64,
+            rss::fmt_bytes(stats.p90_rss_bytes),
+            Better::Lower,
+        ),
+    ]
+}
+
+/// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
+pub fn summarize(samples: &mut [Duration]) -> Stats {
+    let n = samples.len();
+    if n == 0 {
+        return Stats {
+            min: Duration::ZERO,
+            p50: Duration::ZERO,
+            p90: Duration::ZERO,
+        };
+    }
+    samples.sort_unstable();
+    let p90_rank = (9 * n).div_ceil(10).clamp(1, n);
+    Stats {
+        min: samples[0],
+        p50: samples[(n - 1) / 2],
+        p90: samples[p90_rank - 1],
+    }
 }
 
 /// Cold timings for one query, split at the open/search boundary:
@@ -97,7 +187,7 @@ pub mod fts {
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
-        rss::{self, PeakSampler, RssStats},
+        rss::{PeakSampler, RssStats},
     };
 
     /// Nanoseconds per second, for time-cell formatting.
@@ -470,20 +560,49 @@ pub mod fts {
         }
     }
 
-    /// Warm p50 (+ per-query RSS) for one query: `p50` is the query
-    /// phase (id + score), `p50_fetched` the fetch phase (+ the text
-    /// column for the top-k rows).
+    /// Warm timing (+ RSS) for one query: `warm` is the query phase (id +
+    /// score), `fetched_min` the fetch phase (+ top-k text).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
-        pub p50: Duration,
-        pub p50_fetched: Duration,
+        pub warm: Stats,
+        pub fetched_min: Duration,
         pub rss: RssStats,
     }
 
-    /// Measure the warm battery against an already-warm reader: one
-    /// untimed prewarm per query, then `iters` timed iterations for
-    /// the query phase and `iters` for the fetch phase.
+    /// Untimed iterations before sampling, to reach steady state.
+    const WARMUP_ITERS: usize = 5;
+
+    /// One warm measurement of a query: query-phase `Stats` + fetch + RSS.
+    fn measure_warm_once<R: FtsRead>(
+        reader: &R,
+        q: &FtsQuery,
+        column: &str,
+        k: usize,
+        iters: usize,
+    ) -> FtsQueryStat {
+        let query = q.terms.join(" ");
+        let mode = to_infino_mode(q.mode);
+        for _ in 0..WARMUP_ITERS {
+            std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
+        }
+        let sampler = PeakSampler::start_default();
+        let mut samples = sample_batched(iters, || reader.bm25_rows(column, &query, k, mode));
+        for _ in 0..WARMUP_ITERS {
+            std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
+        }
+        let mut fetched_samples =
+            sample_batched(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
+        let rss = sampler.stop_stats();
+        FtsQueryStat {
+            name: q.name,
+            warm: summarize(&mut samples),
+            fetched_min: summarize(&mut fetched_samples).min,
+            rss,
+        }
+    }
+
+    /// Measure the warm battery against an already-warm reader once per query.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -492,37 +611,10 @@ pub mod fts {
         iters: usize,
         log_prefix: &str,
     ) -> Vec<FtsQueryStat> {
+        eprintln!("[{log_prefix}] warm: {} queries...", battery.len());
         battery
             .iter()
-            .map(|q| {
-                eprintln!("[{log_prefix}] warm: query {}...", q.name);
-                let query = q.terms.join(" ");
-                let mode = to_infino_mode(q.mode);
-                let _ = reader.bm25_rows(column, &query, k, mode);
-                let sampler = PeakSampler::start_default();
-                let mut samples = Vec::with_capacity(iters);
-                for _ in 0..iters {
-                    let t = Instant::now();
-                    let rows = reader.bm25_rows(column, &query, k, mode);
-                    samples.push(t.elapsed());
-                    std::hint::black_box(rows);
-                }
-                let _ = reader.bm25_rows_fetched(column, &query, k, mode);
-                let mut fetched_samples = Vec::with_capacity(iters);
-                for _ in 0..iters {
-                    let t = Instant::now();
-                    let rows = reader.bm25_rows_fetched(column, &query, k, mode);
-                    fetched_samples.push(t.elapsed());
-                    std::hint::black_box(rows);
-                }
-                let rss = sampler.stop_stats();
-                FtsQueryStat {
-                    name: q.name,
-                    p50: p50(&mut samples),
-                    p50_fetched: p50(&mut fetched_samples),
-                    rss,
-                }
-            })
+            .map(|q| measure_warm_once(reader, q, column, k, iters))
             .collect()
     }
 
@@ -574,29 +666,28 @@ pub mod fts {
     fn warm_cells(stat: Option<&FtsQueryStat>) -> Vec<Cell> {
         match stat {
             Some(q) => {
-                let ns = q.p50.as_secs_f64() * NS_PER_SEC;
-                let fetched_ns = q.p50_fetched.as_secs_f64() * NS_PER_SEC;
-                vec![
-                    metric(ns, fmt_time(ns), Better::Lower),
-                    metric(fetched_ns, fmt_time(fetched_ns), Better::Lower),
-                    metric(
-                        q.rss.peak_rss_bytes as f64,
-                        rss::fmt_bytes(q.rss.peak_rss_bytes),
-                        Better::Lower,
-                    ),
-                    metric(
-                        q.rss.median_rss_bytes as f64,
-                        rss::fmt_bytes(q.rss.median_rss_bytes),
-                        Better::Lower,
-                    ),
-                    metric(
-                        q.rss.p90_rss_bytes as f64,
-                        rss::fmt_bytes(q.rss.p90_rss_bytes),
-                        Better::Lower,
-                    ),
-                ]
+                let min_ns = q.warm.min.as_secs_f64() * NS_PER_SEC;
+                let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
+                let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
+                let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
+                let mut cells = vec![
+                    warm_time_cell(min_ns),
+                    warm_time_cell(p50_ns),
+                    warm_time_cell(p90_ns),
+                    context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
+                ];
+                cells.extend(rss_cells(&q.rss));
+                cells
             }
-            None => vec![text("—"), text("—"), text("—"), text("—"), text("—")],
+            None => vec![
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+            ],
         }
     }
 
@@ -614,7 +705,7 @@ pub mod fts {
                 Some(t) => {
                     let open_ns = t.open.as_secs_f64() * NS_PER_SEC;
                     let search_ns = t.search.as_secs_f64() * NS_PER_SEC;
-                    cells.push(metric(open_ns, fmt_time(open_ns), Better::Lower));
+                    cells.push(context(open_ns, fmt_time(open_ns), Better::Lower));
                     cells.push(metric(search_ns, fmt_time(search_ns), Better::Lower));
                 }
                 None => {
@@ -646,9 +737,17 @@ pub mod fts {
         let mut header_cols = vec!["Query".to_string()];
         if warm_map.is_some() {
             header_cols.extend(
-                ["warm", "warm +fetch", "Peak RSS", "Median RSS", "P90 RSS"]
-                    .iter()
-                    .map(|s| s.to_string()),
+                [
+                    "warm min",
+                    "warm p50",
+                    "warm p90",
+                    "+fetch min",
+                    "Peak RSS",
+                    "Median RSS",
+                    "P90 RSS",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
             );
         }
         if cold.is_some() {
@@ -684,8 +783,8 @@ pub mod fts {
                         let b = bmm.as_secs_f64() * NS_PER_SEC;
                         vec![
                             text(*shape),
-                            metric(w, fmt_time(w), Better::Lower),
-                            metric(b, fmt_time(b), Better::Lower),
+                            context(w, fmt_time(w), Better::Lower),
+                            context(b, fmt_time(b), Better::Lower),
                         ]
                     })
                     .collect(),
@@ -747,7 +846,7 @@ pub mod fts {
                 vec![
                     text(name),
                     text(fmt_count(c.n as usize)),
-                    metric(ns, fmt_time(ns), Better::Lower),
+                    context(ns, fmt_time(ns), Better::Lower),
                 ]
             }
             None => vec![text(name), text("—"), text("—")],
@@ -802,7 +901,7 @@ pub mod vector {
         corpus::{self, Calibrated},
         markdown::fmt_time,
         report::{Better, Block, Cell, Report, Section, metric, text},
-        rss::{self, PeakSampler, RssStats},
+        rss::{PeakSampler, RssStats},
     };
 
     /// Recall correctness gate (shared by both tiers).
@@ -1128,12 +1227,17 @@ pub mod vector {
             .collect()
     }
 
-    /// Warm p50 (+ RSS) for one config on an already-warm reader.
+    /// Warm timing (+ RSS) for one config on an already-warm reader,
+    /// gated on `warm.min`.
     #[derive(Clone, Copy)]
     pub struct VecTiming {
-        pub p50_ns: f64,
+        pub warm: Stats,
         pub rss: RssStats,
     }
+
+    /// Untimed iterations before sampling, to reach steady state.
+    const WARMUP_ITERS: usize = 5;
+    const WARM_SAMPLE_ITERS: usize = 30;
 
     pub fn measure_warm<R: VectorRead>(
         reader: &R,
@@ -1143,18 +1247,16 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> VecTiming {
-        let sampler = PeakSampler::start_default();
-        let _ = reader.topk_global(column, query, k, nprobe, rerank);
-        let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
-        for _ in 0..CALIBRATION_P50_ITERS {
-            let t0 = Instant::now();
-            let hits = reader.topk_global(column, query, k, nprobe, rerank);
-            samples.push(t0.elapsed());
-            black_box(hits);
+        for _ in 0..WARMUP_ITERS {
+            black_box(reader.topk_global(column, query, k, nprobe, rerank));
         }
+        let sampler = PeakSampler::start_default();
+        let mut samples = sample_batched(WARM_SAMPLE_ITERS, || {
+            reader.topk_global(column, query, k, nprobe, rerank)
+        });
         let rss = sampler.stop_stats();
         VecTiming {
-            p50_ns: p50(&mut samples).as_secs_f64() * NS_PER_SEC,
+            warm: summarize(&mut samples),
             rss,
         }
     }
@@ -1197,6 +1299,7 @@ pub mod vector {
         pub cold: Option<ColdTiming>,
     }
 
+    /// Gate latency cell (warm min, cold search).
     fn time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             metric(ns, fmt_time(ns), Better::Lower)
@@ -1205,24 +1308,13 @@ pub mod vector {
         }
     }
 
-    fn rss_cells(stats: &RssStats) -> Vec<Cell> {
-        vec![
-            metric(
-                stats.peak_rss_bytes as f64,
-                rss::fmt_bytes(stats.peak_rss_bytes),
-                Better::Lower,
-            ),
-            metric(
-                stats.median_rss_bytes as f64,
-                rss::fmt_bytes(stats.median_rss_bytes),
-                Better::Lower,
-            ),
-            metric(
-                stats.p90_rss_bytes as f64,
-                rss::fmt_bytes(stats.p90_rss_bytes),
-                Better::Lower,
-            ),
-        ]
+    /// Context latency cell (p50/p90, cold open).
+    fn ctx_time_cell(ns: f64) -> Cell {
+        if ns.is_finite() {
+            context(ns, fmt_time(ns), Better::Lower)
+        } else {
+            text("—")
+        }
     }
 
     /// Render the recall/latency table (same columns for both tiers):
@@ -1243,9 +1335,16 @@ pub mod vector {
         ];
         if include_warm {
             headers.extend(
-                ["warm", "Peak RSS", "Median RSS", "P90 RSS"]
-                    .iter()
-                    .map(|s| s.to_string()),
+                [
+                    "warm min",
+                    "warm p50",
+                    "warm p90",
+                    "Peak RSS",
+                    "Median RSS",
+                    "P90 RSS",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
             );
         }
         if include_cold {
@@ -1259,16 +1358,21 @@ pub mod vector {
                 if include_warm {
                     match &r.warm {
                         Some(w) => {
-                            cells.push(time_cell(w.p50_ns));
+                            let min_ns = w.warm.min.as_secs_f64() * NS_PER_SEC;
+                            let p50_ns = w.warm.p50.as_secs_f64() * NS_PER_SEC;
+                            let p90_ns = w.warm.p90.as_secs_f64() * NS_PER_SEC;
+                            cells.push(warm_time_cell(min_ns));
+                            cells.push(warm_time_cell(p50_ns));
+                            cells.push(warm_time_cell(p90_ns));
                             cells.extend(rss_cells(&w.rss));
                         }
-                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(4)),
+                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
                     }
                 }
                 if include_cold {
                     match r.cold {
                         Some(t) => {
-                            cells.push(time_cell(t.open.as_secs_f64() * NS_PER_SEC));
+                            cells.push(ctx_time_cell(t.open.as_secs_f64() * NS_PER_SEC));
                             cells.push(time_cell(t.search.as_secs_f64() * NS_PER_SEC));
                         }
                         None => {
@@ -1472,11 +1576,11 @@ pub mod sql {
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
-        rss::{self, PeakSampler, RssStats},
+        rss::{PeakSampler, RssStats},
     };
 
     /// Timed query repetitions per query (after one warmup).
-    pub const ITERS: usize = 10;
+    pub const ITERS: usize = 30;
 
     const BUCKET_IN_ALL: &str = "('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9')";
 
@@ -1584,10 +1688,13 @@ pub mod sql {
     #[derive(Clone)]
     pub struct SqlQueryStat {
         pub name: &'static str,
-        pub p50: Duration,
+        pub warm: Stats,
         pub rows: usize,
         pub rss: RssStats,
     }
+
+    /// Untimed iterations before sampling, to reach steady state.
+    const WARMUP_ITERS: usize = 5;
 
     /// The full set of measured warm SQL query shapes. Infino-only: the
     /// DataFusion-only control arms (plain scan, full-scan aggregates) were
@@ -1600,19 +1707,16 @@ pub mod sql {
     }
 
     fn timed<R: SqlRead>(reader: &R, name: &'static str, sql: &str, iters: usize) -> SqlQueryStat {
-        let sampler = PeakSampler::start_default();
-        let warm_rows = reader.query_rows(sql);
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let t0 = Instant::now();
-            let r = reader.query_rows(sql);
-            samples.push(t0.elapsed());
-            black_box(r);
+        let mut warm_rows = 0;
+        for _ in 0..WARMUP_ITERS {
+            warm_rows = reader.query_rows(sql);
         }
+        let sampler = PeakSampler::start_default();
+        let mut samples = sample_batched(iters, || reader.query_rows(sql));
         let rss = sampler.stop_stats();
         SqlQueryStat {
             name,
-            p50: p50(&mut samples),
+            warm: summarize(&mut samples),
             rows: warm_rows,
             rss,
         }
@@ -1739,31 +1843,15 @@ pub mod sql {
         }
     }
 
-    fn rss_cells(stats: &RssStats) -> Vec<Cell> {
-        vec![
-            metric(
-                stats.peak_rss_bytes as f64,
-                rss::fmt_bytes(stats.peak_rss_bytes),
-                Better::Lower,
-            ),
-            metric(
-                stats.median_rss_bytes as f64,
-                rss::fmt_bytes(stats.median_rss_bytes),
-                Better::Lower,
-            ),
-            metric(
-                stats.p90_rss_bytes as f64,
-                rss::fmt_bytes(stats.p90_rss_bytes),
-                Better::Lower,
-            ),
-        ]
-    }
-
     fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
-        let ns = stat.p50.as_secs_f64() * 1e9;
+        let min_ns = stat.warm.min.as_secs_f64() * 1e9;
+        let p50_ns = stat.warm.p50.as_secs_f64() * 1e9;
+        let p90_ns = stat.warm.p90.as_secs_f64() * 1e9;
         let mut cells = vec![
             text(stat.name),
-            metric(ns, fmt_time(ns), Better::Lower),
+            warm_time_cell(min_ns),
+            warm_time_cell(p50_ns),
+            warm_time_cell(p90_ns),
             text(fmt_count(stat.rows)),
         ];
         cells.extend(rss_cells(&stat.rss));
@@ -1773,7 +1861,9 @@ pub mod sql {
     fn query_headers() -> Vec<String> {
         vec![
             "Query".into(),
-            "p50".into(),
+            "warm min".into(),
+            "warm p50".into(),
+            "warm p90".into(),
             "Rows".into(),
             "Peak RSS".into(),
             "Median RSS".into(),
@@ -1891,5 +1981,38 @@ pub mod sql {
                     .collect(),
             }],
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{sample_batched, summarize};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn summarize_picks_min_median_p90() {
+        let mut s = [ms(5), ms(1), ms(3), ms(2), ms(4)];
+        let out = summarize(&mut s);
+        assert_eq!(out.min, ms(1));
+        assert_eq!(out.p50, ms(3)); // lower-median of 5
+        assert_eq!(out.p90, ms(5)); // nearest-rank ceil(0.9*5)=5
+    }
+
+    #[test]
+    fn summarize_single_and_empty() {
+        assert_eq!(summarize(&mut [ms(7)]).p90, ms(7));
+        let z = summarize(&mut []);
+        assert_eq!((z.min, z.p50, z.p90), (ms(0), ms(0), ms(0)));
+    }
+
+    #[test]
+    fn sample_batched_returns_requested_count() {
+        let s = sample_batched(8, || std::hint::black_box(1 + 1));
+        assert_eq!(s.len(), 8);
     }
 }
