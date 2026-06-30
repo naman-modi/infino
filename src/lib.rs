@@ -126,6 +126,7 @@ pub use roaring;
 // public items are re-exported at the crate root below.
 mod catalog;
 mod error;
+mod memory;
 mod runtime_bridge;
 
 // ---- Curated public surface ----
