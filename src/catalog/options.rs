@@ -62,6 +62,11 @@ pub struct ConnectOptions {
     pub(crate) cache_budget_bytes: Option<u64>,
     /// Cold-fetch strategy when the disk cache is enabled.
     pub(crate) cold_fetch_mode: ColdFetchMode,
+    /// Per-connection memory (heap) budget in bytes. `None` (default) tracks
+    /// usage without enforcing; `Some(n)` enforces a ceiling so one connection
+    /// can't exhaust process memory. Applies to the whole connection, shared
+    /// across supertables.
+    pub(crate) connection_memory_budget_bytes: Option<u64>,
     /// Probe the backend at `connect`. Default `false`; opt in for
     /// fail-fast on bad credentials.
     pub(crate) validate: bool,
@@ -94,6 +99,15 @@ impl ConnectOptions {
     /// meaningful with [`with_cache_dir`](Self::with_cache_dir).
     pub fn with_cold_fetch_mode(mut self, mode: ColdFetchMode) -> Self {
         self.cold_fetch_mode = mode;
+        self
+    }
+
+    /// Set a per-connection memory budget, in bytes. Unset (the default)
+    /// tracks usage without enforcing; a positive value enforces a ceiling so
+    /// one connection can't exhaust process memory. Shared across all of the
+    /// connection's tables.
+    pub fn with_connection_memory_budget_bytes(mut self, bytes: u64) -> Self {
+        self.connection_memory_budget_bytes = Some(bytes);
         self
     }
 

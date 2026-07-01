@@ -59,8 +59,8 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, Rec
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
     config::{
-        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-        SupertableSettings,
+        CompactionSettings, Config, MemorySettings, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings,
     },
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
@@ -237,6 +237,7 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        memory: MemorySettings::default(),
     }
 }
 

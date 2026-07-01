@@ -85,7 +85,43 @@ pub struct Config {
     /// Compaction settings.
     #[serde(default)]
     pub compaction: CompactionSettings,
+    /// Per-connection memory budget.
+    #[serde(default)]
+    pub memory: MemorySettings,
 }
+
+/// Memory subsection of [`Config`]. All memory-related settings for Infino here.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Per-connection memory (heap) budget in bytes. `0` (the default) is
+    /// measure-only: usage is tracked but never refused. A positive value
+    /// enforces a ceiling so one connection can't exhaust process memory.
+    ///
+    /// Applies to connections built from a config file (`apply_config`). Code
+    /// that opens a connection programmatically sets the budget on
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] instead.
+    ///
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
+    pub connection_budget_bytes: u64,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
+        }
+    }
+}
+
+/// Engine default connection budget when none is configured; used by both
+/// [`MemorySettings`] and the connect path. `0` is the deliberate measure-only
+/// (no-ceiling) sentinel that `from_budget_bytes` maps to a measured budget.
+///
+/// A future non-trivial default (e.g. a fraction of system RAM) changes here.
+/// `from_budget_bytes` stays a pure value mapper; the only added work then is
+/// letting the config field distinguish "unset" from an explicit `0`.
+pub(crate) const DEFAULT_CONNECTION_BUDGET_BYTES: u64 = 0;
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
 /// specific knobs grouped so they don't crowd the top-level
@@ -644,6 +680,12 @@ storage:
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Auto);
+    }
+
+    #[test]
+    fn memory_budget_defaults_to_measure_only() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.memory.connection_budget_bytes, 0);
     }
 
     #[test]

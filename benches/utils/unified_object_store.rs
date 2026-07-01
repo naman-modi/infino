@@ -98,8 +98,8 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
     config::{
-        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-        SupertableSettings,
+        CompactionSettings, Config, MemorySettings, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings,
     },
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
@@ -1879,6 +1879,7 @@ pub(crate) mod diag {
                 ..StorageSettings::default()
             },
             compaction: CompactionSettings::default(),
+            memory: MemorySettings::default(),
         }
     }
 

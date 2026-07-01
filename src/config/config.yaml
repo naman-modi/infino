@@ -134,3 +134,21 @@ compaction:
 
   # Maximum memory budget for materializing inputs during a single merge, in MiB.
   max_memory_mb: 3072
+
+# Per-connection memory budget: a ceiling on the anonymous heap the query
+# and ingest paths allocate (result batches, the vector shortlist, ingest
+# buffers), so one connection can't grow memory until the process is OOM-
+# killed. The memory-mapped superfiles and the disk cache are bounded
+# separately; this bounds heap only.
+#
+# Applies to connections built from this config file. Code that opens a
+# connection programmatically sets the budget on ConnectOptions
+# (with_connection_memory_budget_bytes) instead.
+#
+# Env override:
+#   INFINO_MEMORY__CONNECTION_BUDGET_BYTES=8589934592
+memory:
+  # Bytes. 0 (default) is measure-only: usage is tracked but never refused.
+  # A positive value enforces the ceiling (the engine reserves at 90% of it,
+  # leaving headroom for small untracked allocations).
+  connection_budget_bytes: 0

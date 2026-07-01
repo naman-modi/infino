@@ -42,6 +42,8 @@ use uri::{Backend, parse_uri};
 
 use crate::{
     InfinoError,
+    config::DEFAULT_CONNECTION_BUDGET_BYTES,
+    memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -103,11 +105,22 @@ pub fn connect_with(
             CatalogStore::Storage(root)
         }
     };
+
+    // Budget comes from `ConnectOptions`; unset falls back to the engine
+    // default (measure-only today). The `config.yaml` default takes a separate
+    // path (`apply_config`), so `connect` never reads config.
+    let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
+        options
+            .connection_memory_budget_bytes
+            .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
+    );
+
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
             backend,
             options,
             store,
+            connection_memory_budget,
             query_runtime: OnceLock::new(),
         }),
     })
@@ -124,6 +137,10 @@ struct ConnectionInner {
     backend: Backend,
     options: ConnectOptions,
     store: CatalogStore,
+    /// Per-connection memory budget, minted once at `connect` and shared
+    /// (cloned `Arc`) into every table's `SupertableOptions`. See
+    /// [`crate::memory`].
+    connection_memory_budget: Arc<ConnectionMemoryBudget>,
     /// Runtime for the table-free `query_sql` fallback — search TVFs name
     /// their table in an argument, not a `FROM` relation, so no supertable
     /// runtime is in scope. See [`build_query_runtime`] for why it must be
@@ -183,7 +200,14 @@ impl Connection {
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
-                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, None)?;
+                let opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    None,
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )?;
                 let handle = Supertable::create(opts)?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
@@ -230,8 +254,14 @@ impl Connection {
                 // cache directory; superfile keys carry the location, so a
                 // re-created table never reads a dropped generation's bytes.
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
-                let mut opts =
-                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    Some(table_storage),
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -311,8 +341,14 @@ impl Connection {
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
-                let mut opts =
-                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    Some(table_storage),
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -509,11 +545,14 @@ fn build_options(
     vectors: Vec<VectorConfig>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
+    connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
     let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
+    // Set last so no builder step can reset the shared connection budget.
+    opts.connection_memory_budget = connection_memory_budget;
     Ok(opts)
 }
 
@@ -644,7 +683,7 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, sync::Arc};
 
     use arrow_schema::{DataType, Field, Schema};
 
@@ -685,6 +724,76 @@ mod tests {
         assert!(matches!(
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn connection_memory_budget_is_measured_by_default() {
+        let conn = connect("memory://").expect("connect");
+        assert_eq!(conn.inner.connection_memory_budget.limit(), None);
+    }
+
+    #[test]
+    fn with_connection_memory_budget_bytes_mints_a_bounded_budget_at_the_gate() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1000),
+        )
+        .expect("connect");
+        // 90% headroom gate: 1000 configured -> 900 enforced.
+        assert_eq!(conn.inner.connection_memory_budget.limit(), Some(900));
+    }
+
+    #[test]
+    fn zero_connection_memory_budget_is_measured() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(0),
+        )
+        .expect("connect");
+        assert_eq!(conn.inner.connection_memory_budget.limit(), None);
+    }
+
+    #[test]
+    fn all_tables_share_one_connection_memory_budget() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1000),
+        )
+        .expect("connect");
+        let a = conn
+            .create_table("a", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create a");
+        let b = conn
+            .create_table("b", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create b");
+
+        // Every table sees the one budget the connection minted, not a copy.
+        assert!(Arc::ptr_eq(
+            &a.options().connection_memory_budget,
+            &b.options().connection_memory_budget
+        ));
+        assert!(Arc::ptr_eq(
+            &a.options().connection_memory_budget,
+            &conn.inner.connection_memory_budget
+        ));
+    }
+
+    #[test]
+    fn reopened_table_shares_the_connection_memory_budget() {
+        // open_table threads the same shared budget as create_table.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1000),
+        )
+        .expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        let reopened = conn.open_table("docs").expect("open");
+
+        assert!(Arc::ptr_eq(
+            &reopened.options().connection_memory_budget,
+            &conn.inner.connection_memory_budget
         ));
     }
 

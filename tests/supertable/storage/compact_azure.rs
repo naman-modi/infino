@@ -67,8 +67,8 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     VectorSearchOptions,
     config::{
-        CompactionSettings, Config, OptimizeOptions, StorageBackend, StorageColdFetchMode,
-        StorageSettings, SupertableSettings, ThreadCount,
+        CompactionSettings, Config, MemorySettings, OptimizeOptions, StorageBackend,
+        StorageColdFetchMode, StorageSettings, SupertableSettings, ThreadCount,
     },
     superfile::{
         builder::{FtsConfig, VectorConfig},
@@ -203,6 +203,7 @@ fn azure_compact_config(container: &str, prefix: &str, cache_root: &std::path::P
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        memory: MemorySettings::default(),
     }
 }
 

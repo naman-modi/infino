@@ -52,6 +52,7 @@ use super::{
 };
 use crate::{
     config::{Config, StorageBackend, StorageColdFetchMode},
+    memory::ConnectionMemoryBudget,
     storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider},
     superfile::{
         OpenOptions,
@@ -278,6 +279,13 @@ pub struct SupertableOptions {
     /// idle-threshold madvise sweep on its existing schedule
     /// but does NOT proactively bound the RSS.
     pub memory_budget_bytes: Option<u64>,
+    /// Per-connection heap budget, shared (cloned `Arc`) by every supertable
+    /// the owning connection opens. The query and ingest paths reserve against
+    /// it before allocating; `measured()` by default, so it tracks usage but
+    /// never refuses until a limit is set. Distinct from `memory_budget_bytes`:
+    /// that bounds the mmap resident set, this bounds anonymous heap. See
+    /// [`crate::memory`].
+    pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
     /// When `true` (default), each commit pre-populates the
     /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
@@ -529,6 +537,10 @@ impl SupertableOptions {
             disk_cache: None,
             manifest_disk_cache: None,
             memory_budget_bytes: None,
+            // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
+            // The catalog's `build_options` overwrites this with the connection's shared budget, and
+            // `apply_config` replaces it from `config.yaml`.
+            connection_memory_budget: ConnectionMemoryBudget::measured(),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
@@ -821,6 +833,13 @@ impl SupertableOptions {
         );
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
+        // The `config.yaml` source for the connection budget; the connect path
+        // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
+        // Note this replaces the budget outright: don't call `apply_config` on
+        // options that already carry a shared connection budget, or the sharing
+        // is silently dropped.
+        self.connection_memory_budget =
+            ConnectionMemoryBudget::from_budget_bytes(cfg.memory.connection_budget_bytes);
         if cfg.supertable.id_column != self.id_column {
             if self
                 .schema
@@ -1345,6 +1364,29 @@ supertable:
         assert_eq!(opts.commit_threshold_size_mb, 7);
         assert_eq!(opts.reader_pool.current_num_threads(), 3);
         assert_eq!(opts.writer_pool.current_num_threads(), 5);
+    }
+
+    #[test]
+    fn apply_config_sets_connection_memory_budget_from_config() {
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
+
+        // A positive config value -> bounded budget, gated at 90%.
+        let yaml = "memory:\n  connection_budget_bytes: 1000\n";
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert_eq!(opts.connection_memory_budget.limit(), Some(900));
+    }
+
+    #[test]
+    fn apply_config_default_leaves_connection_memory_budget_measured() {
+        // The shipped default (0) is measure-only.
+        let cfg = Config::defaults().expect("embedded default");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert_eq!(opts.connection_memory_budget.limit(), None);
     }
 
     #[test]

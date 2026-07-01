@@ -44,8 +44,8 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use infino::{
     config::{
-        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-        SupertableSettings,
+        CompactionSettings, Config, MemorySettings, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings,
     },
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
@@ -159,6 +159,7 @@ fn real_azure_config(container: &str, prefix: &str, cache_root: &std::path::Path
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        memory: MemorySettings::default(),
     }
 }
 

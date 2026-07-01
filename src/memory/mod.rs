@@ -130,12 +130,13 @@ impl ConnectionMemoryBudget {
     }
 
     /// A bounded budget. `configured_bytes` is the operator-facing value; the
-    /// enforced ceiling is the headroom-adjusted fraction of it (90%).
+    /// enforced ceiling is 90% of it, leaving headroom for small untracked
+    /// allocations.
     ///
-    /// Expects `configured_bytes > 0` — choosing "0 / unset means measured" is
-    /// the caller's job (in config), not this constructor's. Note the gate
-    /// floors: a configured value below ~10 bytes rounds to a `0` ceiling that
-    /// refuses everything. Irrelevant at real (MB/GB) budgets.
+    /// Expects `configured_bytes > 0`; use
+    /// [`from_budget_bytes`](Self::from_budget_bytes) when `0` should mean
+    /// measure-only. A value below ~10 bytes rounds down to a `0` ceiling that
+    /// refuses everything, but that never happens at real (MB/GB) budgets.
     pub fn with_limit(configured_bytes: u64) -> Arc<Self> {
         debug_assert!(
             configured_bytes > 0,
@@ -150,6 +151,19 @@ impl ConnectionMemoryBudget {
             used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
         })
+    }
+
+    /// Map a configured byte value to a budget: `0` is measure-only
+    /// ([`measured`](Self::measured)), anything positive is bounded
+    /// ([`with_limit`](Self::with_limit)). Both config sources (`ConnectOptions`
+    /// and `config.yaml`) route through here, so "0 means measure-only" is
+    /// defined in exactly one place.
+    pub fn from_budget_bytes(bytes: u64) -> Arc<Self> {
+        if bytes > 0 {
+            Self::with_limit(bytes)
+        } else {
+            Self::measured()
+        }
     }
 
     /// Reserve `n` bytes, returning a guard that frees them on drop. Fails with
@@ -324,6 +338,17 @@ mod tests {
         // 1000 configured -> gate at 900 (9/10).
         let budget = ConnectionMemoryBudget::with_limit(1000);
         assert_eq!(budget.limit(), Some(900));
+    }
+
+    #[test]
+    fn from_budget_bytes_maps_zero_to_measured_and_positive_to_bounded() {
+        // The config / ConnectOptions convention: 0 means measure-only.
+        assert_eq!(ConnectionMemoryBudget::from_budget_bytes(0).limit(), None);
+        // Positive -> bounded, with the same 90% gate as with_limit.
+        assert_eq!(
+            ConnectionMemoryBudget::from_budget_bytes(1000).limit(),
+            Some(900)
+        );
     }
 
     #[test]
