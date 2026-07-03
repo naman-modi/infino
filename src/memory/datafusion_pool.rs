@@ -15,7 +15,7 @@ use datafusion::{
     error::{DataFusionError, Result as DfResult},
     execution::{
         memory_pool::{MemoryLimit, MemoryPool, MemoryReservation},
-        runtime_env::RuntimeEnvBuilder,
+        runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -59,22 +59,23 @@ impl MemoryPool for ConnectionBudgetPool {
     }
 }
 
-/// A `SessionContext` whose SQL allocations are gated by `budget`. The default
-/// disk manager (OS temp) gives spillable operators somewhere to spill.
-pub(crate) fn budgeted_session_context(
-    budget: &Arc<ConnectionMemoryBudget>,
-) -> DfResult<SessionContext> {
+/// A `RuntimeEnv` whose memory pool is `budget`. The default disk manager (OS
+/// temp) gives spillable operators somewhere to spill.
+fn budgeted_runtime(budget: &Arc<ConnectionMemoryBudget>) -> DfResult<Arc<RuntimeEnv>> {
     let pool: Arc<dyn MemoryPool> = Arc::new(ConnectionBudgetPool {
         budget: Arc::clone(budget),
     });
 
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(pool)
-        .build_arc()?;
+    RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()
+}
 
+/// A `SessionContext` whose SQL allocations are gated by `budget`.
+pub(crate) fn budgeted_session_context(
+    budget: &Arc<ConnectionMemoryBudget>,
+) -> DfResult<SessionContext> {
     Ok(SessionContext::new_with_config_rt(
         SessionConfig::new(),
-        runtime,
+        budgeted_runtime(budget)?,
     ))
 }
 
@@ -194,11 +195,11 @@ mod tests {
         reservation_bytes: usize,
     ) -> (usize, bool, usize) {
         let budget = ConnectionMemoryBudget::with_limit(configured_bytes);
-        let pool: Arc<dyn MemoryPool> = Arc::new(ConnectionBudgetPool { budget });
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(pool)
-            .build_arc()
-            .expect("runtime env");
+
+        // Build through the production runtime + pool wiring (`budgeted_runtime`);
+        // only the SessionConfig is tuned here (that's DataFusion's, not our
+        // wiring) so the sort spills deterministically.
+        let runtime = budgeted_runtime(&budget).expect("runtime env");
         let mut cfg = SessionConfig::new();
         cfg.options_mut().execution.sort_spill_reservation_bytes = reservation_bytes;
         // One partition = one sorter. The default (num_cpus) gives N sorters,
