@@ -8,6 +8,25 @@
 //! connection budget and lets DataFusion spill instead of us reserving by hand.
 //!
 //! One counter per connection: a fresh pool per `SessionContext` still shares it.
+//!
+//! # Spill vs OverBudget
+//!
+//! For SQL query paths, when the gate refuses (`try_grow` returns `ResourcesExhausted`), what happens
+//! next is up to the operator that asked for memory:
+//!
+//! - Spillable operator like sort, grouped aggregate, sort-merge join: frees
+//!   memory by writing its buffered run to disk, then continues. The query still
+//!   succeeds, just slower.
+//! - Otherwise it surfaces as [`InfinoError::OverBudget`], when:
+//!     - the operator can't spill at all:
+//!        - non-spillable (hash-join build side, nested-loop join, window aggregate), or
+//!        - a streaming operator (scan / filter / projection) that buffers nothing, so a single
+//!          allocation already exceeds the budget and there is nothing to write out; or
+//!     - it is spillable but can't reserve even the minimum it needs to run the
+//!       spill / merge (e.g. the sort's merge reservation).
+//!
+//! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
+//!
 
 use std::sync::Arc;
 
