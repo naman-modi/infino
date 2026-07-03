@@ -45,7 +45,7 @@ use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::{ConnectionMemoryBudget, budgeted_session_context},
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::FtsConfig,
