@@ -117,9 +117,9 @@ pub(crate) struct ConnectionMemoryBudget {
     // Bytes reserved across all live reservations. Every access is `Relaxed`: this is a pure
     // accounting counter, it guards no other memory, so no  stronger ordering is needed.
     used: AtomicUsize,
-    // High-water mark of `used`: the most ever held at once. Observability only,
-    // never gates. Exact even under concurrency: each grow records its own atomic
-    // post-add value, and `fetch_max` can't lose a maximum.
+    // The largest memory `used` ever reached. Observability only, never gates. Exact
+    // even under concurrency: each grow records its own atomic post-add value,
+    // and `fetch_max` can't lose a maximum.
     peak_used: AtomicUsize,
     // Count of refused reservations (a count, not bytes); observability only,
     // never affects gating.
@@ -227,7 +227,7 @@ impl ConnectionMemoryBudget {
         self.record_peak(prev.saturating_add(n));
     }
 
-    /// Raise the high-water mark to `used_now` if it's a new maximum.
+    /// Raise the recorded peak to `used_now` if it's a new maximum.
     fn record_peak(&self, used_now: usize) {
         self.peak_used.fetch_max(used_now, Ordering::Relaxed);
     }
@@ -246,8 +246,7 @@ impl ConnectionMemoryBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// High-water mark of [`used`](Self::used): the most held at once over this
-    /// budget's life. Only grows; never reset.
+    /// The largest [`used`](Self::used) ever reached. Only grows; never reset.
     pub(crate) fn peak(&self) -> usize {
         self.peak_used.load(Ordering::Relaxed)
     }
@@ -358,14 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn peak_holds_the_high_water_mark() {
+    fn peak_holds_the_largest_used() {
         let budget = ConnectionMemoryBudget::measured();
         let r1 = budget.try_reserve(1000).expect("ok");
         let r2 = budget.try_reserve(500).expect("ok");
         assert_eq!(budget.used(), 1500);
         assert_eq!(budget.peak(), 1500);
 
-        // `used` falls back to 0, but the peak stays at the high-water mark.
+        // `used` falls back to 0, but the peak stays at the largest value seen.
         drop((r1, r2));
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.peak(), 1500);
