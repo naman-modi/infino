@@ -117,6 +117,10 @@ pub(crate) struct ConnectionMemoryBudget {
     // Bytes reserved across all live reservations. Every access is `Relaxed`: this is a pure
     // accounting counter, it guards no other memory, so no  stronger ordering is needed.
     used: AtomicUsize,
+    // High-water mark of `used`: the most ever held at once. Observability only,
+    // never gates. Exact even under concurrency: each grow records its own atomic
+    // post-add value, and `fetch_max` can't lose a maximum.
+    peak_used: AtomicUsize,
     // Count of refused reservations (a count, not bytes); observability only,
     // never affects gating.
     denials: AtomicU64,
@@ -129,6 +133,7 @@ impl ConnectionMemoryBudget {
         Arc::new(Self {
             limit: None,
             used: AtomicUsize::new(0),
+            peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
         })
     }
@@ -153,6 +158,7 @@ impl ConnectionMemoryBudget {
         Arc::new(Self {
             limit: Some(limit),
             used: AtomicUsize::new(0),
+            peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
         })
     }
@@ -190,7 +196,8 @@ impl ConnectionMemoryBudget {
         match self.limit {
             // Unbounded
             None => {
-                self.used.fetch_add(n, Ordering::Relaxed);
+                let prev = self.used.fetch_add(n, Ordering::Relaxed);
+                self.record_peak(prev.saturating_add(n));
                 Ok(())
             }
 
@@ -199,7 +206,7 @@ impl ConnectionMemoryBudget {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                     used.checked_add(n).filter(|next| *next <= limit)
                 })
-                .map(|_| ())
+                .map(|prev| self.record_peak(prev.saturating_add(n)))
                 .map_err(|used| {
                     // Budget exceeded
                     self.denials.fetch_add(1, Ordering::Relaxed);
@@ -216,7 +223,13 @@ impl ConnectionMemoryBudget {
     /// Charge `n` bytes unconditionally, for a caller that has already committed
     /// the allocation and cannot fail — the query engine's infallible `grow`.
     pub(crate) fn grow_unchecked(&self, n: usize) {
-        self.used.fetch_add(n, Ordering::Relaxed);
+        let prev = self.used.fetch_add(n, Ordering::Relaxed);
+        self.record_peak(prev.saturating_add(n));
+    }
+
+    /// Raise the high-water mark to `used_now` if it's a new maximum.
+    fn record_peak(&self, used_now: usize) {
+        self.peak_used.fetch_max(used_now, Ordering::Relaxed);
     }
 
     /// Return `n` bytes to the budget.
@@ -231,6 +244,12 @@ impl ConnectionMemoryBudget {
     /// Bytes currently reserved.
     pub(crate) fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// High-water mark of [`used`](Self::used): the most held at once over this
+    /// budget's life. Only grows; never reset.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak_used.load(Ordering::Relaxed)
     }
 
     /// The enforced ceiling, or `None` when measured.
@@ -339,6 +358,25 @@ mod tests {
     }
 
     #[test]
+    fn peak_holds_the_high_water_mark() {
+        let budget = ConnectionMemoryBudget::measured();
+        let r1 = budget.try_reserve(1000).expect("ok");
+        let r2 = budget.try_reserve(500).expect("ok");
+        assert_eq!(budget.used(), 1500);
+        assert_eq!(budget.peak(), 1500);
+
+        // `used` falls back to 0, but the peak stays at the high-water mark.
+        drop((r1, r2));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.peak(), 1500);
+
+        // A smaller later reservation doesn't lower the peak.
+        let r3 = budget.try_reserve(200).expect("ok");
+        assert_eq!(budget.peak(), 1500);
+        drop(r3);
+    }
+
+    #[test]
     fn with_limit_bakes_in_the_headroom_gate() {
         // 1000 configured -> gate at 900 (9/10).
         let budget = ConnectionMemoryBudget::with_limit(1000);
@@ -361,6 +399,8 @@ mod tests {
         let budget = ConnectionMemoryBudget::with_limit(1000); // gate = 900
         let held = budget.try_reserve(900).expect("exactly at the gate fits");
         assert_eq!(budget.used(), 900);
+        // A bounded reservation records the peak too.
+        assert_eq!(budget.peak(), 900);
 
         let err = budget
             .try_reserve(1)
@@ -374,8 +414,9 @@ mod tests {
             }
         );
         assert_eq!(budget.denials(), 1);
-        // A denied reservation must not have changed the counter.
+        // A denied reservation must not have changed the counter or the peak.
         assert_eq!(budget.used(), 900);
+        assert_eq!(budget.peak(), 900);
 
         drop(held);
         assert_eq!(budget.used(), 0);
@@ -413,6 +454,7 @@ mod tests {
         let budget = ConnectionMemoryBudget::with_limit(1000); // gate = 900
         budget.grow_unchecked(5000); // well over the gate, but unconditional
         assert_eq!(budget.used(), 5000);
+        assert_eq!(budget.peak(), 5000); // grow_unchecked records the peak too
         assert_eq!(budget.denials(), 0); // not a refusal path
         budget.release(5000);
         assert_eq!(budget.used(), 0);
