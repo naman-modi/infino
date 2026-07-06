@@ -39,15 +39,16 @@ Think of three ideas:
         Application
             │  connect(uri) → Connection
             ▼
-        Connection  ── catalog of tables (name → supertable) ──┐
+        Connection  ── catalog of tables (name → supertable) ───┐
             │  create / open / list / drop · cross-table SQL    │
-            ▼                                                    │
-        Supertable  ── manifest (the file list) ──┐             │
-            │                                      │             │
+            ▼                                                   │
+        Supertable  ── manifest (the file list) ───┐            │
+            │                                      │            │
    stateless compute                       immutable files      │
-   + local cache (hot)                     (superfiles)          │
-            │                                      │             │
-            └──────────── byte-range reads ────────┴─────────────┘
+   + local cache (hot)                     (superfiles)         │
+            │                                      │            │
+            └──────────── byte-range reads ────────┴────────────┘
+                                 |
                                  ▼
                       Object storage (S3) — cheap, durable,
                               the source of truth
