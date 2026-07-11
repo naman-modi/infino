@@ -96,6 +96,7 @@ use super::{
 use crate::superfile::ReadError;
 use crate::{
     InfinoError,
+    memory::{ConnectionMemoryBudget, Reservation},
     storage::{StorageError, StorageProvider},
     superfile::{
         SuperfileReader,
@@ -122,6 +123,18 @@ use crate::{
         reader_cache::DiskCacheStore,
     },
 };
+
+// An approximate multiple for the memory the build will use, reserved up front rather than accounted for exactly.
+// Building the superfile here holds the FTS and vector blobs plus the serialized file in memory at once, so the
+// real peak is a few times the raw ingested bytes.
+//
+// Reserving "5 x ingested_raw_bytes" is a cheap estimate. It covers the measured scalar-only (~2-3x) and
+// FTS (~3-4x) cases, but vector-heavy builds reach ~5-8x (worse for small batches and across concurrent
+// shards), so 5x can still under-reserve those.
+//
+// A better way later is a dynamic factor, since it depends on the schema a lot:
+// memory for building vector blobs >> memory for the FTS blob >> memory for plain scalar columns
+const BUILD_SCRATCH_FACTOR: usize = 5;
 
 /// Single-writer append + commit handle.
 ///
@@ -974,6 +987,16 @@ impl SupertableWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
+
+        // Try reserving the transient heap from the ConnectionMemoryBudget before draining the buffer.
+        // For now, if memory reservation is refused, the buffer is left untouched, but this behaviour can be changed.
+        //
+        // Held until this function returns, i.e. past `publish_superfiles` below.
+        let _build_guard = reserve_build_scratch(
+            &self.inner.options.connection_memory_budget,
+            self.buffer_bytes,
+        )?;
+
         let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
@@ -1008,7 +1031,10 @@ impl SupertableWriter {
             superfiles = outputs.len(),
             "published appended superfiles"
         );
+
         publish_superfiles(&self.inner, outputs)?;
+
+        // Reserved memory (if any) via _build_guard is freed now.
         Ok(())
     }
 }
@@ -1066,6 +1092,19 @@ impl ShardOutput {
             scalar_stats,
         }
     }
+}
+
+/// Reserve the build's estimated heap (`raw_bytes` times [`BUILD_SCRATCH_FACTOR`]);
+/// returns `OverBudget` when a bounded budget can't fit it.
+fn reserve_build_scratch(
+    budget: &Arc<ConnectionMemoryBudget>,
+    raw_bytes: usize,
+) -> Result<Reservation, BuildError> {
+    budget
+        .try_reserve(raw_bytes.saturating_mul(BUILD_SCRATCH_FACTOR))
+        // Label the message "during ingest" so it can be told apart from a query
+        // or SQL over-budget error once it reaches the public InfinoError.
+        .map_err(|e| BuildError::OverBudget(format!("during ingest, {e}")))
 }
 
 /// Build one superfile from one slice of buffered batches. Runs on
@@ -2143,6 +2182,152 @@ mod tests {
         let titles =
             LargeStringArray::from((0..n).map(|i| format!("doc {i} alpha")).collect::<Vec<_>>());
         RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("build batch")
+    }
+
+    // ---- ingest memory budget ----------------------------------------
+
+    #[test]
+    fn append_over_budget_is_refused() {
+        // A 1-byte bounded budget floors the enforced gate to 0, so building
+        // any batch (which reserves buffer_bytes x factor > 0) is refused. The
+        // public folded append surfaces it as InfinoError::OverBudget.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let err = st
+            .append(&build_simple_batch(0, 8))
+            .expect_err("build over a 0-byte gate is refused");
+        let InfinoError::OverBudget(msg) = err else {
+            panic!("expected InfinoError::OverBudget, got {err:?}");
+        };
+        // The message names the ingest path, so a caller can tell it apart from
+        // a query or SQL over-budget error (which share the OverBudget variant).
+        assert!(
+            msg.contains("ingest"),
+            "over-budget message should identify ingest: {msg}"
+        );
+
+        // Nothing was published, and a refused reservation commits nothing.
+        assert_eq!(st.reader().n_docs_total(), 0);
+        assert!(st.options().connection_memory_budget.denials() >= 1);
+        assert_eq!(st.options().connection_memory_budget.peak(), 0);
+    }
+
+    #[test]
+    fn append_under_measured_budget_runs_and_tracks_peak() {
+        // Measured budget never refuses; the build still reserves, so peak > 0
+        // proves the reservation ran on the ingest path.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::measured();
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&build_simple_batch(0, 8))
+            .expect("measured budget never refuses");
+        assert_eq!(st.reader().n_docs_total(), 8);
+
+        let budget = &st.options().connection_memory_budget;
+        assert_eq!(budget.denials(), 0);
+        assert!(
+            budget.peak() > 0,
+            "the build must reserve against the budget"
+        );
+    }
+
+    #[test]
+    fn append_under_ample_bounded_budget_runs() {
+        // A bounded (enforcing) budget well above the build must admit the
+        // ingest, not refuse on principle.
+        const AMPLE_BUDGET_BYTES: u64 = 1 << 30; // 1 GiB, far above an 8-row batch.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(AMPLE_BUDGET_BYTES);
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&build_simple_batch(0, 8))
+            .expect("under-budget append runs under a bounded budget");
+        assert_eq!(st.reader().n_docs_total(), 8);
+
+        let budget = &st.options().connection_memory_budget;
+        assert_eq!(budget.denials(), 0);
+        assert!(budget.limit().is_some(), "bounded, not measured");
+    }
+
+    #[test]
+    fn over_budget_commit_preserves_the_buffer() {
+        // Reserving before draining the buffer means a refused commit leaves the
+        // buffered rows intact, so the caller can retry or back off.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 8)).expect("append buffers");
+        assert_eq!(w.buffered_batches(), 1);
+
+        let err = w
+            .commit()
+            .expect_err("commit over a 0-byte gate is refused");
+        assert!(
+            matches!(err, CommitError::AppendFlush(BuildError::OverBudget(_))),
+            "got {err:?}"
+        );
+        // The buffer was not drained.
+        assert_eq!(w.buffered_batches(), 1);
+    }
+
+    #[test]
+    fn auto_flush_over_budget_is_refused_from_append() {
+        // With a commit threshold set, `append` auto-flushes once the buffer
+        // crosses it, so the refusal surfaces out of `append` itself (the
+        // auto-flush exit) rather than an explicit `commit`. A batch large
+        // enough to exceed the 1 MiB threshold in one call trips it.
+        const AUTO_FLUSH_TRIP_ROWS: usize = 40_000;
+        let mut opts = options_id_title_serial().with_commit_threshold_size_mb(1);
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let mut w = st.writer().expect("writer");
+        let err = w
+            .append(&build_simple_batch(0, AUTO_FLUSH_TRIP_ROWS))
+            .expect_err("auto-flush over a 0-byte gate is refused");
+        assert!(matches!(err, BuildError::OverBudget(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn vector_ingest_over_budget_is_refused() {
+        // The gate covers the vector build path too: a vector-schema ingest over
+        // a 0-byte gate is refused as the public OverBudget, nothing published.
+        let dim = 16;
+        let mut opts = options_with_vector(dim);
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let err = st
+            .append(&build_vector_batch(0, 8, dim))
+            .expect_err("vector build over a 0-byte gate is refused");
+        assert!(matches!(err, InfinoError::OverBudget(_)), "got {err:?}");
+        assert_eq!(st.reader().n_docs_total(), 0);
+    }
+
+    #[test]
+    fn vector_ingest_reserves_and_runs_under_measured() {
+        // Measured never refuses; peak > 0 proves the vector build (kmeans +
+        // quantization + serialized blob) actually reserved against the budget.
+        let dim = 16;
+        let mut opts = options_with_vector(dim);
+        opts.connection_memory_budget = ConnectionMemoryBudget::measured();
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&build_vector_batch(0, 8, dim))
+            .expect("measured vector ingest runs");
+        assert_eq!(st.reader().n_docs_total(), 8);
+
+        let budget = &st.options().connection_memory_budget;
+        assert_eq!(budget.denials(), 0);
+        assert!(
+            budget.peak() > 0,
+            "the vector build must reserve against the budget"
+        );
     }
 
     // ---- writer slot exclusion ---------------------------------------

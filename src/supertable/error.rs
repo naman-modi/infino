@@ -100,6 +100,11 @@ pub enum BuildError {
     #[error("error from underlying superfile layer: {0}")]
     Superfile(#[from] SuperfileBuildError),
 
+    /// Ingest build refused: would cross the connection memory budget. The string
+    /// is already a full, labelled message, so `#[error("{0}")]` passes it through.
+    #[error("{0}")]
+    OverBudget(String),
+
     #[error(
         "another SupertableWriter is already outstanding for this Supertable; \
          drop it before acquiring a new one"
