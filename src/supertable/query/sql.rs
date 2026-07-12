@@ -313,6 +313,7 @@ mod tests {
 
     use crate::{
         memory::ConnectionMemoryBudget,
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -352,12 +353,26 @@ mod tests {
         .with_writer_pool(pool)
     }
 
-    // Bounded budget so the reader's SQL path gates DataFusion's heap.
-    // `with_limit(1)` is a 0-byte gate (90% of 1 floors to 0): refuse everything.
-    fn options_with_zero_gate() -> SupertableOptions {
-        let mut opts = options_id_cat_title();
-        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
-        opts
+    // Ingest `batch` on a measured supertable, then return a second handle over
+    // the same durable storage under a 0-byte gate. Ingest is gated by the
+    // budget too, so a query-gating test can't reuse one tiny-budget handle for
+    // both; this does the setup on a measured handle and hands back the gated
+    // reader. The returned `TempDir` guard must be held: dropping it deletes the
+    // store the reader is still reading through.
+    fn zero_gate_reader_after_ingest(batch: &RecordBatch) -> (tempfile::TempDir, Supertable) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+
+        let ingest = Supertable::create(options_id_cat_title().with_storage(Arc::clone(&storage)))
+            .expect("create");
+        let mut w = ingest.writer().expect("writer");
+        w.append(batch).expect("append");
+        w.commit().expect("commit");
+
+        let mut qopts = options_id_cat_title().with_storage(storage);
+        qopts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        (dir, Supertable::open(qopts).expect("open"))
     }
 
     /// Build a small categorical batch — start id sequence at
@@ -467,17 +482,11 @@ mod tests {
     fn query_sql_group_by_over_budget_is_refused() {
         // The reader path (second production ctx site) is gated too: a 0-byte
         // gate refuses the aggregate and surfaces as QueryError::OverBudget.
-        let st = Supertable::create(options_with_zero_gate()).expect("create");
-        let mut w = st.writer().expect("writer");
-
-        w.append(&build_cat_batch(
+        let (_dir, st) = zero_gate_reader_after_ingest(&build_cat_batch(
             0,
             &["rust", "python", "rust"],
             &["a", "b", "c"],
-        ))
-        .expect("append");
-
-        w.commit().expect("commit");
+        ));
 
         let err = st
             .reader()
@@ -491,13 +500,8 @@ mod tests {
     fn query_sql_streaming_scan_is_not_refused_under_a_zero_gate() {
         // A projection streams (no buffering), so it runs even at a 0-byte gate:
         // the budget bounds sort/aggregate/join, not scans.
-        let st = Supertable::create(options_with_zero_gate()).expect("create");
-        let mut w = st.writer().expect("writer");
-
-        w.append(&build_cat_batch(0, &["rust", "python"], &["a", "b"]))
-            .expect("append");
-
-        w.commit().expect("commit");
+        let (_dir, st) =
+            zero_gate_reader_after_ingest(&build_cat_batch(0, &["rust", "python"], &["a", "b"]));
 
         let rows: usize = st
             .reader()

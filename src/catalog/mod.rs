@@ -1487,6 +1487,23 @@ mod tests {
         titles.len()
     }
 
+    /// Ingest the fixture on a measured connection, then return a 0-byte-gate
+    /// connection over the same durable store plus the row count. Ingest is
+    /// gated by the budget too, so setup runs on a measured connection and only
+    /// the query connection carries the gate. Hold the `TempDir`: dropping it
+    /// deletes the store.
+    fn tiny_budget_conn_after_ingest() -> (tempfile::TempDir, Connection, usize) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let n = append_titles(&connect(&uri).expect("writer connect"));
+        let conn = connect_with(
+            &uri,
+            ConnectOptions::new().with_connection_memory_budget_bytes(1),
+        )
+        .expect("query connect");
+        (dir, conn, n)
+    }
+
     const HEAVY_GROUP_BY: &str = "SELECT title, COUNT(*) AS n FROM docs GROUP BY title";
 
     #[test]
@@ -1517,12 +1534,7 @@ mod tests {
     fn query_sql_over_a_tiny_budget_is_refused_as_over_budget() {
         // 0-byte gate: the aggregate can't reserve its first byte, and spilling
         // needs memory it doesn't have, so it's refused as OverBudget.
-        let conn = connect_with(
-            "memory://",
-            ConnectOptions::new().with_connection_memory_budget_bytes(1),
-        )
-        .expect("connect");
-        append_titles(&conn);
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
         let err = conn
             .query_sql(HEAVY_GROUP_BY)
             .expect_err("a 0-byte gate refuses the aggregate");
@@ -1536,12 +1548,7 @@ mod tests {
     fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
         // A projection streams (no buffering), so it reserves nothing and runs
         // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.
-        let conn = connect_with(
-            "memory://",
-            ConnectOptions::new().with_connection_memory_budget_bytes(1),
-        )
-        .expect("connect");
-        let n = append_titles(&conn);
+        let (_dir, conn, n) = tiny_budget_conn_after_ingest();
         let out = conn
             .query_sql("SELECT title FROM docs")
             .expect("a streaming scan is not gated");
