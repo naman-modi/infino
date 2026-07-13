@@ -143,7 +143,12 @@ impl From<SuperfileBuildError> for InfinoError {
 
 impl From<SupertableBuildError> for InfinoError {
     fn from(e: SupertableBuildError) -> Self {
-        InfinoError::Schema(e.to_string())
+        match e {
+            // A budget refusal during ingest keeps its own variant so it
+            // surfaces as the public over-budget error, not a schema error.
+            SupertableBuildError::OverBudget(msg) => InfinoError::OverBudget(msg),
+            other => InfinoError::Schema(other.to_string()),
+        }
     }
 }
 
@@ -175,7 +180,14 @@ impl From<MutationError> for InfinoError {
 
 impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
-        InfinoError::Backend(e.to_string())
+        match e {
+            // An ingest budget refusal fails the append-flush phase; preserve it
+            // as over-budget rather than flattening to a generic backend error.
+            MutationCommitError::AppendFlush(SupertableBuildError::OverBudget(msg)) => {
+                InfinoError::OverBudget(msg)
+            }
+            other => InfinoError::Backend(other.to_string()),
+        }
     }
 }
 
