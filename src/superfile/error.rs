@@ -151,6 +151,18 @@ pub enum ReadError {
     Columnar(String),
 }
 
+impl ReadError {
+    /// The over-budget message if this, or the vector error it wraps, is a
+    /// budget refusal, else `None`. Lets a `From` impl route to
+    /// `InfinoError::OverBudget` without matching the nested shape.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            ReadError::Vector(v) => v.over_budget(),
+            _ => None,
+        }
+    }
+}
+
 impl From<FtsError> for ReadError {
     fn from(e: FtsError) -> Self {
         ReadError::Fts(Box::new(e))
@@ -198,11 +210,22 @@ pub enum VectorError {
     #[error("lazy source error during vector search: {0}")]
     LazySource(String),
 
-    /// A cold cluster-block fetch would cross the connection memory budget;
-    /// the search is refused before the fetch. Surfaces as
-    /// `InfinoError::OverBudget`.
-    #[error("vector search exceeded the connection memory budget: {0}")]
+    /// A cold cluster-block fetch would cross the connection memory budget; the
+    /// search is refused before the fetch. The string is already labelled with
+    /// the operation ("vector search, ..."); it routes to
+    /// `InfinoError::OverBudget` via [`VectorError::over_budget`].
+    #[error("{0}")]
     OverBudget(String),
+}
+
+impl VectorError {
+    /// The over-budget message if this is a budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            VectorError::OverBudget(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

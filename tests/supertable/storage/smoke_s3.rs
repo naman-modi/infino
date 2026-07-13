@@ -992,6 +992,174 @@ async fn supertable_cold_vector_search_over_budget_via_s3_wire_protocol() {
     );
 }
 
+/// The same cold-fetch budget refusal, but the vector search is embedded in a
+/// SQL query (the `vector_search` table function) instead of the direct API.
+///
+/// The kNN runs in a custom execution node, so its `QueryError::OverBudget`
+/// has to cross the DataFusion error boundary and back. The node maps it to
+/// `DataFusionError::ResourcesExhausted` (the same channel the SQL memory pool
+/// uses for a spill refusal), so the SQL error classifier routes it to the
+/// public `InfinoError::OverBudget` rather than flattening it to a generic
+/// query error. A measured control runs the identical SQL to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_cold_vector_search_over_budget_via_sql_wire_protocol() {
+    if std::env::var("INFINO_TEST_S3").is_err() {
+        eprintln!(
+            "supertable_cold_vector_search_over_budget_via_sql_wire_protocol: skipped \
+             (set INFINO_TEST_S3=1 to enable)"
+        );
+        return;
+    }
+
+    let (addr, _fs_root_guard) = spawn_s3s_fs().await;
+    let endpoint = format!("http://{}", addr);
+    let dim = EMB_DIM;
+
+    // Producer: commit a vector batch through the S3 wire protocol.
+    let storage = budget_s3_provider(&endpoint);
+    {
+        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)))
+            .expect("create budget producer");
+        let mut w = producer.writer().expect("budget producer writer");
+        w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+            .expect("append large vector+FTS batch");
+        w.commit().expect("budget producer commit via S3");
+    }
+
+    // One-hot query at dim 0 as the SQL table-function's CSV argument.
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let q_csv = q
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT _id FROM vector_search('emb', '{q_csv}', {VECTOR_SEARCH_K})");
+
+    // Cold consumer under a bounded 1-byte budget: the kNN's cold cluster-block
+    // fetch is refused, and the refusal must survive the SQL boundary as
+    // `InfinoError::OverBudget`. `map_err(InfinoError::from)` is the same
+    // conversion the curated public surface applies.
+    let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
+    let result = consumer.reader().query_sql(&sql).map_err(InfinoError::from);
+    match result {
+        Err(InfinoError::OverBudget(msg)) => {
+            eprintln!("[s3-budget-sql] cold vector search in SQL refused as OverBudget: {msg}");
+        }
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(batches) => panic!(
+            "expected InfinoError::OverBudget under a {TINY_BUDGET_BYTES}-byte budget; \
+             cold vector search in SQL returned {} batch(es)",
+            batches.len()
+        ),
+    }
+    let bounded_budget = consumer.options().connection_budget();
+    assert!(
+        bounded_budget.denials() >= 1,
+        "bounded budget must record >=1 denial; got {}",
+        bounded_budget.denials()
+    );
+
+    // Control: the identical SQL over a measured (unbounded) budget runs to
+    // completion, so the deny above is the budget's doing, not a broken plan.
+    let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
+    let control_rows: usize = control
+        .reader()
+        .query_sql(&sql)
+        .expect("measured cold vector search in SQL should run to completion")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert!(
+        control_rows >= 1,
+        "measured cold vector search in SQL returned no rows over S3"
+    );
+    assert_eq!(
+        control.options().connection_budget().denials(),
+        0,
+        "measured budget must never deny"
+    );
+}
+
+/// Same cold-fetch budget refusal, but through the `hybrid_search` table
+/// function (BM25 + vector fused with RRF). Hybrid runs the vector kNN in its
+/// own execution node, distinct from `vector_search`, so it has its own error
+/// boundary. This pins that the vector arm's `OverBudget` survives that node
+/// too and isn't flattened to a generic query error. A measured control runs
+/// the identical SQL to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_cold_hybrid_search_over_budget_via_sql_wire_protocol() {
+    if std::env::var("INFINO_TEST_S3").is_err() {
+        eprintln!(
+            "supertable_cold_hybrid_search_over_budget_via_sql_wire_protocol: skipped \
+             (set INFINO_TEST_S3=1 to enable)"
+        );
+        return;
+    }
+
+    let (addr, _fs_root_guard) = spawn_s3s_fs().await;
+    let endpoint = format!("http://{}", addr);
+    let dim = EMB_DIM;
+
+    let storage = budget_s3_provider(&endpoint);
+    {
+        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)))
+            .expect("create budget producer");
+        let mut w = producer.writer().expect("budget producer writer");
+        w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+            .expect("append large vector+FTS batch");
+        w.commit().expect("budget producer commit via S3");
+    }
+
+    // 'budget' is in every title (see budget_vector_batch), so BM25 matches;
+    // the vector arm is what crosses the budget on its cold cluster fetch.
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let q_csv = q
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT _id FROM hybrid_search('title', 'budget', 'emb', '{q_csv}', {VECTOR_SEARCH_K})"
+    );
+
+    let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
+    match consumer.reader().query_sql(&sql).map_err(InfinoError::from) {
+        Err(InfinoError::OverBudget(msg)) => {
+            eprintln!("[s3-budget-sql] cold hybrid search refused as OverBudget: {msg}");
+        }
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(batches) => panic!(
+            "expected InfinoError::OverBudget under a {TINY_BUDGET_BYTES}-byte budget; \
+             cold hybrid search returned {} batch(es)",
+            batches.len()
+        ),
+    }
+    assert!(
+        consumer.options().connection_budget().denials() >= 1,
+        "bounded budget must record >=1 denial"
+    );
+
+    let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
+    let control_rows: usize = control
+        .reader()
+        .query_sql(&sql)
+        .expect("measured cold hybrid search should run to completion")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert!(
+        control_rows >= 1,
+        "measured cold hybrid search returned no rows over S3"
+    );
+    assert_eq!(
+        control.options().connection_budget().denials(),
+        0,
+        "measured budget must never deny"
+    );
+}
+
 /// The per-connection budget is shared across the multi-superfile fan-out, so
 /// several superfiles' cold fetches accumulate against one ceiling. A
 /// per-superfile budget would never add up, and this is what pins that.

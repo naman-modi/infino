@@ -165,6 +165,17 @@ pub enum MutationError {
     TombstonePhase(#[from] TombstonePhaseError),
 }
 
+impl MutationError {
+    /// The over-budget message if a budget-refused predicate eval caused this,
+    /// else `None`. The append phase isn't budget-gated, so it never carries one.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            MutationError::PredicateEval(q) => q.over_budget(),
+            _ => None,
+        }
+    }
+}
+
 /// Value returned from [`SupertableWriter::update`]. Carries the
 /// count of rows the predicate resolved to at call time so the
 /// caller can decide whether to proceed to `commit()`. Captured
@@ -240,4 +251,15 @@ pub enum CommitError {
         total: usize,
         cause: Box<MutationError>,
     },
+}
+
+impl CommitError {
+    /// The over-budget message if the append flush, or a buffered mutation's
+    /// predicate eval, was budget-refused, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            CommitError::AppendFlush(b) => b.over_budget(),
+            CommitError::PartialCommit { cause, .. } => cause.over_budget(),
+        }
+    }
 }

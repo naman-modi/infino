@@ -100,8 +100,9 @@ pub enum BuildError {
     #[error("error from underlying superfile layer: {0}")]
     Superfile(#[from] SuperfileBuildError),
 
-    /// Ingest build refused: would cross the connection memory budget. The string
-    /// is already a full, labelled message, so `#[error("{0}")]` passes it through.
+    /// Ingest build refused: would cross the connection memory budget. The
+    /// string is already labelled ("during ingest, ..."); routes to
+    /// `InfinoError::OverBudget` via [`BuildError::over_budget`].
     #[error("{0}")]
     OverBudget(String),
 
@@ -140,6 +141,16 @@ pub enum BuildError {
     /// back. Caller fixes config or schema.
     #[error("partition column missing in schema: {0}")]
     PartitionColumnMissing(String),
+}
+
+impl BuildError {
+    /// The over-budget message if this is a budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            BuildError::OverBudget(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 /// Errors raised by the supertable's commit path — building +
@@ -420,9 +431,22 @@ pub enum QueryError {
     #[error("DataFusion failed to execute the query: {0}")]
     Execute(String),
 
-    #[error("query exceeded the connection memory budget: {0}")]
+    /// A query crossed the connection memory budget. The string is already
+    /// labelled with the operation; routes to `InfinoError::OverBudget` via
+    /// [`QueryError::over_budget`].
+    #[error("{0}")]
     OverBudget(String),
 
     #[error("manifest load error: {0}")]
     ManifestLoad(ManifestLoadError),
+}
+
+impl QueryError {
+    /// The over-budget message if this is a budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            QueryError::OverBudget(m) => Some(m),
+            _ => None,
+        }
+    }
 }
