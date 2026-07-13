@@ -294,9 +294,13 @@ impl Supertable {
         tracing::instrument(skip_all, fields(rows = batch.num_rows()))
     )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
-        let mut w = self.writer()?;
-        w.append(batch)?;
-        w.commit()?;
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
+        w.append(batch)
+            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
+        w.commit()
+            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
         Ok(())
     }
 
@@ -330,9 +334,16 @@ impl Supertable {
         predicate: Expr,
         new_rows: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
-        let mut w = self.writer()?;
-        w.update(predicate, new_rows.clone())?;
-        single_outcome(w.commit()?)
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("update", None))?;
+        w.update(predicate, new_rows.clone())
+            .map_err(|e| InfinoError::from(e).with_context("update", None))?;
+        single_outcome(
+            w.commit()
+                .map_err(|e| InfinoError::from(e).with_context("update", None))?,
+        )
+        .map_err(|e| e.with_context("update", None))
     }
 
     /// Tombstone every row matching `predicate`, then commit. Durable
@@ -356,9 +367,16 @@ impl Supertable {
     /// ```
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
-        let mut w = self.writer()?;
-        w.delete(predicate)?;
-        single_outcome(w.commit()?)
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("delete", None))?;
+        w.delete(predicate)
+            .map_err(|e| InfinoError::from(e).with_context("delete", None))?;
+        single_outcome(
+            w.commit()
+                .map_err(|e| InfinoError::from(e).with_context("delete", None))?,
+        )
+        .map_err(|e| e.with_context("delete", None))
     }
 
     test_visible! {

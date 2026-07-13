@@ -210,7 +210,7 @@ impl Connection {
         schema: SchemaRef,
         indexes: IndexSpec,
     ) -> Result<Supertable, InfinoError> {
-        validate_name(name)?;
+        validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         let tokenizer = table_tokenizer(&indexes);
 
@@ -223,11 +223,14 @@ impl Connection {
                     tokenizer,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
-                )?;
-                let handle = Supertable::create(opts)?;
+                )
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
+                let handle = Supertable::create(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
-                    return Err(InfinoError::AlreadyExists(name.to_string()));
+                    return Err(InfinoError::AlreadyExists(name.to_string())
+                        .with_context("create_table", Some(name)));
                 }
                 map.insert(name.to_string(), handle.clone());
                 info!(table = name, backend = "memory", "created table");
@@ -261,20 +264,23 @@ impl Connection {
                 let location = unique_location(name);
                 let entry = TableEntry {
                     location: location.clone(),
-                    schema_ipc: schema_to_ipc(&schema)?,
+                    schema_ipc: schema_to_ipc(&schema)
+                        .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns().to_vec(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
 
                 let table_storage =
-                    backend_to_provider(&self.inner.backend.join(&location), &self.inner.options)?
+                    backend_to_provider(&self.inner.backend.join(&location), &self.inner.options)
+                        .map_err(|e| e.with_context("create_table", Some(name)))?
                         .expect("non-memory backend yields a storage provider");
                 // Disk cache is keyed on the stable name (not the unique
                 // location) so the producer and a later reopener share one
                 // cache directory; superfile keys carry the location, so a
                 // re-created table never reads a dropped generation's bytes.
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
+                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
+                    .map_err(|e| e.with_context("create_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -282,7 +288,8 @@ impl Connection {
                     tokenizer,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
-                )?;
+                )
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -295,7 +302,8 @@ impl Connection {
                 // register the name. A losing racer that also created a
                 // (distinct) location just orphans its empty subtree; the
                 // catalog OCC below decides the single name winner.
-                let handle = Supertable::create(opts)?;
+                let handle = Supertable::create(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
 
                 // Gate the commit + memo insert: else a racing `open_table`
                 // sees the commit, misses the memo, and builds a rival store.
@@ -309,7 +317,8 @@ impl Connection {
                     }
                     body.tables.insert(name_owned.clone(), entry.clone());
                     Ok(())
-                }))?;
+                }))
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
 
                 // Seed the memo: `query_sql` reads back through this same
                 // handle, so in-process writes are visible at once.
@@ -343,7 +352,9 @@ impl Connection {
                 .expect("catalog mutex poisoned")
                 .get(name)
                 .cloned()
-                .ok_or_else(|| InfinoError::NotFound(name.to_string())),
+                .ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
+                }),
 
             CatalogStore::Storage {
                 root,
@@ -366,13 +377,14 @@ impl Connection {
                     return Ok(handle.clone());
                 }
 
-                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
-                let entry = body
-                    .tables
-                    .get(name)
-                    .ok_or_else(|| InfinoError::NotFound(name.to_string()))?;
+                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let entry = body.tables.get(name).ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
+                })?;
 
-                let schema = schema_from_ipc(&entry.schema_ipc)?;
+                let schema = schema_from_ipc(&entry.schema_ipc)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
                 // Rebuild the index spec from the recorded declarations and
                 // lower it through the *same* path `create_table` used, so
                 // the defaults it applies (rotation seed, rerank codec) are
@@ -386,7 +398,8 @@ impl Connection {
                         v.column.clone(),
                         v.dim,
                         v.n_cent,
-                        metric_from_str(&v.metric)?,
+                        metric_from_str(&v.metric)
+                            .map_err(|e| e.with_context("open_table", Some(name)))?,
                     );
                 }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
@@ -395,12 +408,14 @@ impl Connection {
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
                     &self.inner.options,
-                )?
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
 
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
+                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -408,16 +423,17 @@ impl Connection {
                     tokenizer,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
-                )?;
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
-
                 // Strong: re-check the manifest pointer per query (cheap,
                 // short-circuits when unchanged), matching the old rebuild's
                 // freshness without its cost.
                 opts = opts.with_read_consistency(Consistency::Strong);
-                let handle = Supertable::open(opts)?;
+                let handle = Supertable::open(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
                 handles.insert(name.to_string(), handle.clone());
 
                 Ok(handle)
@@ -456,7 +472,9 @@ impl Connection {
                 .expect("catalog mutex poisoned")
                 .remove(name)
                 .map(|_| ())
-                .ok_or_else(|| InfinoError::NotFound(name.to_string())),
+                .ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("drop_table", Some(name))
+                }),
             CatalogStore::Storage {
                 root,
                 handles,
@@ -484,7 +502,8 @@ impl Connection {
                         }
                         None => Err(InfinoError::NotFound(name.to_string())),
                     }
-                }))?;
+                }))
+                .map_err(|e| e.with_context("drop_table", Some(name)))?;
                 if purge {
                     let location =
                         location.expect("catalog commit succeeded => an entry was removed");
@@ -497,7 +516,8 @@ impl Connection {
                         let objects = root.list_with_prefix(&location).await?;
                         try_join_all(objects.iter().map(|uri| root.delete(uri))).await?;
                         Ok::<(), StorageError>(())
-                    })?;
+                    })
+                    .map_err(|e| InfinoError::from(e).with_context("drop_table", Some(name)))?;
                 }
                 Ok(())
             }
@@ -560,7 +580,7 @@ impl Connection {
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate.
         let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
@@ -568,11 +588,11 @@ impl Connection {
         let statement = ctx
             .state()
             .sql_to_statement(sql, &Dialect::Generic)
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
         let refs = ctx
             .state()
             .resolve_table_references(&statement)
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
         let mut handles: Vec<Supertable> = Vec::new();
@@ -583,13 +603,13 @@ impl Connection {
             }
             match self.open_table(&name) {
                 Ok(table) => {
-                    table
-                        .register_into(&ctx, &name)
-                        .map_err(|e| InfinoError::Query(e.to_string()))?;
+                    table.register_into(&ctx, &name).map_err(|e| {
+                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                    })?;
                     handles.push(table);
                 }
                 Err(InfinoError::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.with_context("query_sql", None)),
             }
         }
 
@@ -603,7 +623,7 @@ impl Connection {
             let df = ctx
                 .sql(&sql)
                 .await
-                .map_err(|e| InfinoError::Query(e.to_string()))?;
+                .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
             // A RecordBatch carries the schema; an empty Vec does not. Capture
             // the output schema before collect() consumes the DataFrame so a
@@ -611,7 +631,10 @@ impl Connection {
             // schema, rather than a schema-less Vec — which the Python binding's
             // Table.from_batches([]) can't build from.
             let output_schema: SchemaRef = df.schema().inner().clone();
-            let batches = df.collect().await.map_err(sql_exec_error)?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
             if batches.is_empty() {
                 Ok(vec![RecordBatch::new_empty(output_schema)])
             } else {
@@ -623,8 +646,11 @@ impl Connection {
         // be multi-thread: a table-free query can be a search TVF, which
         // fans out object-store reads under the hood.
         match handles.first() {
-            Some(table) => table.block_on_query(drive),
-            None => bridge_on_runtime(drive, &self.query_runtime()),
+            Some(table) => table
+                .block_on_query(drive)
+                .map_err(|e: InfinoError| e.with_context("query_sql", None)),
+            None => bridge_on_runtime(drive, &self.query_runtime())
+                .map_err(|e: InfinoError| e.with_context("query_sql", None)),
         }
     }
 
@@ -2074,5 +2100,59 @@ mod tests {
             1,
             "expected the persisted doc to be searchable"
         );
+    }
+
+    /// Finding #3: public API boundaries prefix operation (+ table when
+    /// known) into the InfinoError message so Display carries context.
+    #[test]
+    fn public_api_errors_carry_operation_and_table_context() {
+        use datafusion::prelude::{col, lit};
+
+        // --- Catalog methods know the table name ---
+        let conn = connect("memory://").expect("connect");
+        let err = conn.open_table("posts").expect_err("missing table");
+        assert!(matches!(err, InfinoError::NotFound(_)));
+        assert!(err.to_string().contains("open_table(posts):"), "got: {err}");
+
+        conn.create_table("posts", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create posts");
+        let err = conn
+            .create_table("posts", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect_err("duplicate create");
+        assert!(matches!(err, InfinoError::AlreadyExists(_)));
+        assert!(
+            err.to_string().contains("create_table(posts):"),
+            "got: {err}"
+        );
+
+        // --- Supertable methods: operation only (no catalog name on handle) ---
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path");
+        let conn = connect(uri).expect("connect");
+        conn.create_table("posts", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create posts");
+        let posts = conn.open_table("posts").expect("open");
+        posts
+            .append(&build_title_batch(&["hello world"]))
+            .expect("append one row");
+
+        let err = posts
+            .update(
+                col("title").eq(lit("hello world")),
+                &build_title_batch(&["a", "b"]),
+            )
+            .expect_err("cardinality mismatch");
+        assert!(matches!(err, InfinoError::Cardinality(_)));
+        assert!(err.to_string().contains("update:"), "got: {err}");
+
+        let err = posts
+            .bm25_search("title", "-onlyneg", TOP_K, BoolMode::Or, None)
+            .expect_err("negation-only query");
+        assert!(matches!(err, InfinoError::Query(_)));
+        assert!(err.to_string().contains("bm25_search:"), "got: {err}");
+
+        let err = conn.query_sql("NOT VALID SQL @@@").expect_err("bad sql");
+        assert!(matches!(err, InfinoError::Query(_)));
+        assert!(err.to_string().contains("query_sql:"), "got: {err}");
     }
 }

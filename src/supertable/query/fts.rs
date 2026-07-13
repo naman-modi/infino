@@ -1003,6 +1003,7 @@ impl Supertable {
         self.reader()
             .bm25_search(column, query, k, mode, projection)
             .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("bm25_search", None))
     }
 
     /// Unranked token match over one FTS column: every row whose
@@ -1026,7 +1027,7 @@ impl Supertable {
         let reader = self.reader();
         let hits = reader
             .token_match(column, query, mode)
-            .map_err(InfinoError::from)?;
+            .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -1034,7 +1035,7 @@ impl Supertable {
                 projection,
                 "token_match",
             ))
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("token_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1057,7 +1058,7 @@ impl Supertable {
         let reader = self.reader();
         let hits = reader
             .exact_match(column, value)
-            .map_err(InfinoError::from)?;
+            .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -1065,7 +1066,7 @@ impl Supertable {
                 projection,
                 "exact_match",
             ))
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("exact_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1096,6 +1097,7 @@ impl Supertable {
         self.reader()
             .count(column, query, mode)
             .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("count", None))
     }
 }
 
