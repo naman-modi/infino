@@ -124,17 +124,26 @@ use crate::{
     },
 };
 
-// An approximate multiple for the memory the build will use, reserved up front rather than accounted for exactly.
-// Building the superfile here holds the FTS and vector blobs plus the serialized file in memory at once, so the
-// real peak is a few times the raw ingested bytes.
+// Approximate multiples for the memory the build will use, reserved up front rather than
+// accounted for exactly. Building the superfile holds the FTS and vector blobs plus the
+// serialized file in memory at once, so the real peak is a few times the raw ingested bytes.
 //
-// Reserving "5 x ingested_raw_bytes" is a cheap estimate. It covers the measured scalar-only (~2-3x) and
-// FTS (~3-4x) cases, but vector-heavy builds reach ~5-8x (worse for small batches and across concurrent
-// shards), so 5x can still under-reserve those.
+// Each kind of blob has a separate factor, so the estimate tracks the schema & ingestion data
+// closely: memory for building vector blobs >> memory for the FTS blob >> memory for plain
+// scalar columns.
 //
-// A better way later is a dynamic factor, since it depends on the schema a lot:
-// memory for building vector blobs >> memory for the FTS blob >> memory for plain scalar columns
-const BUILD_SCRATCH_FACTOR: usize = 5;
+// Stored as numerator over DENOM so the estimate stays integer-only (halves).
+const BUILD_SCRATCH_DENOM: usize = 2;
+
+// Scalar columns, held then serialized into the Parquet body: ~2.5x.
+const BUILD_SCALAR_NUM: usize = 5;
+
+// f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
+const BUILD_VECTOR_NUM: usize = 13;
+
+// FTS text, ~1.5x for the FST + postings structures. Added on top of the scalar factor, not
+// instead of it: the same text bytes are held as a column and drive the index build at once.
+const BUILD_FTS_NUM: usize = 3;
 
 /// Single-writer append + commit handle.
 ///
@@ -148,9 +157,16 @@ pub struct SupertableWriter {
     /// SuperfileBuilder) owns the buffer so commit() can rayon-
     /// shard it across workers, each running its own builder.
     buffer: Vec<BufferedBatch>,
-    /// Estimated byte cost of `buffer` so append() can auto-flush
-    /// when the buffer crosses the configured threshold.
-    buffer_bytes: usize,
+    /// Held Arrow scalar bytes across `buffer` (id + user columns,
+    /// including the FTS text columns).
+    buffer_scalar_bytes: usize,
+    /// Held f32 vector payload bytes across `buffer`.
+    buffer_vector_bytes: usize,
+    /// Byte size of the FTS-indexed text columns within `buffer`. A
+    /// subset of `buffer_scalar_bytes`, not extra held memory; tracked
+    /// only to weight the build-scratch reserve, since the FTS index
+    /// structures built at commit scale with the text input.
+    buffer_fts_bytes: usize,
     /// Pending update entries, in buffer order. Each is
     /// fully-resolved at `update()` call time (predicate
     /// captured, `_id` range minted, IPC sidecar bytes encoded);
@@ -188,7 +204,7 @@ impl fmt::Debug for SupertableWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupertableWriter")
             .field("buffered_batches", &self.buffer.len())
-            .field("buffered_bytes", &self.buffer_bytes)
+            .field("buffered_bytes", &self.buffered_bytes())
             .field("manifest_id", &self.inner.manifest.load().manifest_id)
             .finish()
     }
@@ -393,7 +409,9 @@ impl Supertable {
             Ok(_) => Ok(SupertableWriter {
                 inner: Arc::clone(self.inner()),
                 buffer: Vec::new(),
-                buffer_bytes: 0,
+                buffer_scalar_bytes: 0,
+                buffer_vector_bytes: 0,
+                buffer_fts_bytes: 0,
                 pending_updates: Vec::new(),
                 pending_deletes: Vec::new(),
             }),
@@ -410,9 +428,12 @@ impl SupertableWriter {
         self.buffer.len()
     }
 
-    /// Estimated bytes of buffered (un-committed) data.
+    /// Bytes of buffered (un-committed) data actually held in memory:
+    /// the scalar columns plus the f32 vector payload. This is the
+    /// figure the auto-flush threshold is compared against (the FTS
+    /// weighting only affects the build-scratch reserve, not held size).
     pub fn buffered_bytes(&self) -> usize {
-        self.buffer_bytes
+        self.buffer_scalar_bytes + self.buffer_vector_bytes
     }
 
     /// Add one batch to the in-memory buffer. Triggers an
@@ -436,29 +457,30 @@ impl SupertableWriter {
         // Validate + split. Batch schema is user_schema (no id col).
         let (scalar_no_id, _vector_slices) = split_vectors(batch, options)?;
 
-        // Re-derive owned Arc<Float32Array> handles for each
-        // vector column. We can't keep the &[f32] slices from
-        // split_vectors in the buffer (their lifetime is tied to
-        // `batch`, which the caller reclaims after this returns).
-        // The Arc<Float32Array> shares the same underlying buffer
-        // — no bytes copied.
+        // Re-derive owned Arc<Float32Array> handles for each vector column. We can't keep the &[f32] slices from
+        // split_vectors in the buffer (their lifetime is tied to `batch`, which the caller reclaims after this returns).
+        // The Arc<Float32Array> shares the same underlying buffer — no bytes copied.
         let mut vectors = Vec::with_capacity(options.vector_columns.len());
         for vc in &options.vector_columns {
             let col_idx = batch
                 .schema()
                 .index_of(&vc.column)
                 .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
             let fsl = batch
                 .column(col_idx)
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or(BuildError::BatchSchemaMismatch)?;
+
             let values = fsl.values();
+
             let f32_arr = values
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or(BuildError::BatchSchemaMismatch)?
                 .clone();
+
             vectors.push(Arc::new(f32_arr));
         }
 
@@ -478,6 +500,7 @@ impl SupertableWriter {
                 ids.push(generator.next_id());
             }
         }
+
         let id_array = Decimal128Array::from(ids)
             .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
             .expect(
@@ -490,24 +513,33 @@ impl SupertableWriter {
         let scalar = RecordBatch::try_new(options.scalar_schema(), columns)
             .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
-        // Estimate byte cost: Arrow scalar columns + f32 vector
-        // payload. RecordBatch::get_array_memory_size accounts
-        // for buffer allocations (rough but good enough for
-        // threshold gating).
-        let bytes = scalar.get_array_memory_size()
-            + vectors
-                .iter()
-                .map(|v| v.len() * mem::size_of::<f32>())
-                .sum::<usize>();
+        // Estimate byte cost per input class. get_array_memory_size accounts for
+        // Arrow buffer allocations (rough but good enough); the vector payload is
+        // its exact f32 size. The FTS text columns are a subset of the scalar
+        // columns, summed separately only to weight the build-scratch reserve.
+        let scalar_bytes = scalar.get_array_memory_size();
+        let vector_bytes = vectors
+            .iter()
+            .map(|v| v.len() * mem::size_of::<f32>())
+            .sum::<usize>();
+        let fts_bytes = options
+            .fts_columns
+            .iter()
+            .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
+            .map(|idx| scalar.column(idx).get_array_memory_size())
+            .sum::<usize>();
 
         self.buffer.push(BufferedBatch { scalar, vectors });
-        self.buffer_bytes += bytes;
+        self.buffer_scalar_bytes += scalar_bytes;
+        self.buffer_vector_bytes += vector_bytes;
+        self.buffer_fts_bytes += fts_bytes;
 
-        // Auto-flush if over threshold.
+        // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
+        // reserve-time concern, not held memory.
         let threshold = (options.commit_threshold_size_mb as usize)
             .saturating_mul(1024)
             .saturating_mul(1024);
-        if threshold > 0 && self.buffer_bytes >= threshold {
+        if threshold > 0 && self.buffered_bytes() >= threshold {
             self.commit_appends_internal()?;
         }
 
@@ -994,11 +1026,15 @@ impl SupertableWriter {
         // Held until this function returns, i.e. past `publish_superfiles` below.
         let _build_guard = reserve_build_scratch(
             &self.inner.options.connection_memory_budget,
-            self.buffer_bytes,
+            self.buffer_scalar_bytes,
+            self.buffer_vector_bytes,
+            self.buffer_fts_bytes,
         )?;
 
         let buffer = mem::take(&mut self.buffer);
-        self.buffer_bytes = 0;
+        self.buffer_scalar_bytes = 0;
+        self.buffer_vector_bytes = 0;
+        self.buffer_fts_bytes = 0;
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
@@ -1094,14 +1130,31 @@ impl ShardOutput {
     }
 }
 
-/// Reserve the build's estimated heap (`raw_bytes` times [`BUILD_SCRATCH_FACTOR`]);
+/// Reserve the build's estimated transient heap:
+///
+/// estimate = (2.5*scalar_raw_bytes + 6.5*vector_raw_bytes + 1.5*fts_text_raw_bytes)
+///
 /// returns `OverBudget` when a bounded budget can't fit it.
 fn reserve_build_scratch(
     budget: &Arc<ConnectionMemoryBudget>,
-    raw_bytes: usize,
+    scalar_bytes: usize,
+    vector_bytes: usize,
+    fts_bytes: usize,
 ) -> Result<Reservation, BuildError> {
+    //  The constants are kept integer rather than float, so the estimate is calculated as such:
+    //
+    //     (BUILD_SCALAR_NUM * scalar_bytes) + (BUILD_VECTOR_NUM * vector_bytes) + (BUILD_FTS_NUM * fts_bytes)
+    //   ------------------------------------------------------------------------------------------------------
+    //                                            BUILD_SCRATCH_DENOM
+    //
+    let estimate = scalar_bytes
+        .saturating_mul(BUILD_SCALAR_NUM)
+        .saturating_add(vector_bytes.saturating_mul(BUILD_VECTOR_NUM))
+        .saturating_add(fts_bytes.saturating_mul(BUILD_FTS_NUM))
+        / BUILD_SCRATCH_DENOM;
+
     budget
-        .try_reserve(raw_bytes.saturating_mul(BUILD_SCRATCH_FACTOR))
+        .try_reserve(estimate)
         // Label the message "during ingest" so it can be told apart from a query
         // or SQL over-budget error once it reaches the public InfinoError.
         .map_err(|e| BuildError::OverBudget(format!("during ingest, {e}")))
@@ -2180,9 +2233,48 @@ mod tests {
     // ---- ingest memory budget ----------------------------------------
 
     #[test]
+    fn reserve_build_scratch_weights_each_input_class() {
+        // Pins the per-class estimate against the constants: a measured budget
+        // never denies, so `used()` is exactly the reserved amount. The point of
+        // the split (vs one blanket factor) is that a byte of vector payload
+        // reserves more than a byte of scalar, and the FTS term is additive on
+        // top of the scalar hold, not a replacement.
+        let budget = ConnectionMemoryBudget::measured();
+        let (scalar, vector, fts) = (1000usize, 2000usize, 400usize);
+
+        let guard = reserve_build_scratch(&budget, scalar, vector, fts)
+            .expect("measured budget never denies");
+        let expected =
+            (BUILD_SCALAR_NUM * scalar + BUILD_VECTOR_NUM * vector + BUILD_FTS_NUM * fts)
+                / BUILD_SCRATCH_DENOM;
+        assert_eq!(budget.used(), expected);
+        drop(guard);
+        assert_eq!(budget.used(), 0, "reservation released on drop");
+
+        // Same byte count, different class: vector costs strictly more than
+        // scalar, and adding FTS text raises the reserve further. Read `used()`
+        // while the guard is alive, then release it before the next call.
+        let reserved = |s, v, f| {
+            let _guard = reserve_build_scratch(&budget, s, v, f).expect("measured");
+            budget.used()
+        };
+        let scalar_only = reserved(1000, 0, 0);
+        let vector_only = reserved(0, 1000, 0);
+        let scalar_plus_fts = reserved(1000, 0, 1000);
+        assert!(
+            vector_only > scalar_only,
+            "a vector byte must reserve more than a scalar byte ({vector_only} vs {scalar_only})"
+        );
+        assert!(
+            scalar_plus_fts > scalar_only,
+            "the FTS term is additive on top of scalar ({scalar_plus_fts} vs {scalar_only})"
+        );
+    }
+
+    #[test]
     fn append_over_budget_is_refused() {
         // A 1-byte bounded budget floors the enforced gate to 0, so building
-        // any batch (which reserves buffer_bytes x factor > 0) is refused. The
+        // any non-empty batch (whose weighted reserve is > 0) is refused. The
         // public folded append surfaces it as InfinoError::OverBudget.
         let mut opts = options_id_title_serial();
         opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
