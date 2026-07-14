@@ -11,8 +11,9 @@ use std::{collections::HashMap, path::PathBuf};
 use crate::supertable::reader_cache::ColdFetchMode as InternalColdFetchMode;
 
 /// How a disk-cache miss is serviced when reading cold superfiles from
-/// object storage. Only meaningful when a disk cache is configured
-/// ([`ConnectOptions::with_cache_dir`]).
+/// object storage. The cache-servicing modes need a cache
+/// ([`ConnectOptions::with_cache_dir`]); `RangeOnly` is the cacheless
+/// path and does not currently use a disk cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColdFetchMode {
     /// Parallel range-GETs that tee into both the live query and the
@@ -97,6 +98,7 @@ impl ConnectOptions {
 
     /// Choose how cold misses are serviced (see [`ColdFetchMode`]). Only
     /// meaningful with [`with_cache_dir`](Self::with_cache_dir).
+    /// `RangeOnly` is the cacheless path and is rejected if a `cache_dir` is set.
     pub fn with_cold_fetch_mode(mut self, mode: ColdFetchMode) -> Self {
         self.cold_fetch_mode = mode;
         self

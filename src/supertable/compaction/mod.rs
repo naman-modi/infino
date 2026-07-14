@@ -32,11 +32,11 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::builder::SuperfileBuilder,
     supertable::{
-        BuildError, CommitError, SuperfileEntry,
+        BuildError, CommitError, ManifestSnapshot, SuperfileEntry,
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
-            Etag, SealRecord, WalStore,
+            Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
@@ -362,6 +362,9 @@ impl Supertable {
             })
             .collect::<Result<_, _>>()?;
 
+        let opts = Arc::clone(&inner.options);
+        let max_retries = opts.max_commit_retries.max(1);
+
         // Seal every input sidecar so no writer can land a tombstone
         // on a file that's about to disappear, and so another
         // compactor doesn't pick up the same inputs. If we die
@@ -372,47 +375,27 @@ impl Supertable {
         let sealed_at = Utc::now();
         let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
         for entry in &inputs {
-            loop {
-                match tombstones_admin::seal(
-                    &wal_store,
-                    entry.superfile_id,
-                    compaction_id,
-                    sealed_at,
-                    stale_seal_timeout,
-                )
-                .await
-                {
-                    Ok((sidecar, etag)) => {
-                        sealed.push(SealedInput {
-                            superfile_id: entry.superfile_id,
-                            bitmap: sidecar.bitmap,
-                            etag,
-                        });
-                        break;
-                    }
-                    Err(TombstonesAdminError::CasLost { .. }) => {
-                        // A writer landed a tombstone bit between our
-                        // GET and our PUT. Re-read and retry — the
-                        // seal will succeed on the next attempt unless
-                        // another compactor raced us.
-                        continue;
-                    }
-                    Err(TombstonesAdminError::AlreadySealed {
-                        superfile_id,
-                        existing_compaction_id,
-                    }) => {
-                        unseal_all(&wal_store, sealed).await;
-                        return Err(CompactionError::SidecarConflict {
-                            superfile_id,
-                            existing_compaction_id,
-                        });
-                    }
-                    Err(TombstonesAdminError::WalStore(e)) => {
-                        unseal_all(&wal_store, sealed).await;
-                        return Err(CompactionError::Seal(e.to_string()));
-                    }
+            let (sidecar, etag) = match seal_with_bounded_retry(
+                &wal_store,
+                entry.superfile_id,
+                compaction_id,
+                sealed_at,
+                stale_seal_timeout,
+                max_retries,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    unseal_all(&wal_store, sealed).await;
+                    return Err(e);
                 }
-            }
+            };
+            sealed.push(SealedInput {
+                superfile_id: entry.superfile_id,
+                bitmap: sidecar.bitmap,
+                etag,
+            });
         }
 
         let merged_segment = match self.merge_superfiles(&inputs).await {
@@ -434,28 +417,14 @@ impl Supertable {
         let mut pending_storage_writes =
             vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?];
 
-        let opts = Arc::clone(&inner.options);
-        let max_retries = opts.max_commit_retries.max(1);
-
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
 
-            let entries_to_remove: Vec<Arc<SuperfileEntry>> = job
-                .inputs
-                .iter()
-                .filter_map(|id| {
-                    current
-                        .get_all_superfiles()
-                        .iter()
-                        .find(|e| e.superfile_id == *id)
-                        .cloned()
-                })
-                .collect();
-
             // Another compactor already merged our inputs — nothing left to commit.
-            if entries_to_remove.len() != job.inputs.len() {
-                return Ok(());
-            }
+            let entries_to_remove = match resolve_entries_to_remove(&current, &job.inputs) {
+                Ok(entries) => entries,
+                Err(_missing) => return Ok(()),
+            };
 
             match try_commit_attempt(
                 storage.clone(),
@@ -504,6 +473,15 @@ impl Supertable {
                         unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
                     }
+                    // Input vanished mid-retry (someone else merged it away).
+                    // Our built output no longer matches reality, so abort
+                    // instead of retrying the commit.
+                    if let Err(missing) =
+                        resolve_entries_to_remove(&inner.manifest.load_full(), &job.inputs)
+                    {
+                        unseal_all(&wal_store, sealed).await;
+                        return Err(CompactionError::SuperfileNotFound(missing));
+                    }
                     time::sleep(backoff_delay(attempt)).await;
                 }
                 Err(e) => {
@@ -546,6 +524,70 @@ async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
             warn!(superfile_id = %superfile_id, error = %e, "compact: failed to unseal after aborting");
         }
     }
+}
+
+/// Look up `job_inputs` in `current`, in order. `Err` carries the first
+/// missing id (removed by another compactor).
+fn resolve_entries_to_remove(
+    current: &ManifestSnapshot,
+    job_inputs: &[Uuid],
+) -> Result<Vec<Arc<SuperfileEntry>>, Uuid> {
+    job_inputs
+        .iter()
+        .map(|id| {
+            current
+                .get_all_superfiles()
+                .iter()
+                .find(|e| e.superfile_id == *id)
+                .cloned()
+                .ok_or(*id)
+        })
+        .collect()
+}
+
+/// Seal one input, retrying a CAS race with a writer up to `max_retries`
+/// times with backoff. `CasLost` just means a writer landed a tombstone
+/// bit between our read and write — not an abandoned compaction.
+async fn seal_with_bounded_retry(
+    wal_store: &WalStore,
+    superfile_id: Uuid,
+    compaction_id: Uuid,
+    sealed_at: chrono::DateTime<Utc>,
+    stale_seal_timeout: std::time::Duration,
+    max_retries: u32,
+) -> Result<(TombstonesSidecar, Etag), CompactionError> {
+    for attempt in 0..max_retries {
+        match tombstones_admin::seal(
+            wal_store,
+            superfile_id,
+            compaction_id,
+            sealed_at,
+            stale_seal_timeout,
+        )
+        .await
+        {
+            Ok(sealed) => return Ok(sealed),
+            Err(TombstonesAdminError::CasLost { .. }) if attempt + 1 < max_retries => {
+                time::sleep(backoff_delay(attempt)).await;
+            }
+            Err(TombstonesAdminError::CasLost { .. }) => {
+                return Err(CompactionError::Seal("seal retries exhausted".to_string()));
+            }
+            Err(TombstonesAdminError::AlreadySealed {
+                superfile_id,
+                existing_compaction_id,
+            }) => {
+                return Err(CompactionError::SidecarConflict {
+                    superfile_id,
+                    existing_compaction_id,
+                });
+            }
+            Err(TombstonesAdminError::WalStore(e)) => {
+                return Err(CompactionError::Seal(e.to_string()));
+            }
+        }
+    }
+    Err(CompactionError::Seal("seal retries exhausted".to_string()))
 }
 
 #[cfg(test)]
@@ -747,6 +789,38 @@ mod tests {
             matches!(err, CompactionError::SuperfileNotFound(id) if id == bogus),
             "{err:?}"
         );
+    }
+
+    /// Resolves every present input in order; reports the missing one by id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_entries_to_remove_reports_the_missing_input() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+
+        let manifest = st.inner().manifest.load_full();
+        let ids: Vec<Uuid> = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+
+        // All present.
+        let resolved = resolve_entries_to_remove(&manifest, &ids).expect("both inputs are present");
+        assert_eq!(
+            resolved.iter().map(|e| e.superfile_id).collect::<Vec<_>>(),
+            ids
+        );
+
+        // One missing.
+        let vanished = Uuid::from_u128(0xDEAD_BEEF);
+        let mut job_inputs = ids.clone();
+        job_inputs.push(vanished);
+        let err = resolve_entries_to_remove(&manifest, &job_inputs)
+            .expect_err("a missing input must be reported");
+        assert_eq!(err, vanished);
     }
 
     /// If one input is already sealed by a different, still-live
