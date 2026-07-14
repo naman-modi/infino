@@ -44,15 +44,17 @@ create_exception!(
     infino,
     InfinoError,
     PyException,
-    "Base class for infino's errors."
+    "Base class for infino's errors. Catch it to handle any infino failure."
 );
 
 create_exception!(
     infino,
     ConnectionMemoryBudgetError,
     InfinoError,
-    "Operation refused: it would exceed the connection's memory budget \
-     (see connect's connection_memory_budget_bytes)."
+    "Raised when an ingest or query would exceed the connection's memory \
+     budget (set via `connect(connection_memory_budget_bytes=...)`). It is \
+     recoverable: catch it and back off, for example narrow the query, split \
+     the ingest, or raise the budget."
 );
 
 /// Map a core engine error to the Python exception the caller sees.

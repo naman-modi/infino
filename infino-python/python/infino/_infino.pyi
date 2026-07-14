@@ -30,10 +30,12 @@ def connect(
 ) -> Connection: ...
 
 class InfinoError(Exception):
-    """Base class for infino's errors."""
+    """Base class for infino's errors. Catch it to handle any infino failure."""
 
 class ConnectionMemoryBudgetError(InfinoError):
-    """Raised when an operation would exceed the connection's memory budget."""
+    """Raised when an ingest or query would exceed the connection's memory budget
+    (set via ``connect(connection_memory_budget_bytes=...)``). Recoverable: catch
+    it and back off, e.g. narrow the query, split the ingest, or raise the budget."""
 
 class Connection:
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
