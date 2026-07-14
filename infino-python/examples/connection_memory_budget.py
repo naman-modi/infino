@@ -1,9 +1,10 @@
 # Bound a connection's heap and recover from an over-budget refusal.
 #
 # `connect(connection_memory_budget_bytes=...)` caps the heap one connection may
-# use for query, ingest, and vector work. A request that would cross the limit
-# raises MemoryError instead of risking an out-of-memory crash, so the caller can
-# back off (narrow the query, raise the budget) rather than lose the process.
+# use to ingest data and query it back. A request that would cross the limit
+# raises ConnectionMemoryBudgetError instead of risking an out-of-memory crash,
+# so the caller can back off (narrow the query, raise the budget) rather than
+# lose the process.
 #
 # Storage is a local directory, so the data is durable and inspectable. We use
 # a TemporaryDirectory so the example is self-cleaning and always writes to a
@@ -41,7 +42,7 @@ def main():
         try:
             docs.append(batch(["the quick brown fox", "a lazy dog"]))
             print("unexpected: ingest was admitted under a 1-byte budget")
-        except MemoryError as e:
+        except infino.ConnectionMemoryBudgetError as e:
             print(f"ingest refused, over budget: {e}")
 
         # A generous budget admits the same work.

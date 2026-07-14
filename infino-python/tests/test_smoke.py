@@ -20,6 +20,8 @@ def test_package_metadata():
     assert set(infino.__all__) == {
         "connect",
         "Connection",
+        "InfinoError",
+        "ConnectionMemoryBudgetError",
         "Table",
         "IndexSpec",
         "MutationStats",
@@ -96,13 +98,15 @@ def test_connection_memory_budget_zero_is_measure_only():
     assert t.bm25_search("title", "fox", 10).num_rows == 1
 
 
-def test_connection_memory_budget_over_budget_raises_memoryerror():
+def test_connection_memory_budget_over_budget_raises_typed_error():
     # A 1-byte budget floors the enforced gate to 0, so building the appended
-    # rows crosses it. The refusal must surface as a catchable MemoryError,
-    # not a crash or a generic error.
+    # rows crosses it. The refusal must surface as the typed
+    # ConnectionMemoryBudgetError, which (subclassing InfinoError) is also
+    # catchable by a broad `except infino.InfinoError`.
+    assert issubclass(infino.ConnectionMemoryBudgetError, infino.InfinoError)
     db = infino.connect("memory://", connection_memory_budget_bytes=1)
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
-    with pytest.raises(MemoryError):
+    with pytest.raises(infino.ConnectionMemoryBudgetError):
         t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
 
 

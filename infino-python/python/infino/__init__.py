@@ -10,8 +10,10 @@ from importlib.metadata import PackageNotFoundError, version
 
 from infino._infino import (
     Connection,
+    ConnectionMemoryBudgetError,
     GcReport,
     IndexSpec,
+    InfinoError,
     MutationStats,
     OptimizeOptions,
     Table,
@@ -26,6 +28,8 @@ except PackageNotFoundError:  # source tree without installed metadata
 __all__ = [
     "connect",
     "Connection",
+    "InfinoError",
+    "ConnectionMemoryBudgetError",
     "Table",
     "IndexSpec",
     "MutationStats",

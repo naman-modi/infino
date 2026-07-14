@@ -29,6 +29,12 @@ def connect(
     validate: bool | None = ...,
 ) -> Connection: ...
 
+class InfinoError(Exception):
+    """Base class for infino's errors."""
+
+class ConnectionMemoryBudgetError(InfinoError):
+    """Raised when an operation would exceed the connection's memory budget."""
+
 class Connection:
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
     def open_table(self, name: str) -> Table: ...
