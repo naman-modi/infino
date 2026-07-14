@@ -78,6 +78,34 @@ def test_connect_accepts_cache_options(tmp_path):
     assert t.token_match("title", "fox").num_rows == 1
 
 
+def test_connection_memory_budget_admits_under_an_ample_limit():
+    # A generous heap budget must not refuse ordinary work.
+    db = infino.connect("memory://", connection_memory_budget_bytes=1 << 30)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+    assert t.bm25_search("title", "fox", 10).num_rows == 1
+
+
+def test_connection_memory_budget_zero_is_measure_only():
+    # 0 means "measure usage, never enforce" (same as omitting it), so ordinary
+    # work is admitted rather than refused. Guards against 0 being read as a
+    # zero-byte budget that rejects everything.
+    db = infino.connect("memory://", connection_memory_budget_bytes=0)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+    assert t.bm25_search("title", "fox", 10).num_rows == 1
+
+
+def test_connection_memory_budget_over_budget_raises_memoryerror():
+    # A 1-byte budget floors the enforced gate to 0, so building the appended
+    # rows crosses it. The refusal must surface as a catchable MemoryError,
+    # not a crash or a generic error.
+    db = infino.connect("memory://", connection_memory_budget_bytes=1)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    with pytest.raises(MemoryError):
+        t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
+
+
 def test_connect_cold_fetch_mode_is_case_insensitive():
     # Consistent with metric / mode parsing.
     infino.connect("memory://", cold_fetch_mode="RANGE_ONLY")

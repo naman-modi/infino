@@ -24,6 +24,7 @@ def connect(
     storage_options: Mapping[str, str] | None = ...,
     cache_dir: str | None = ...,
     cache_budget_bytes: int | None = ...,
+    connection_memory_budget_bytes: int | None = ...,
     cold_fetch_mode: ColdFetchMode | None = ...,
     validate: bool | None = ...,
 ) -> Connection: ...

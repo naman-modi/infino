@@ -25,7 +25,7 @@ use arrow_schema::Schema;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
-use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -43,6 +43,9 @@ fn py_err(e: InfinoError) -> PyErr {
         | InfinoError::Cardinality(m)
         | InfinoError::Query(m) => PyValueError::new_err(m),
         InfinoError::Io(m) | InfinoError::Backend(m) => PyRuntimeError::new_err(m),
+        // A connection-memory-budget refusal: recoverable, so raise the builtin
+        // MemoryError the caller can catch and back off on, not a generic error.
+        InfinoError::OverBudget(m) => PyMemoryError::new_err(m),
         // `InfinoError` is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => PyRuntimeError::new_err(other.to_string()),
@@ -90,15 +93,26 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 /// local disk cache. Pass `validate=True` to probe the object store at
 /// connect (off by default) so bad credentials fail there. Omit all for
 /// local / `memory://` / ambient-credential object storage.
+///
+/// `connection_memory_budget_bytes` caps this connection's heap: the memory
+/// used to ingest data and run queries over it (keyword, vector, hybrid, or
+/// SQL). Crossing it raises `MemoryError` rather than risking an OOM. Separate
+/// from `cache_budget_bytes` (the disk cache). Omit or `0` to measure only,
+/// never enforce. See
+/// <https://infino.ai/docs/guides/storage#connection-memory-budget>.
 #[pyfunction]
+// Each keyword mirrors a `ConnectOptions` setter; grouping them into a struct
+// would just move the surface without simplifying the Python-facing signature.
+#[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
-                    cold_fetch_mode=None, validate=None))]
+                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
     storage_options: Option<HashMap<String, String>>,
     cache_dir: Option<String>,
     cache_budget_bytes: Option<u64>,
+    connection_memory_budget_bytes: Option<u64>,
     cold_fetch_mode: Option<String>,
     validate: Option<bool>,
 ) -> PyResult<Connection> {
@@ -119,6 +133,10 @@ fn connect(
         }
         if let Some(bytes) = cache_budget_bytes {
             opts = opts.with_cache_budget_bytes(bytes);
+            has_options = true;
+        }
+        if let Some(bytes) = connection_memory_budget_bytes {
+            opts = opts.with_connection_memory_budget_bytes(bytes);
             has_options = true;
         }
         if let Some(mode) = cold_fetch_mode {
