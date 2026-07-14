@@ -59,10 +59,14 @@ impl MemoryPool for ConnectionBudgetPool {
     }
 
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> DfResult<()> {
-        self.budget.try_grow(additional).map_err(|_| {
-            DataFusionError::ResourcesExhausted(format!(
-                "connection memory budget exhausted: {additional} more bytes would cross the limit"
-            ))
+        // DataFusion's spilling operators (sort, aggregate) call try_grow and, on `Err`, spill to disk
+        // and retry rather than fail. They branch on the error variant (`ResourcesExhausted`), never on
+        // its message, so the text here only surfaces if the query still can't fit after spilling.
+        //
+        // We label it "during SQL query" so that final error matches the ingest and vector over-budget
+        // messages once it reaches InfinoError::OverBudget.
+        self.budget.try_grow(additional).map_err(|over| {
+            DataFusionError::ResourcesExhausted(format!("during SQL query, {over}"))
         })
     }
 

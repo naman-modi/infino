@@ -42,12 +42,32 @@ use crate::{
         reader::{rank_back_indices, row_selection_for_ids},
     },
     supertable::{
+        error::QueryError,
         handle::SupertableReader,
         manifest::SuperfileUri,
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{SuperfileHit, superfile_reader::superfile_reader},
     },
 };
+
+/// Map a search TVF's `QueryError` into a DataFusion error at the
+/// execution-node boundary.
+///
+/// The kNN runs off-SQL (in a custom `ExecutionPlan`), so its error must cross
+/// back into DataFusion to bubble up through `collect()`. A connection-memory
+/// budget refusal has to re-enter as `ResourcesExhausted`, the same channel
+/// DataFusion's own memory pool uses, so the SQL error classifier routes it to
+/// `InfinoError::OverBudget` rather than flattening it to a generic query
+/// error. Every other failure is a plain execution error.
+///
+/// Shared by the `vector_search` and `hybrid_search` nodes; without it a hybrid
+/// query would flatten the budget refusal that the plain vector query preserves.
+pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
+    match e.over_budget() {
+        Some(msg) => DataFusionError::ResourcesExhausted(msg.to_string()),
+        None => DataFusionError::Execution(e.to_string()),
+    }
+}
 
 /// Resolve `hits` to one `RecordBatch`, with `projection` naming the
 /// output columns (any of `_id`, the visible scalar columns, or the
@@ -601,6 +621,21 @@ mod tests {
             "emb"
         );
         assert!(arg_to_string(&lit(3_i64), "column").is_err());
+    }
+
+    #[test]
+    fn search_query_df_error_maps_over_budget_to_resources_exhausted() {
+        // Pins the boundary contract both search nodes depend on: a budget
+        // refusal maps to ResourcesExhausted (the shape the SQL classifier
+        // routes back to OverBudget), any other failure to Execution.
+        assert!(matches!(
+            search_query_df_error(QueryError::OverBudget("vector search, over".into())),
+            DataFusionError::ResourcesExhausted(_)
+        ));
+        assert!(matches!(
+            search_query_df_error(QueryError::Plan("boom".into())),
+            DataFusionError::Execution(_)
+        ));
     }
 
     #[test]

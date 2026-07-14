@@ -56,12 +56,17 @@ use datafusion::{
 };
 use futures::stream;
 
-use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
 use crate::{
     superfile::reader::VectorSearchOptions,
     supertable::{
         handle::{SupertableReader, WeakReader},
-        query::candidate::CandidatePlan,
+        query::{
+            candidate::CandidatePlan,
+            exec::common::{
+                arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+                search_query_df_error,
+            },
+        },
     },
 };
 
@@ -382,7 +387,7 @@ impl ExecutionPlan for VectorSearchExec {
                         .await
                 }
             }
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(search_query_df_error)?;
             resolve_hits(
                 &reader,
                 &hits,

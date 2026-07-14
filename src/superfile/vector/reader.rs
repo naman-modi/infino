@@ -3117,7 +3117,7 @@ fn reserve_cold_fetch(
     budget
         .try_reserve(cold_bytes)
         .map(Some)
-        .map_err(|e| VectorError::OverBudget(e.to_string()))
+        .map_err(|e| VectorError::OverBudget(format!("vector search, {e}")))
 }
 
 fn get_cluster_ranges_coalesced_with_extra(

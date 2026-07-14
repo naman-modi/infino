@@ -44,10 +44,15 @@ use datafusion::{
     },
 };
 
-use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
 use crate::{
     superfile::fts::reader::BoolMode,
-    supertable::handle::{SupertableReader, WeakReader},
+    supertable::{
+        handle::{SupertableReader, WeakReader},
+        query::exec::common::{
+            arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+            search_query_df_error,
+        },
+    },
 };
 
 /// SQL name for the term-based BM25 TVF.
@@ -380,7 +385,7 @@ impl ExecutionPlan for Bm25Exec {
                     reader.bm25_search_prefix_async(&column, prefix, k).await
                 }
             }
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(search_query_df_error)?;
             resolve_hits(
                 &reader,
                 &hits,

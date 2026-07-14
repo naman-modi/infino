@@ -127,15 +127,18 @@ impl From<StorageError> for InfinoError {
 
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        match e {
-            QueryError::OverBudget(msg) => InfinoError::OverBudget(msg),
-            other => InfinoError::Query(other.to_string()),
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
         }
+        InfinoError::Query(e.to_string())
     }
 }
 
 impl From<SuperfileReadError> for InfinoError {
     fn from(e: SuperfileReadError) -> Self {
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
+        }
         InfinoError::Query(e.to_string())
     }
 }
@@ -148,12 +151,10 @@ impl From<SuperfileBuildError> for InfinoError {
 
 impl From<SupertableBuildError> for InfinoError {
     fn from(e: SupertableBuildError) -> Self {
-        match e {
-            // A budget refusal during ingest keeps its own variant so it
-            // surfaces as the public over-budget error, not a schema error.
-            SupertableBuildError::OverBudget(msg) => InfinoError::OverBudget(msg),
-            other => InfinoError::Schema(other.to_string()),
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
         }
+        InfinoError::Schema(e.to_string())
     }
 }
 
@@ -173,6 +174,8 @@ impl From<MutationError> for InfinoError {
     fn from(e: MutationError) -> Self {
         let msg = e.to_string();
         match e {
+            // Routes over-budget through From<QueryError> when the predicate
+            // eval was the budget refusal.
             MutationError::PredicateEval(q) => InfinoError::from(q),
             MutationError::Storage(s) => InfinoError::from(s),
             MutationError::CardinalityMismatch { .. }
@@ -185,14 +188,10 @@ impl From<MutationError> for InfinoError {
 
 impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
-        match e {
-            // An ingest budget refusal fails the append-flush phase; preserve it
-            // as over-budget rather than flattening to a generic backend error.
-            MutationCommitError::AppendFlush(SupertableBuildError::OverBudget(msg)) => {
-                InfinoError::OverBudget(msg)
-            }
-            other => InfinoError::Backend(other.to_string()),
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
         }
+        InfinoError::Backend(e.to_string())
     }
 }
 
@@ -290,6 +289,26 @@ mod tests {
         ));
         assert!(matches!(
             InfinoError::from(OpenError::ManifestListParse("m".into())),
+            InfinoError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn over_budget_routes_through_wrappers() {
+        // A budget refusal nested under a wrapper (here the commit's
+        // append-flush phase) still routes to OverBudget: each wrapper's
+        // over_budget() delegates to the inner error's.
+        let nested =
+            MutationCommitError::AppendFlush(SupertableBuildError::OverBudget("deep".into()));
+        assert!(matches!(
+            InfinoError::from(nested),
+            InfinoError::OverBudget(_)
+        ));
+        // A non-budget error in the same wrapper stays a generic backend error.
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::AppendFlush(
+                SupertableBuildError::NoDocsToBuild
+            )),
             InfinoError::Backend(_)
         ));
     }

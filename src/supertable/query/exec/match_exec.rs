@@ -46,13 +46,17 @@ use datafusion::{
 };
 use futures::stream;
 
-use super::{
-    common::{arg_to_string, output_schema_with_score, resolve_hits},
-    fts_exec::arg_to_bool_mode,
-};
 use crate::{
     superfile::fts::reader::BoolMode,
-    supertable::handle::{SupertableReader, WeakReader},
+    supertable::{
+        handle::{SupertableReader, WeakReader},
+        query::exec::{
+            common::{
+                arg_to_string, output_schema_with_score, resolve_hits, search_query_df_error,
+            },
+            fts_exec::arg_to_bool_mode,
+        },
+    },
 };
 
 /// SQL name for the unranked token-match TVF.
@@ -359,7 +363,7 @@ impl ExecutionPlan for MatchExec {
                 }
                 MatchQuery::Exact { value } => reader.exact_match_async(&column, value).await,
             }
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(search_query_df_error)?;
             resolve_hits(
                 &reader,
                 &hits,

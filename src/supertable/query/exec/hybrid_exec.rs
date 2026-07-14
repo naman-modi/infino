@@ -64,12 +64,6 @@ use datafusion::{
 use futures::{future, stream};
 use tracing::debug;
 
-use super::{
-    common::{
-        arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits, resolve_hits_named,
-    },
-    vector_exec::arg_to_query_vector,
-};
 use crate::{
     InfinoError,
     superfile::{fts::reader::BoolMode, reader::VectorSearchOptions},
@@ -77,7 +71,16 @@ use crate::{
         QueryError,
         handle::{Supertable, SupertableReader, WeakReader},
         manifest::SuperfileUri,
-        query::SuperfileHit,
+        query::{
+            SuperfileHit,
+            exec::{
+                common::{
+                    arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+                    resolve_hits_named, search_query_df_error,
+                },
+                vector_exec::arg_to_query_vector,
+            },
+        },
     },
 };
 
@@ -471,7 +474,7 @@ impl ExecutionPlan for HybridSearchExec {
             let fused = reader
                 .hybrid_search_async(&text_col, &q_text, mode, &vec_col, &q_vec, options, k)
                 .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                .map_err(search_query_df_error)?;
             resolve_hits(
                 &reader,
                 &fused,
