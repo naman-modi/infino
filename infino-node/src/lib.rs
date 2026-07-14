@@ -55,13 +55,14 @@ use infino::{
 // ---------------------------------------------------------------------------
 
 /// Map a core [`InfinoError`] to a JS error, mirroring the Python
-/// bindings' grouping: not-found vs. bad-argument vs. runtime. The bucket
-/// is encoded in the napi [`Status`] (surfaced as `err.code` in JS) and
-/// the message is preserved.
+/// bindings' grouping: not-found vs. bad-argument vs. runtime, plus the
+/// connection-memory-budget refusal. The bucket is encoded in the napi
+/// [`Status`] (surfaced as `err.code` in JS) and the message is preserved;
+/// where several kinds share a `Status`, a message prefix tells them apart
+/// (as `NotFound:` does).
 //
-// TODO: refine into distinct JS `Error` subclasses once the surface
-// settles; the three-bucket split is the same contract as Python's
-// KeyError / ValueError / RuntimeError mapping.
+// TODO: refine into distinct JS `Error` subclasses once the surface settles,
+// matching Python's `InfinoError` base + `ConnectionMemoryBudgetError`.
 fn map_err(e: InfinoError) -> Error {
     match e {
         InfinoError::NotFound(m) => Error::new(Status::GenericFailure, format!("NotFound: {m}")),
@@ -70,6 +71,13 @@ fn map_err(e: InfinoError) -> Error {
         | InfinoError::Cardinality(m)
         | InfinoError::Query(m) => Error::new(Status::InvalidArg, m),
         InfinoError::Io(m) | InfinoError::Backend(m) => Error::new(Status::GenericFailure, m),
+        // A recoverable connection-memory-budget refusal. Prefixed with the same
+        // name Python raises (`ConnectionMemoryBudgetError`) so the concept reads
+        // the same across bindings and a caller can tell it apart to back off.
+        InfinoError::OverBudget(m) => Error::new(
+            Status::GenericFailure,
+            format!("ConnectionMemoryBudgetError: {m}"),
+        ),
         // `InfinoError` is `#[non_exhaustive]`: future variants fall back
         // to a generic runtime error carrying the message.
         other => Error::new(Status::GenericFailure, other.to_string()),
@@ -208,6 +216,9 @@ pub struct ConnectOptions {
     pub cache_dir: Option<String>,
     /// Disk-cache budget in bytes (a JS number; up to 2^53).
     pub cache_budget_bytes: Option<f64>,
+    /// Per-connection heap budget in bytes (a JS number; up to 2^53). `0` or
+    /// omitted measures usage without enforcing.
+    pub connection_memory_budget_bytes: Option<f64>,
     /// Cold-miss strategy: `"hybrid_with_prefetch"` | `"range_only"` |
     /// `"lazy_foreground_with_background_fill"`.
     pub cold_fetch_mode: Option<String>,
@@ -368,6 +379,9 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
             }
             if let Some(bytes) = o.cache_budget_bytes {
                 opts = opts.with_cache_budget_bytes(bytes as u64);
+            }
+            if let Some(bytes) = o.connection_memory_budget_bytes {
+                opts = opts.with_connection_memory_budget_bytes(bytes as u64);
             }
             if let Some(mode) = o.cold_fetch_mode {
                 opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);

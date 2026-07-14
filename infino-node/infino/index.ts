@@ -40,6 +40,15 @@ export interface ConnectOptions {
   cacheDir?: string;
   /** Disk-cache budget in bytes. */
   cacheBudgetBytes?: number;
+  /**
+   * Per-connection heap budget in bytes: the working memory ingesting and
+   * querying use. Crossing it throws an Error whose message starts with
+   * `ConnectionMemoryBudgetError:`, instead of risking an out-of-memory crash.
+   * `0` or omitted measures without enforcing. Separate from `cacheBudgetBytes`
+   * (the disk cache). See
+   * https://infino.ai/docs/guides/storage#connection-memory-budget
+   */
+  connectionMemoryBudgetBytes?: number;
   /** How cold misses are serviced. */
   coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
   /**

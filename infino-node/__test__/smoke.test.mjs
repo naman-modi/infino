@@ -339,3 +339,29 @@ test("connect parses cache + cold-fetch options", () => {
 test("connect rejects an invalid coldFetchMode", () => {
   assert.throws(() => connect("memory://", { coldFetchMode: "nonsense" }));
 });
+
+test("connectionMemoryBudgetBytes: ample admits, over-budget throws", () => {
+  // A generous heap budget must not refuse ordinary work.
+  const ample = connect("memory://", { connectionMemoryBudgetBytes: 1 << 30 });
+  const ok = ample.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  ok.append([{ title: "the quick brown fox" }]);
+  assert.equal(ok.bm25Search("title", "fox", 10).length, 1);
+
+  // A 1-byte budget floors the enforced gate to 0, so building the appended
+  // rows crosses it. The refusal throws an Error prefixed
+  // `ConnectionMemoryBudgetError:`, not a crash.
+  const tight = connect("memory://", { connectionMemoryBudgetBytes: 1 });
+  const docs = tight.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  assert.throws(
+    () => docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]),
+    /ConnectionMemoryBudgetError:/,
+  );
+});
+
+test("connectionMemoryBudgetBytes: 0 measures without enforcing", () => {
+  // 0 (like omitting it) measures usage but never denies.
+  const db = connect("memory://", { connectionMemoryBudgetBytes: 0 });
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }]);
+  assert.equal(docs.bm25Search("title", "fox", 10).length, 1);
+});
