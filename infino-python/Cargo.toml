@@ -33,4 +33,4 @@ pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
 # `Expr` — the type the core `update` / `delete` take. Pinned to infino's
 # datafusion version so the `Expr` type unifies with the core signatures;
 # feature unification reuses infino's already-compiled datafusion.
-datafusion = "53"
+datafusion = "54"

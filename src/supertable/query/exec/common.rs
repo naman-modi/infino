@@ -586,6 +586,31 @@ pub(crate) fn arg_to_usize(expr: &Expr, what: &str) -> DfResult<usize> {
     usize::try_from(n).map_err(|_| DataFusionError::Plan(format!("{what} must be >= 0, got {n}")))
 }
 
+/// Shared test support for the exec-module tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use datafusion::{
+        catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider},
+        error::Result as DfResult,
+        logical_expr::Expr,
+        prelude::SessionContext,
+    };
+
+    /// Invoke a table function's `call_with_args` with a throwaway session.
+    /// The search TVFs read only the argument exprs, not the session, so a
+    /// fresh empty context is enough to satisfy the DataFusion 54 signature.
+    pub(crate) fn call_tvf<F: TableFunctionImpl>(
+        func: &F,
+        exprs: &[Expr],
+    ) -> DfResult<Arc<dyn TableProvider>> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        func.call_with_args(TableFunctionArgs::new(exprs, &state))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{Array, FixedSizeListArray, LargeStringArray};

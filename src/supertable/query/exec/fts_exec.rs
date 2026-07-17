@@ -26,12 +26,12 @@
 //! descending). The optional `mode` is `'or'` (default) or `'and'`;
 //! prefix search always runs OR over the expanded term set.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
+    catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableType},
@@ -119,7 +119,8 @@ impl Bm25SearchFunc {
 }
 
 impl TableFunctionImpl for Bm25SearchFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != BM25_SEARCH_ARG_COUNT_MIN && args.len() != BM25_SEARCH_ARG_COUNT_MAX {
             return Err(DataFusionError::Plan(format!(
                 "bm25_search expects {BM25_SEARCH_ARG_COUNT_MIN} or {BM25_SEARCH_ARG_COUNT_MAX} \
@@ -170,7 +171,9 @@ impl Bm25PrefixFunc {
 }
 
 impl TableFunctionImpl for Bm25PrefixFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
+
         if args.len() != BM25_PREFIX_SEARCH_ARG_COUNT {
             return Err(DataFusionError::Plan(format!(
                 "bm25_search_prefix expects {BM25_PREFIX_SEARCH_ARG_COUNT} arguments \
@@ -178,6 +181,7 @@ impl TableFunctionImpl for Bm25PrefixFunc {
                 args.len()
             )));
         }
+
         let column = arg_to_string(&args[0], "bm25_search_prefix column")?;
         let prefix = arg_to_string(&args[1], "bm25_search_prefix prefix")?;
         let k = arg_to_usize(&args[2], "bm25_search_prefix k")?;
@@ -186,6 +190,7 @@ impl TableFunctionImpl for Bm25PrefixFunc {
                 "bm25_search_prefix: supertable consumer dropped before execution".into(),
             )
         })?;
+
         Ok(Arc::new(Bm25Table {
             reader,
             column,
@@ -220,10 +225,6 @@ impl fmt::Debug for Bm25Table {
 
 #[async_trait]
 impl TableProvider for Bm25Table {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -336,10 +337,6 @@ impl DisplayAs for Bm25Exec {
 impl ExecutionPlan for Bm25Exec {
     fn name(&self) -> &'static str {
         "Bm25Exec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -685,19 +682,18 @@ mod tests {
     /// `Debug` — none of which normal query execution touches.
     #[tokio::test]
     async fn bm25_table_and_exec_trait_methods() {
+        use crate::supertable::query::exec::common::test_support::call_tvf;
         let st = demo_corpus();
         let reader = Arc::new(st.reader());
         let scalar_schema = reader.options().scalar_schema();
         let func = Bm25SearchFunc::new(reader, scalar_schema);
-        let table = func
-            .call(&[lit("title"), lit("rust"), lit(10_i64)])
-            .expect("bm25 table");
+        let table = call_tvf(&func, &[lit("title"), lit("rust"), lit(10_i64)]).expect("bm25 table");
 
         // TableProvider metadata.
         let dbg = format!("{table:?}");
         assert!(dbg.contains("Bm25Table"), "Debug missing: {dbg}");
         assert!(
-            table.as_any().downcast_ref::<Bm25Table>().is_some(),
+            table.downcast_ref::<Bm25Table>().is_some(),
             "as_any downcasts to Bm25Table"
         );
         assert_eq!(table.table_type(), TableType::Base);

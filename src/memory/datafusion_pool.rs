@@ -28,7 +28,7 @@
 //! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
 //!
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
@@ -49,7 +49,21 @@ struct ConnectionBudgetPool {
     budget: Arc<ConnectionMemoryBudget>,
 }
 
+/// Pool name for DataFusion 54's `MemoryPool::name` + `Display` (both required;
+/// used only in its diagnostics). The budget has no extra state worth printing.
+const POOL_NAME: &str = "ConnectionBudgetPool";
+
+impl fmt::Display for ConnectionBudgetPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(POOL_NAME)
+    }
+}
+
 impl MemoryPool for ConnectionBudgetPool {
+    fn name(&self) -> &str {
+        POOL_NAME
+    }
+
     fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
         self.budget.grow_unchecked(additional);
     }

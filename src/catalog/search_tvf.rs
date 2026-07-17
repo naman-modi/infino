@@ -26,7 +26,7 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use datafusion::{
-    catalog::{TableFunctionImpl, TableProvider},
+    catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::context::SessionContext,
     logical_expr::Expr,
@@ -163,9 +163,11 @@ struct Bm25SearchCatalogFunc {
     resolver: Arc<TableResolver>,
 }
 impl TableFunctionImpl for Bm25SearchCatalogFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args, "bm25_search")?;
-        Bm25SearchFunc::new(t.reader, t.scalar_schema).call(rest)
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args.exprs(), "bm25_search")?;
+
+        Bm25SearchFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
@@ -174,9 +176,13 @@ struct Bm25PrefixCatalogFunc {
     resolver: Arc<TableResolver>,
 }
 impl TableFunctionImpl for Bm25PrefixCatalogFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args, "bm25_search_prefix")?;
-        Bm25PrefixFunc::new(t.reader, t.scalar_schema).call(rest)
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self
+            .resolver
+            .split_leading(args.exprs(), "bm25_search_prefix")?;
+
+        Bm25PrefixFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
@@ -185,9 +191,11 @@ struct VectorSearchCatalogFunc {
     resolver: Arc<TableResolver>,
 }
 impl TableFunctionImpl for VectorSearchCatalogFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args, "vector_search")?;
-        VectorSearchFunc::new(t.reader, t.scalar_schema).call(rest)
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args.exprs(), "vector_search")?;
+
+        VectorSearchFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
@@ -196,9 +204,11 @@ struct HybridSearchCatalogFunc {
     resolver: Arc<TableResolver>,
 }
 impl TableFunctionImpl for HybridSearchCatalogFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args, "hybrid_search")?;
-        HybridSearchFunc::new(t.reader, t.scalar_schema).call(rest)
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args.exprs(), "hybrid_search")?;
+
+        HybridSearchFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
@@ -207,9 +217,11 @@ struct TokenMatchCatalogFunc {
     resolver: Arc<TableResolver>,
 }
 impl TableFunctionImpl for TokenMatchCatalogFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args, "token_match")?;
-        TokenMatchFunc::new(t.reader, t.scalar_schema).call(rest)
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args.exprs(), "token_match")?;
+
+        TokenMatchFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
 
@@ -218,8 +230,10 @@ struct ExactMatchCatalogFunc {
     resolver: Arc<TableResolver>,
 }
 impl TableFunctionImpl for ExactMatchCatalogFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args, "exact_match")?;
-        ExactMatchFunc::new(t.reader, t.scalar_schema).call(rest)
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let (t, rest) = self.resolver.split_leading(args.exprs(), "exact_match")?;
+
+        ExactMatchFunc::new(t.reader, t.scalar_schema)
+            .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
