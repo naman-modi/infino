@@ -452,12 +452,10 @@ fn peel_input(input: &LogicalPlan) -> Option<(Expr, &TableScan)> {
 
 /// The provider behind a scan, when it is ours.
 fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
-    scan.source
-        .as_any()
-        .downcast_ref::<DefaultTableSource>()?
-        .table_provider
-        .as_any()
-        .downcast_ref::<SupertableProvider>()
+    // DataFusion 54 dropped `as_any` for an `Any` supertrait; downcast through
+    // its provided `downcast_ref` (auto-derefs the `Arc`).
+    let source = scan.source.downcast_ref::<DefaultTableSource>()?;
+    source.table_provider.downcast_ref::<SupertableProvider>()
 }
 
 /// Strictly extract a single-column range from the predicate: a

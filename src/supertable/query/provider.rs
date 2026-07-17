@@ -44,7 +44,6 @@
 //! without adding another object-store implementation.
 
 use std::{
-    any::Any,
     cmp,
     collections::{HashMap, HashSet},
     fmt,
@@ -550,10 +549,6 @@ fn scalar_as_str(v: &ScalarValue) -> Option<&str> {
 
 #[async_trait]
 impl TableProvider for SupertableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -753,7 +748,11 @@ impl TableProvider for SupertableProvider {
             };
             let mut file = PartitionedFile::new(seg.path.to_string(), seg.size);
             if let Some(plan) = access_plan {
-                file = file.with_extensions(Arc::new(plan));
+                // DataFusion 54 keys file extensions by concrete type and reads
+                // the access plan via `extensions.get::<ParquetAccessPlan>()`, so
+                // attach it typed (the old `with_extensions(Arc<dyn Any>)` slot
+                // would no longer be found, silently disabling row-group pruning).
+                file = file.with_extension(plan);
             }
             files.push(file);
         }
@@ -1990,13 +1989,10 @@ mod tests {
     fn trait_accessors_and_debug() {
         let (provider, _rt) = provider_over_two_superfiles();
 
-        // as_any downcasts back to the concrete provider.
-        assert!(
-            provider
-                .as_any()
-                .downcast_ref::<SupertableProvider>()
-                .is_some()
-        );
+        // A `dyn TableProvider` downcasts back to the concrete provider via
+        // DataFusion 54's provided `downcast_ref` (what `covered_agg` relies on).
+        let dyn_provider: &dyn TableProvider = &provider;
+        assert!(dyn_provider.downcast_ref::<SupertableProvider>().is_some());
         // table_type is a base table.
         assert!(matches!(provider.table_type(), TableType::Base));
         // schema() returns the scalar schema (category + title + _id).
