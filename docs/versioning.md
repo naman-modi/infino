@@ -52,28 +52,43 @@ contract for how their versions relate.
 
 ## How to release
 
+Stamp the version files with `make release-prep PACKAGE=<crate|node|python|all>
+VERSION=X.Y.Z` — it validates the bump against the rules above, rewrites every
+file carrying that package's version (manifest, lockfile, and the Node
+platform pins), re-runs the drift guard, and prints the follow-up step.
+`make release-prep PACKAGE=each` (no `VERSION`) bumps every package to its own
+next patch in one go — for a fix that genuinely ships in all three; patch
+counters stay independent. Land the stamped change as an ordinary PR, then
+trigger the publish:
+
 A `v<version>` tag is the release trigger; what it publishes depends on whether
 it is a patch or a coordinated minor/major.
 
 - **Crate patch** (`vX.Y.Z`, `Z > 0`, e.g. `v0.1.1`) — bump `version` in the root
-  `Cargo.toml`, then push the matching tag. The `Publish crate` workflow
-  (`.github/workflows/crate-publish.yml`) asserts the tag matches `Cargo.toml` and
-  publishes to crates.io. **The Node and Python workflows skip a patch tag** —
-  their coordinated-release gate fires only when `patch == 0` — so the crate
-  patches alone. (You can also run `Publish crate` manually from the Actions
-  tab — the default is a dry run.)
+  `Cargo.toml` (`make release-prep PACKAGE=crate`) and land it. On merge, the
+  `Tag release` workflow (`.github/workflows/tag-release.yml`) pushes the
+  matching tag and kicks off `Publish crate`
+  (`.github/workflows/crate-publish.yml`), which publishes to crates.io.
+  **The Node and Python workflows skip a crate patch** — their
+  coordinated-release gate fires only when `patch == 0` — so the crate patches
+  alone. (Pushing a `v<version>` tag by hand still triggers the same publish,
+  and `Publish crate` can be run manually from the Actions tab — the default
+  is a dry run.)
 - **Coordinated minor/major** (`vX.Y.0`, e.g. `v0.2.0`) — land the engine change,
   **update the Node and Python binding code for any new or changed engine
-  surface**, bump the crate *and* both bindings (`infino-node/package.json`,
-  `infino-python/Cargo.toml`) to the same `X.Y.0`, then push the `vX.Y.0` tag. All
-  three publish workflows fire on it — crate → crates.io, Node → npm, Python →
-  PyPI — at `X.Y.0`. (Node's `napi prepublish` derives the per-platform package
-  versions and `optionalDependencies` pins from that single `package.json`
-  field.) The bindings must never ship a new minor before their code exposes that
-  minor's engine changes.
+  surface**, bump the crate *and* both bindings to the same `X.Y.0`
+  (`make release-prep PACKAGE=all`), and land the bump. On merge, `Tag release`
+  pushes the `vX.Y.0` tag and kicks off all three publish workflows — crate →
+  crates.io, Node → npm, Python → PyPI — at `X.Y.0`. (Node's `napi prepublish`
+  derives the per-platform package versions and `optionalDependencies` pins
+  from that single `package.json` field.) The bindings must never ship a new
+  minor before their code exposes that minor's engine changes.
 - **Binding-only patch** (Node or Python, independent of the crate's patch) — bump
-  that binding's version and run its workflow **manually** (`Node publish` /
-  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched.
+  that binding's version (`make release-prep PACKAGE=node|python VERSION=…`),
+  land it, then run its workflow **manually** (`Node publish` /
+  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched. Both
+  workflows publish the version committed in the tree — Node from
+  `infino-node/package.json`, Python from `infino-python/Cargo.toml`.
 
 **Patch counters are independent per package and never shared**, so the crate's
 patch and a binding's patch can never collide on a registry — only `major.minor`
@@ -112,6 +127,12 @@ Patches diverge between coordinated minors; a minor bump realigns everything on
   `v<version>` tag; Node and Python still publish via their own manual workflows.
   Still worth naming a clear owner for the engine's version bumps so the crate
   doesn't fall behind the bindings on the shared release line.
-- **No drift guard yet.** A small CI check that asserts the `major.minor` of the
-  root `Cargo.toml`, `infino-node/package.json`, and `infino-python/Cargo.toml`
-  all agree (patch ignored) would enforce rule 2 cheaply. Recommended.
+- **Drift guard: done.** `make version-sync` (part of `make check`, so it runs
+  on every PR) asserts the `major.minor` of the root `Cargo.toml`,
+  `infino-node/package.json`, and `infino-python/Cargo.toml` all agree (patch
+  ignored), that the `infx-*` platform pins track the Node package version, and
+  that each Cargo.lock records its manifest's version so `--locked` publishes
+  don't fail at the tag. The binding publish workflows run the same guard
+  before building — `publish-python` validates the dispatched version against
+  the crate's line, `Node publish` validates the in-tree state. See
+  `scripts/check_version_sync.py`.
