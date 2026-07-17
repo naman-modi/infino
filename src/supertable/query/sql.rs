@@ -83,9 +83,26 @@ use crate::{
 ///   result boundary.
 #[derive(Clone)]
 pub(crate) struct SqlSchemas {
-    pub(crate) scalar: SchemaRef,
-    pub(crate) scan: SchemaRef,
-    pub(crate) declared: Arc<HashMap<String, DataType>>,
+    scalar: SchemaRef,
+    scan: SchemaRef,
+    declared: Arc<HashMap<String, DataType>>,
+}
+
+impl SqlSchemas {
+    /// Plain scalar schema (id + scalar + FTS, no vectors) the TVFs bind to.
+    pub(crate) fn scalar(&self) -> &SchemaRef {
+        &self.scalar
+    }
+
+    /// String-viewed schema the provider plans against.
+    pub(crate) fn scan(&self) -> &SchemaRef {
+        &self.scan
+    }
+
+    /// Declared string types, for restoring result columns at the boundary.
+    pub(crate) fn declared(&self) -> &Arc<HashMap<String, DataType>> {
+        &self.declared
+    }
 }
 
 /// Build the [`SqlSchemas`] for `options`. Called once per table; the result is
@@ -260,7 +277,7 @@ impl SupertableReader {
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
 
             let batches = df.collect().await.map_err(exec_query_error)?;
-            cast_back_views(batches, &schemas.declared)
+            cast_back_views(batches, schemas.declared())
         };
 
         // Drive through the shared sync→async bridge: ambient
@@ -309,7 +326,7 @@ impl SupertableReader {
         // schema; the TVFs bind to the plain `scalar` schema.
         let schemas = self.sql_schemas();
         let provider = SupertableProvider::new(
-            schemas.scan.clone(),
+            schemas.scan().clone(),
             Arc::clone(&manifest),
             store,
             disk_cache,
@@ -332,11 +349,11 @@ impl SupertableReader {
         // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
         // the pinned snapshot. They lower to custom `ExecutionPlan`
         // nodes that call the async kernels inside `execute()`.
-        register_vector_search(&ctx, Arc::clone(&reader), schemas.scalar.clone());
-        register_bm25(&ctx, Arc::clone(&reader), schemas.scalar.clone());
+        register_vector_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        register_bm25(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         // Unranked token / exact match TVFs (siblings of bm25_search).
-        register_match(&ctx, Arc::clone(&reader), schemas.scalar.clone());
-        register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar.clone());
+        register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
 
         *guard = Some((Arc::clone(&manifest), ctx.clone()));
 
@@ -406,7 +423,7 @@ impl Supertable {
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         // Provider scans the cached string-viewed schema.
         let provider = SupertableProvider::new(
-            self.sql_schemas().scan.clone(),
+            self.sql_schemas().scan().clone(),
             manifest,
             store,
             disk_cache,
@@ -975,28 +992,31 @@ mod tests {
         let s = build_sql_schemas(&options_id_cat_title());
         // scan: `category` (non-FTS string) viewed; `title` (FTS) kept.
         assert_eq!(
-            s.scan
+            s.scan()
                 .field_with_name("category")
                 .expect("category")
                 .data_type(),
             &DataType::Utf8View,
         );
         assert_eq!(
-            s.scan.field_with_name("title").expect("title").data_type(),
+            s.scan()
+                .field_with_name("title")
+                .expect("title")
+                .data_type(),
             &DataType::LargeUtf8,
             "FTS column stays LargeUtf8 in the scan schema",
         );
         // scalar: no viewing.
         assert_eq!(
-            s.scalar
+            s.scalar()
                 .field_with_name("category")
                 .expect("category")
                 .data_type(),
             &DataType::LargeUtf8,
         );
         // declared: name -> declared type.
-        assert_eq!(s.declared.get("category"), Some(&DataType::LargeUtf8));
-        assert_eq!(s.declared.get("title"), Some(&DataType::LargeUtf8));
+        assert_eq!(s.declared().get("category"), Some(&DataType::LargeUtf8));
+        assert_eq!(s.declared().get("title"), Some(&DataType::LargeUtf8));
     }
 
     /// The per-table schemas are built once and memoized on the handle, not

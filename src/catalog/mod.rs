@@ -627,11 +627,11 @@ impl Connection {
         // query uses its map directly; a join merges, first table winning a name
         // collision (rare).
         let declared: Arc<HashMap<String, DataType>> = match handles.as_slice() {
-            [single] => Arc::clone(&single.sql_schemas().declared),
+            [single] => Arc::clone(single.sql_schemas().declared()),
             tables => {
                 let mut merged = HashMap::new();
                 for t in tables {
-                    for (name, ty) in t.sql_schemas().declared.iter() {
+                    for (name, ty) in t.sql_schemas().declared().iter() {
                         merged.entry(name.clone()).or_insert_with(|| ty.clone());
                     }
                 }
