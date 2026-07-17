@@ -1,6 +1,6 @@
 [package]
 name = "infino-node"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -38,7 +38,7 @@ arrow-schema = "58"
 # `Expr` — the type `infino::Supertable::update` / `delete` take. Pinned to
 # infino's datafusion version so the `Expr` type unifies with the core
 # signatures; feature unification reuses infino's already-compiled datafusion.
-datafusion = "53"
+datafusion = "54"
 
 [build-dependencies]
 napi-build = "2"

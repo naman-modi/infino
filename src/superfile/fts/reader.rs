@@ -47,12 +47,18 @@ use crate::superfile::{
     lazy_source::{LazyByteSource, PrefetchedSource, Source},
 };
 
-/// Boolean-mode for multi-term queries.
+/// Default operator for a query's bare (sigil-less) terms. Terms
+/// carrying an explicit clause sigil keep their polarity regardless
+/// of mode: `+term` is a must (every hit contains it), `-term` a
+/// must-not (hard exclusion).
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum BoolMode {
-    /// All query terms must match the doc.
+    /// Bare terms are musts: all of them must match the doc.
     And,
-    /// Any query term matching contributes to the doc's score.
+    /// Bare terms are shoulds: any of them matching contributes to
+    /// the doc's score. When the query also carries `+must` terms,
+    /// the musts alone define the match set and bare terms become
+    /// scoring-only.
     Or,
 }
 
@@ -775,31 +781,44 @@ impl FtsReader {
         // below `floor` makes those comparisons exactly "strictly
         // below floor is dead, equal-to-floor survives".
         let floor_eff = floor.next_down();
-        self.search_with_filters(column_id, terms, k, mode, None, floor_eff)
+        // A flat term list under one mode is the degenerate clause
+        // shape: `And` makes every term a must, `Or` a should.
+        let (musts, shoulds): (&[&str], &[&str]) = match mode {
+            BoolMode::And => (terms, &[]),
+            BoolMode::Or => (&[], terms),
+        };
+        self.search_clauses(column_id, musts, shoulds, k, None, floor_eff)
             .await
     }
 
-    /// BM25 search with negated (`-term`) terms excluded.
+    /// BM25 search over explicit clause lists, with negated terms
+    /// excluded.
     ///
-    /// `positives` are scored under `mode` as in [`Self::search`];
-    /// `negatives` filter out any doc containing one of them, regardless
-    /// of score. Both lists are already tokenized.
+    /// `musts` all have to match (their intersection is the match
+    /// set); `shoulds` are scoring-only — a matching should raises a
+    /// doc's score but never adds or removes a match. With no musts,
+    /// the shoulds' union is the match set (a plain OR query).
+    /// `negatives` filter out any doc containing one of them,
+    /// regardless of score. All lists are already tokenized; the
+    /// default-operator resolution (bare token → must or should)
+    /// happened at parse time via `ParsedQuery::into_clauses`.
     ///
-    /// No positives → [`FtsError::NegationOnly`] (nothing to rank).
-    /// Empty positives *and* negatives → empty result.
+    /// No musts and no shoulds → [`FtsError::NegationOnly`] (nothing
+    /// to rank) when negatives exist, else an empty result.
     pub(crate) async fn search_excluding(
         &self,
         column: &str,
-        positives: &[&str],
+        musts: &[&str],
+        shoulds: &[&str],
         negatives: &[&str],
         k: usize,
-        mode: BoolMode,
+        floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
-        if positives.is_empty() {
+        if musts.is_empty() && shoulds.is_empty() {
             if negatives.is_empty() {
                 return Ok(Vec::new());
             }
@@ -813,58 +832,63 @@ impl FtsReader {
             )),
         };
 
-        // Negated string queries carry no cross-segment floor today;
-        // NEG_INFINITY disables floor pruning (see `search_with_floor`).
-        self.search_with_filters(
-            column_id,
-            positives,
-            k,
-            mode,
-            filter.as_mut(),
-            f32::NEG_INFINITY,
-        )
-        .await
+        let floor_eff = floor.next_down();
+        self.search_clauses(column_id, musts, shoulds, k, filter.as_mut(), floor_eff)
+            .await
     }
 
     /// Shared dispatch for [`Self::search_with_floor`] and
-    /// [`Self::search_excluding`]: routes positives to the single-term
-    /// / OR / AND kernel, threading `filter` to the heap-admission
-    /// sites and `floor_eff` (already `next_down`-adjusted) to every
-    /// pruning structure.
-    async fn search_with_filters(
+    /// [`Self::search_excluding`]: routes the clause lists to the
+    /// single-term / OR / AND / must+should kernel, threading `filter`
+    /// to the heap-admission sites and `floor_eff` (already
+    /// `next_down`-adjusted) to every pruning structure.
+    async fn search_clauses(
         &self,
         column_id: u32,
-        terms: &[&str],
+        musts: &[&str],
+        shoulds: &[&str],
         k: usize,
-        mode: BoolMode,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        // Single-term fast path: BlockMaxWAND-driven block skipping.
-        // Walks blocks in order, populating a top-k min-heap. Once the
-        // heap is full, blocks whose skip-table-recorded `max_bm25`
-        // can't beat the kth-best (or the seeded floor) are skipped
-        // without decoding.
-        if terms.len() == 1 {
+        // Single-atom fast path: BlockMaxWAND-driven block skipping.
+        // One term scores identically whichever clause list it sits
+        // in (a lone must and a lone should both rank that term's
+        // postings), so both shapes take it.
+        if musts.len() + shoulds.len() == 1 {
+            let term = musts.iter().chain(shoulds).next().expect("one atom");
             return self
-                .search_single_term_bmw(column_id, terms[0], k, filter, floor_eff)
+                .search_single_term_bmw(column_id, term, k, filter, floor_eff)
                 .await;
         }
-        match mode {
-            BoolMode::Or => {
-                self.dispatch_multi_term_or(column_id, terms, k, filter, floor_eff)
-                    .await
-            }
-            BoolMode::And => {
-                // Build cursors; if any term is missing, the
-                // intersection is empty.
-                let cursors = self.build_term_cursors(column_id, terms).await?;
-                if cursors.len() != terms.len() {
-                    return Ok(Vec::new());
-                }
-                self.run_and_intersect(column_id, cursors, k, filter, floor_eff)
-            }
+        if musts.is_empty() {
+            return self
+                .dispatch_multi_term_or(column_id, shoulds, k, filter, floor_eff)
+                .await;
         }
+        // Build must cursors; if any must is missing, the
+        // intersection is empty.
+        let must_cursors = self.build_term_cursors(column_id, musts).await?;
+        if must_cursors.len() != musts.len() {
+            return Ok(Vec::new());
+        }
+        if shoulds.is_empty() {
+            return self.run_and_intersect(column_id, must_cursors, k, filter, floor_eff);
+        }
+        // Shoulds absent from this superfile contribute nothing;
+        // when none survive, the walk is a plain must intersection.
+        let should_cursors = self.build_term_cursors(column_id, shoulds).await?;
+        if should_cursors.is_empty() {
+            return self.run_and_intersect(column_id, must_cursors, k, filter, floor_eff);
+        }
+        self.run_must_should(
+            column_id,
+            must_cursors,
+            should_cursors,
+            k,
+            filter,
+            floor_eff,
+        )
     }
 
     /// Unranked token match over a **token list** — the no-scoring
@@ -1593,6 +1617,46 @@ impl FtsReader {
             floor_eff,
         };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        Ok(drain_top_k_desc(heap))
+    }
+
+    /// Ranked must+should walk: the match set is the musts'
+    /// intersection (driven by the same flat-merge as
+    /// [`run_and_intersect`](Self::run_and_intersect), so the two
+    /// always agree on which docs match), and each matching doc's
+    /// score additionally collects every should term that lands on it.
+    /// Shoulds never affect matching — a doc containing every must and
+    /// no should still matches, with its must-only score.
+    fn run_must_should(
+        &self,
+        column_id: u32,
+        mut must_cursors: Vec<TermCursor>,
+        should_cursors: Vec<TermCursor>,
+        k: usize,
+        filter: Option<&mut ExcludeFilter>,
+        floor_eff: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        debug_assert!(
+            !must_cursors.is_empty() && !should_cursors.is_empty(),
+            "dispatch routes empty-side shapes to the AND/OR kernels"
+        );
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        must_cursors.sort_by_key(|c| c.block_count());
+
+        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
+        let mut sink = MustShouldSink {
+            heap: &mut heap,
+            k,
+            filter,
+            floor_eff,
+            shoulds: should_cursors,
+            should_ub,
+            dl_norm_k1,
+        };
+        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
         Ok(drain_top_k_desc(heap))
     }
 
@@ -2383,6 +2447,39 @@ impl FtsReader {
                     if d >= window_end {
                         break;
                     }
+                    let pos = c.pos;
+                    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
+                        let doc_ids = [
+                            c.block_doc_ids[pos],
+                            c.block_doc_ids[pos + 1],
+                            c.block_doc_ids[pos + 2],
+                            c.block_doc_ids[pos + 3],
+                        ];
+                        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
+                            let contributions = bm25::score_one_term_x4(
+                                c.idf_x_k1p1,
+                                [
+                                    c.block_tfs[pos],
+                                    c.block_tfs[pos + 1],
+                                    c.block_tfs[pos + 2],
+                                    c.block_tfs[pos + 3],
+                                ],
+                                [
+                                    dl_norm_k1[doc_ids[0] as usize],
+                                    dl_norm_k1[doc_ids[1] as usize],
+                                    dl_norm_k1[doc_ids[2] as usize],
+                                    dl_norm_k1[doc_ids[3] as usize],
+                                ],
+                            );
+                            for lane in 0..bm25::SCORE_SIMD_LANES {
+                                let local = (doc_ids[lane] - base) as usize;
+                                scores[local] += contributions[lane];
+                                present[local >> 6] |= 1u64 << (local & 63);
+                            }
+                            c.advance_by(bm25::SCORE_SIMD_LANES);
+                            continue;
+                        }
+                    }
                     let local = (d - base) as usize;
                     scores[local] += bm25::score_with_dl_norm_k1(
                         c.idf_x_k1p1,
@@ -2829,6 +2926,66 @@ impl AndSink for ScoreSink<'_> {
 
     fn emit(&mut self, doc: u32, score: f32) {
         // Floor gate: strictly-below-floor docs are dead to the caller.
+        if score > self.floor_eff {
+            and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+        }
+    }
+}
+
+/// Ranked must+should sink: scores the must intersection like
+/// [`ScoreSink`], then adds each should term's contribution for docs
+/// it lands on before heap admission. The should cursors ride inside
+/// the sink — the AND walk emits docs in ascending order, so each
+/// should list is `skip_to`-streamed forward at most once per query,
+/// exactly like [`ExcludeFilter`]'s negated cursors.
+struct MustShouldSink<'a> {
+    heap: &'a mut BinaryHeap<TopKEntry>,
+    k: usize,
+    filter: Option<&'a mut ExcludeFilter>,
+    floor_eff: f32,
+    shoulds: Vec<TermCursor>,
+    /// Σ `term_max_bm25` over the should cursors — the most the
+    /// shoulds can add to any single doc's score.
+    should_ub: f32,
+    /// Per-doc BM25 length normalization for the column, for scoring
+    /// the should terms at emitted docs.
+    dl_norm_k1: &'a [f32],
+}
+
+impl AndSink for MustShouldSink<'_> {
+    fn bar(&self) -> f32 {
+        // The AND walk's block-max arithmetic bounds the MUST portion
+        // of a doc's score only, so the pruning bar is lowered by the
+        // most the shoulds could add: a must block that can't reach
+        // (kth-best − should_ub) can't produce a top-k doc even with
+        // every should matching at its maximum.
+        let full_bar = if self.heap.len() >= self.k {
+            self.heap
+                .peek()
+                .expect("heap len == k")
+                .0
+                .max(self.floor_eff)
+        } else {
+            self.floor_eff
+        };
+        full_bar - self.should_ub
+    }
+
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn emit(&mut self, doc: u32, must_score: f32) {
+        let norm = self.dl_norm_k1[doc as usize];
+        let mut score = must_score;
+        for c in &mut self.shoulds {
+            c.skip_to(doc);
+            if !c.is_exhausted() && c.current_doc_id() == doc {
+                score += bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), norm);
+            }
+        }
+        // Floor gate on the FULL score — a must-only score below the
+        // floor can still survive once its shoulds are added.
         if score > self.floor_eff {
             and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
         }
@@ -3478,19 +3635,41 @@ impl TermCursor {
 
     /// Advance one position. Crosses block boundaries automatically;
     /// decodes the next block on demand.
+    #[inline(always)]
     fn next(&mut self) {
         if self.is_exhausted() {
             return;
         }
         self.pos += 1;
         if self.pos >= self.block_n {
-            self.current_block += 1;
-            if self.current_block > self.inspect_block {
-                self.inspect_block = self.current_block;
-            }
-            if self.current_block < self.blocks.len() {
-                self.decode_current_block();
-            }
+            self.advance_block();
+        }
+    }
+
+    /// Advance a known in-block batch, crossing to the next block when
+    /// `count` consumes its remaining postings. Unlike [`Self::next`],
+    /// callers must not start at or advance past the decoded block end.
+    #[inline(always)]
+    fn advance_by(&mut self, count: usize) {
+        debug_assert!(!self.is_exhausted());
+        debug_assert!(count > 0 && self.pos + count <= self.block_n);
+        self.pos += count;
+        // The assertion above makes equality equivalent to `>=` here.
+        if self.pos == self.block_n {
+            self.advance_block();
+        }
+    }
+
+    /// Move to and decode the next posting block, or mark the cursor
+    /// exhausted when the current block is the last one.
+    #[inline(always)]
+    fn advance_block(&mut self) {
+        self.current_block += 1;
+        if self.current_block > self.inspect_block {
+            self.inspect_block = self.current_block;
+        }
+        if self.current_block < self.blocks.len() {
+            self.decode_current_block();
         }
     }
 
@@ -4335,7 +4514,7 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         // "runtime" hits docs 0 and 1; negate "async" (only in doc 0).
         let hits = r
-            .search_excluding("body", &["runtime"], &["async"], 10, BoolMode::Or)
+            .search_excluding("body", &[], &["runtime"], &["async"], 10, f32::NEG_INFINITY)
             .await
             .expect("search excluding");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -4347,7 +4526,7 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let err = r
-            .search_excluding("body", &[], &["rust"], 10, BoolMode::Or)
+            .search_excluding("body", &[], &[], &["rust"], 10, f32::NEG_INFINITY)
             .await
             .expect_err("negation-only");
         assert!(matches!(err, FtsError::NegationOnly));
@@ -4358,7 +4537,7 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let hits = r
-            .search_excluding("body", &[], &[], 10, BoolMode::Or)
+            .search_excluding("body", &[], &[], &[], 10, f32::NEG_INFINITY)
             .await
             .expect("empty");
         assert!(hits.is_empty());
@@ -4586,7 +4765,7 @@ mod tests {
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into()).expect("register");
         for i in 0..N_DOCS {
-            let mut text = String::from("alpha "); // ~every doc
+            let mut text = String::from("alpha zeta eta theta "); // ~every doc
             if i % 2 == 0 {
                 text.push_str("beta ");
             }
@@ -4604,12 +4783,23 @@ mod tests {
         let blob = Bytes::from(b.finish().expect("finish"));
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        let uniform_terms: &[&str] = &["zeta", "eta", "theta"];
+        let uniform_cursors = r
+            .build_term_cursors(col, uniform_terms)
+            .await
+            .expect("uniform cursors");
+        assert!(
+            prefer_windowed_union(&uniform_cursors),
+            "production router should select windowed union for equal upper bounds"
+        );
 
         let shapes: &[&[&str]] = &[
             &["alpha", "beta"],
             &["alpha", "beta", "gamma"],
             &["beta", "gamma", "delta"], // no single dominator
             &["alpha", "beta", "gamma", "delta", "epsilon"],
+            uniform_terms,
         ];
         for terms in shapes {
             for k in [1usize, 5, 50, 1000] {

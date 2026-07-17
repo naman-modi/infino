@@ -34,14 +34,14 @@
 //! score` ascending lists nearest neighbours first. See
 //! [`SuperfileHit::score`].
 
-use std::{any::Any, collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use arrow::compute::cast;
 use arrow_array::{Array, ArrayRef, Float32Array, ListArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
+    catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
@@ -112,7 +112,8 @@ impl VectorSearchFunc {
 }
 
 impl TableFunctionImpl for VectorSearchFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != VECTOR_SEARCH_ARG_COUNT {
             return Err(DataFusionError::Plan(format!(
                 "vector_search expects {VECTOR_SEARCH_ARG_COUNT} arguments \
@@ -165,10 +166,6 @@ impl fmt::Debug for VectorSearchTable {
 
 #[async_trait]
 impl TableProvider for VectorSearchTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -315,10 +312,6 @@ impl DisplayAs for VectorSearchExec {
 impl ExecutionPlan for VectorSearchExec {
     fn name(&self) -> &'static str {
         "VectorSearchExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1017,15 +1010,15 @@ mod tests {
         let st = supertable_one_superfile(dim, 8);
         let reader = Arc::new(st.reader());
         let scalar_schema = reader.options().scalar_schema();
+        use crate::supertable::query::exec::common::test_support::call_tvf;
         let func = VectorSearchFunc::new(reader, scalar_schema);
-        let table = func
-            .call(&[lit("emb"), lit(csv_one_hot(dim, 0)), lit(5_i64)])
+        let table = call_tvf(&func, &[lit("emb"), lit(csv_one_hot(dim, 0)), lit(5_i64)])
             .expect("vector table");
 
         let dbg = format!("{table:?}");
         assert!(dbg.contains("VectorSearchTable"), "Debug missing: {dbg}");
         assert!(
-            table.as_any().downcast_ref::<VectorSearchTable>().is_some(),
+            table.downcast_ref::<VectorSearchTable>().is_some(),
             "as_any downcasts to VectorSearchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);

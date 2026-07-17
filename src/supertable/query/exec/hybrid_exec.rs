@@ -43,13 +43,13 @@
 //! `(superfile, local_doc_id)`, so a document surfaced by *both*
 //! retrievers is boosted above one surfaced by a single retriever.
 
-use std::{any::Any, cmp::Ordering, collections::HashMap, fmt, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, fmt, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
+    catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableType},
@@ -229,7 +229,8 @@ impl HybridSearchFunc {
 }
 
 impl TableFunctionImpl for HybridSearchFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != HYBRID_SEARCH_ARG_COUNT {
             return Err(DataFusionError::Plan(format!(
                 "hybrid_search expects {HYBRID_SEARCH_ARG_COUNT} arguments \
@@ -291,10 +292,6 @@ impl fmt::Debug for HybridSearchTable {
 
 #[async_trait]
 impl TableProvider for HybridSearchTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -424,10 +421,6 @@ impl DisplayAs for HybridSearchExec {
 impl ExecutionPlan for HybridSearchExec {
     fn name(&self) -> &'static str {
         "HybridSearchExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1017,21 +1010,24 @@ mod tests {
         let st = demo(dim);
         let reader = Arc::new(st.reader());
         let scalar_schema = reader.options().scalar_schema();
+        use crate::supertable::query::exec::common::test_support::call_tvf;
         let func = HybridSearchFunc::new(reader, scalar_schema);
-        let table = func
-            .call(&[
+        let table = call_tvf(
+            &func,
+            &[
                 lit("title"),
                 lit("rust"),
                 lit("emb"),
                 lit(csv_one_hot(dim, 0)),
                 lit(5_i64),
-            ])
-            .expect("hybrid table");
+            ],
+        )
+        .expect("hybrid table");
 
         let dbg = format!("{table:?}");
         assert!(dbg.contains("HybridSearchTable"), "Debug missing: {dbg}");
         assert!(
-            table.as_any().downcast_ref::<HybridSearchTable>().is_some(),
+            table.downcast_ref::<HybridSearchTable>().is_some(),
             "as_any downcasts to HybridSearchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);

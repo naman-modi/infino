@@ -27,12 +27,12 @@
 //! uniformity with the other search TVFs) but constant `0.0`. Order is
 //! unspecified — add a SQL `ORDER BY` / `LIMIT` for control.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
+    catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableType},
@@ -114,7 +114,8 @@ impl TokenMatchFunc {
 }
 
 impl TableFunctionImpl for TokenMatchFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 2 && args.len() != 3 {
             return Err(DataFusionError::Plan(format!(
                 "token_match expects 2 or 3 arguments (column, query[, mode]), got {}",
@@ -162,7 +163,8 @@ impl ExactMatchFunc {
 }
 
 impl TableFunctionImpl for ExactMatchFunc {
-    fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 2 {
             return Err(DataFusionError::Plan(format!(
                 "exact_match expects 2 arguments (column, value), got {}",
@@ -207,10 +209,6 @@ impl fmt::Debug for MatchTable {
 
 #[async_trait]
 impl TableProvider for MatchTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -317,10 +315,6 @@ impl DisplayAs for MatchExec {
 impl ExecutionPlan for MatchExec {
     fn name(&self) -> &'static str {
         "MatchExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -634,7 +628,7 @@ mod tests {
         let _ = exec.properties();
         // `as_any` downcasts back to the concrete type.
         let arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
-        assert!(arc.as_any().downcast_ref::<MatchExec>().is_some());
+        assert!(arc.downcast_ref::<MatchExec>().is_some());
 
         // `with_new_children` returns the same node (it has none).
         let same = Arc::clone(&arc)
@@ -706,15 +700,15 @@ mod tests {
     fn token_and_exact_func_call_reject_bad_arity() {
         // Direct `TableFunctionImpl::call` arity checks, without the
         // SQL layer. A live reader keeps the WeakReader upgrade-able.
-        use datafusion::catalog::TableFunctionImpl;
+        use crate::supertable::query::exec::common::test_support::call_tvf;
         let st = demo();
         let reader = Arc::new(st.reader());
         let scalar_schema = reader.options().scalar_schema();
         let tf = TokenMatchFunc::new(Arc::clone(&reader), Arc::clone(&scalar_schema));
         // 1 arg → error; 2 args → ok.
-        assert!(tf.call(&[]).is_err(), "0 args must fail");
+        assert!(call_tvf(&tf, &[]).is_err(), "0 args must fail");
         let ef = ExactMatchFunc::new(reader, scalar_schema);
-        assert!(ef.call(&[]).is_err(), "0 args must fail");
+        assert!(call_tvf(&ef, &[]).is_err(), "0 args must fail");
     }
 
     /// Construct `MatchTable` directly through the `token_match` TVF
@@ -723,22 +717,21 @@ mod tests {
     /// execution touches.
     #[test]
     fn match_table_trait_methods() {
-        use datafusion::{catalog::TableFunctionImpl, logical_expr::TableType, prelude::lit};
+        use datafusion::{logical_expr::TableType, prelude::lit};
 
         use super::MatchTable;
+        use crate::supertable::query::exec::common::test_support::call_tvf;
 
         let st = demo();
         let reader = Arc::new(st.reader());
         let scalar_schema = reader.options().scalar_schema();
         let func = TokenMatchFunc::new(reader, scalar_schema);
-        let table = func
-            .call(&[lit("title"), lit("rust")])
-            .expect("match table");
+        let table = call_tvf(&func, &[lit("title"), lit("rust")]).expect("match table");
 
         let dbg = format!("{table:?}");
         assert!(dbg.contains("MatchTable"), "Debug missing: {dbg}");
         assert!(
-            table.as_any().downcast_ref::<MatchTable>().is_some(),
+            table.downcast_ref::<MatchTable>().is_some(),
             "as_any downcasts to MatchTable"
         );
         assert_eq!(table.table_type(), TableType::Base);
