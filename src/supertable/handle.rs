@@ -602,7 +602,7 @@ impl Supertable {
         self.inner.options.user_schema()
     }
 
-    /// Cached per-table SQL schemas (scan view + declared string types).
+    /// Cached per-table SQL schemas (scan view + scalar schema).
     pub(crate) fn sql_schemas(&self) -> Arc<SqlSchemas> {
         self.inner.sql_schemas()
     }
@@ -1022,7 +1022,7 @@ impl SupertableReader {
         &self.inner.options
     }
 
-    /// Cached per-table SQL schemas (scan view + declared string types).
+    /// Cached per-table SQL schemas (scan view + scalar schema).
     pub(crate) fn sql_schemas(&self) -> Arc<SqlSchemas> {
         self.inner.sql_schemas()
     }

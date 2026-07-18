@@ -29,7 +29,7 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
 use dashmap::DashMap;
 use datafusion::{config::Dialect, error::DataFusionError};
 use futures::future::try_join_all;
@@ -56,7 +56,6 @@ use crate::{
     supertable::{
         Supertable,
         options::{Consistency, SupertableOptions},
-        query::sql::{cast_back_schema, cast_back_views},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
@@ -622,23 +621,6 @@ impl Connection {
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone());
 
-        // Declared string types for cast-back, from each table's cached map (so
-        // a wide schema is walked once per table, not per query). A single-table
-        // query uses its map directly; a join merges, first table winning a name
-        // collision (rare).
-        let declared: Arc<HashMap<String, DataType>> = match handles.as_slice() {
-            [single] => Arc::clone(single.sql_schemas().declared()),
-            tables => {
-                let mut merged = HashMap::new();
-                for t in tables {
-                    for (name, ty) in t.sql_schemas().declared().iter() {
-                        merged.entry(name.clone()).or_insert_with(|| ty.clone());
-                    }
-                }
-                Arc::new(merged)
-            }
-        };
-
         let sql = sql.to_owned();
         let drive = async move {
             let df = ctx
@@ -648,20 +630,16 @@ impl Connection {
 
             // A RecordBatch carries the schema; an empty Vec does not. Capture
             // the output schema before collect() consumes the DataFrame so a
-            // zero-row result returns one empty batch with the projected
-            // schema, rather than a schema-less Vec — which the Python binding's
-            // Table.from_batches([]) can't build from. `cast_back_schema` so the
-            // empty-result schema matches the cast-back applied below.
-            let output_schema: SchemaRef = cast_back_schema(df.schema().inner(), &declared);
+            // zero-row result returns one empty batch with the projected schema,
+            // rather than a schema-less Vec, which the Python binding's
+            // Table.from_batches([]) can't build from. The scan's `Utf8View`
+            // columns are already coerced back to `LargeUtf8` here by
+            // `expand_views_at_output`, so the schema needs no further fixup.
+            let output_schema: SchemaRef = df.schema().inner().clone();
             let batches = df
                 .collect()
                 .await
                 .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
-
-            // Views are internal to the scan; restore each result column to its
-            // declared type before it leaves the public API.
-            let batches = cast_back_views(batches, &declared)
-                .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
             if batches.is_empty() {
                 Ok(vec![RecordBatch::new_empty(output_schema)])
             } else {
@@ -1745,10 +1723,9 @@ mod tests {
         );
     }
 
-    /// Public-path cast-back: a non-FTS `LargeUtf8` column is scanned as
-    /// `Utf8View` but `Connection::query_sql` (the public entry point) returns
-    /// it as the declared `LargeUtf8`, so no `Utf8View` leaks to a caller. The
-    /// public-path version of the internal-reader test in `sql.rs`.
+    /// Public path: a non-FTS `LargeUtf8` column is scanned as `Utf8View`, but
+    /// `Connection::query_sql` returns it as `LargeUtf8` (the scan view is
+    /// coerced at the plan output), so no `Utf8View` leaks to a caller.
     #[test]
     fn query_sql_public_string_result_is_large_utf8_not_view() {
         let conn = connect("memory://").expect("connect");
@@ -1781,9 +1758,31 @@ mod tests {
         );
     }
 
-    /// Cross-table join whose key is a viewed string column: exercises the
-    /// multi-table declared-type merge and confirms the join key comes back the
-    /// declared `LargeUtf8`, not a view.
+    /// Ungrouped `MIN`/`MAX` over a viewed string column through the public
+    /// path (the shape that regressed before `expand_views_at_output`): must
+    /// not error and returns `LargeUtf8`.
+    #[test]
+    fn query_sql_public_ungrouped_min_max_string() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["beta", "alpha", "gamma"]))
+            .expect("append");
+
+        let batches = conn
+            .query_sql("SELECT MIN(title) lo, MAX(title) hi, COUNT(*) n FROM docs")
+            .expect("ungrouped min/max over a viewed column");
+        let lo = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("MIN(title) is LargeUtf8");
+        assert_eq!(lo.value(0), "alpha");
+    }
+
+    /// Cross-table join whose key is a viewed string column: the join key comes
+    /// back `LargeUtf8`, not a view.
     #[test]
     fn query_sql_join_across_tables_on_string_column() {
         let conn = connect("memory://").expect("connect");

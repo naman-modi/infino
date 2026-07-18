@@ -46,14 +46,11 @@
 //! of each superfile was written with this same scalar schema, so
 //! round-trip shape matches without projection or rewrite.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
-use arrow::{compute::cast, record_batch::RecordBatch};
+use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion::{error::DataFusionError, execution::context::SessionContext, prelude::Expr};
 
 use crate::{
@@ -79,13 +76,10 @@ use crate::{
 /// - `scalar`: id + scalar + FTS columns, no vectors. What the search TVFs bind to.
 /// - `scan`: `scalar` with non-FTS strings viewed as `Utf8View`
 ///   (`view_string_schema`). What the provider plans against.
-/// - `declared`: name -> declared string type, for `cast_back_views` at the
-///   result boundary.
 #[derive(Clone)]
 pub(crate) struct SqlSchemas {
     scalar: SchemaRef,
     scan: SchemaRef,
-    declared: Arc<HashMap<String, DataType>>,
 }
 
 impl SqlSchemas {
@@ -97,11 +91,6 @@ impl SqlSchemas {
     /// String-viewed schema the provider plans against.
     pub(crate) fn scan(&self) -> &SchemaRef {
         &self.scan
-    }
-
-    /// Declared string types, for restoring result columns at the boundary.
-    pub(crate) fn declared(&self) -> &Arc<HashMap<String, DataType>> {
-        &self.declared
     }
 }
 
@@ -116,12 +105,7 @@ pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
         .map(|c| c.column.as_str())
         .collect();
     let scan = view_string_schema(&scalar, &fts);
-    let declared = Arc::new(declared_string_types(&scalar));
-    SqlSchemas {
-        scalar,
-        scan,
-        declared,
-    }
+    SqlSchemas { scalar, scan }
 }
 
 /// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
@@ -131,106 +115,6 @@ fn exec_query_error(e: DataFusionError) -> QueryError {
         DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg),
         other => QueryError::Execute(other.to_string()),
     }
-}
-
-/// Name -> declared type for the string columns of the queried table(s). These
-/// are the only columns cast-back can restore to a user-declared type; non-string
-/// columns are irrelevant and skipped.
-pub(crate) fn declared_string_types(schema: &Schema) -> HashMap<String, DataType> {
-    schema
-        .fields()
-        .iter()
-        .filter(|f| {
-            matches!(
-                f.data_type(),
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-            )
-        })
-        .map(|f| (f.name().clone(), f.data_type().clone()))
-        .collect()
-}
-
-/// The type a result field should carry after cast-back, or `None` to leave it.
-///
-/// Only `Utf8View` result columns are touched (the scan views strings for
-/// speed). A view column is matched by name to `declared`: a column the user
-/// declared `Utf8View` is kept, one declared `Utf8`/`LargeUtf8` is restored to
-/// exactly that type. A view column with no declared match (an aggregate,
-/// alias, or other computed value) has no user-declared type, so it defaults to
-/// `LargeUtf8`.
-fn cast_back_type(field: &Field, declared: &HashMap<String, DataType>) -> Option<DataType> {
-    if field.data_type() != &DataType::Utf8View {
-        return None;
-    }
-    let target = declared
-        .get(field.name())
-        .cloned()
-        .unwrap_or(DataType::LargeUtf8);
-
-    (&target != field.data_type()).then_some(target)
-}
-
-/// Result schema after cast-back: each `Utf8View` field rewritten to its
-/// [`cast_back_type`], others unchanged. Types a zero-row result to match what
-/// a populated one returns.
-pub(crate) fn cast_back_schema(result: &Schema, declared: &HashMap<String, DataType>) -> SchemaRef {
-    let fields = result
-        .fields()
-        .iter()
-        .map(|f| match cast_back_type(f, declared) {
-            // clone + retype: keeps nullability and metadata (`Field::new` drops it).
-            Some(t) => Arc::new(f.as_ref().clone().with_data_type(t)),
-            None => Arc::clone(f),
-        })
-        .collect::<Vec<_>>();
-
-    Arc::new(Schema::new_with_metadata(fields, result.metadata().clone()))
-}
-
-/// Undo the scan's string viewing at the result boundary: cast each `Utf8View`
-/// column to its [`cast_back_type`], leave the rest. Keeps a user-declared
-/// `Utf8View` intact, restores columns we viewed to their declared type, and
-/// defaults computed view columns to `LargeUtf8`. Results are bounded, so the
-/// cast is cheap; no view column means no work.
-pub(crate) fn cast_back_views(
-    batches: Vec<RecordBatch>,
-    declared: &HashMap<String, DataType>,
-) -> Result<Vec<RecordBatch>, QueryError> {
-    let Some(first) = batches.first() else {
-        return Ok(batches);
-    };
-
-    if !first
-        .schema()
-        .fields()
-        .iter()
-        .any(|f| f.data_type() == &DataType::Utf8View)
-    {
-        return Ok(batches);
-    }
-
-    let target = cast_back_schema(first.schema().as_ref(), declared);
-    batches
-        .into_iter()
-        .map(|b| {
-            let cols = b
-                .columns()
-                .iter()
-                .zip(target.fields())
-                .map(|(c, tf)| {
-                    if c.data_type() == tf.data_type() {
-                        Ok(Arc::clone(c))
-                    } else {
-                        cast(c, tf.data_type())
-                            .map_err(|e| QueryError::Execute(format!("utf8view cast-back: {e}")))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            RecordBatch::try_new(Arc::clone(&target), cols)
-                .map_err(|e| QueryError::Execute(format!("utf8view cast-back rebuild: {e}")))
-        })
-        .collect()
 }
 
 impl SupertableReader {
@@ -265,10 +149,6 @@ impl SupertableReader {
         // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
 
-        // Cached declared string types: cast-back restores each result column
-        // to what the user declared (and keeps a declared `Utf8View`).
-        let schemas = self.sql_schemas();
-
         let sql = sql.to_owned();
         let drive = async move {
             let df = ctx
@@ -276,8 +156,10 @@ impl SupertableReader {
                 .await
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
 
-            let batches = df.collect().await.map_err(exec_query_error)?;
-            cast_back_views(batches, schemas.declared())
+            // The scan runs strings as `Utf8View`; `expand_views_at_output`
+            // (set in `budgeted_session_context`) coerces them back to
+            // `LargeUtf8` at the plan output, so the result carries no view.
+            df.collect().await.map_err(exec_query_error)
         };
 
         // Drive through the shared sync→async bridge: ambient
@@ -466,7 +348,7 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
@@ -482,11 +364,7 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            Supertable, SupertableOptions,
-            error::QueryError,
-            query::sql::{
-                build_sql_schemas, cast_back_schema, cast_back_views, declared_string_types,
-            },
+            Supertable, SupertableOptions, error::QueryError, query::sql::build_sql_schemas,
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -749,10 +627,10 @@ mod tests {
         );
     }
 
-    // ---- Utf8View scan / cast-back ----------------------------------------
+    // ---- Utf8View scan ----------------------------------------------------
 
-    /// The scan runs strings as `Utf8View`; the result is cast back to the
-    /// declared type so no view leaks to a caller. Gate for the common case: a
+    /// The scan runs strings as `Utf8View`, but `expand_views_at_output` coerces
+    /// them to `LargeUtf8` at the plan output, so no view leaks to a caller: a
     /// GROUP BY key on a `LargeUtf8` column comes back `LargeUtf8`, not a view.
     #[test]
     fn query_sql_string_group_by_key_is_large_utf8_not_view() {
@@ -791,13 +669,13 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .expect("category is LargeUtf8 after cast-back");
+            .expect("category is LargeUtf8");
         let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
         assert_eq!(got, vec!["go", "python", "rust"]);
     }
 
     /// Grouped `MIN(string)` aggregates on the view and returns `LargeUtf8`
-    /// after cast-back, with correct per-group minima.
+    ///, with correct per-group minima.
     #[test]
     fn query_sql_grouped_min_string_is_large_utf8() {
         let st = seeded(&["rust", "rust", "go", "go"], &["b", "a", "d", "c"]);
@@ -812,183 +690,40 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .expect("category is LargeUtf8 after cast-back");
+            .expect("category is LargeUtf8");
         let m = batches[0]
             .column(1)
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .expect("MIN(title) is LargeUtf8 after cast-back");
+            .expect("MIN(title) is LargeUtf8");
         let got: Vec<(&str, &str)> = (0..cat.len()).map(|i| (cat.value(i), m.value(i))).collect();
         assert_eq!(got, vec![("go", "c"), ("rust", "a")]);
     }
 
-    /// KNOWN LIMITATION: an *ungrouped* `MIN`/`MAX(string)` over a `Utf8View`
-    /// column trips a DataFusion 53.1 `ProjectionPushdown` bug (`Schema
-    /// mismatch: Utf8View vs LargeUtf8`) before the cast-back can run. Grouped
-    /// MIN/MAX (above) is fine. Re-check on a DataFusion upgrade; if fixed
-    /// there, un-ignore this.
+    /// Ungrouped `MIN(string)` over a viewed column. On its own this trips a
+    /// DataFusion `ProjectionPushdown` schema mismatch (`Utf8View` vs
+    /// `LargeUtf8`); `expand_views_at_output` (set in `budgeted_session_context`)
+    /// coerces the view at the plan output and sidesteps it. Returns `LargeUtf8`.
     #[test]
-    #[ignore = "DataFusion 53.1 ProjectionPushdown bug on ungrouped MIN/MAX over Utf8View"]
-    fn query_sql_ungrouped_min_string_datafusion53_projection_pushdown_bug() {
+    fn query_sql_ungrouped_min_string() {
         let st = seeded(&["rust", "go", "python"], &["a", "b", "c"]);
         let batches = st
             .reader()
             .query_sql("SELECT MIN(category) AS m FROM supertable")
-            .expect("ungrouped min (fails on DF 53.1 with the view)");
+            .expect("ungrouped min");
         let col = batches[0]
             .column(0)
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .expect("MIN(string) is LargeUtf8 after cast-back");
+            .expect("MIN(string) is LargeUtf8");
         assert_eq!(col.value(0), "go");
     }
 
-    /// A declared map covering the three string cases the cast-back must honor.
-    fn declared(pairs: &[(&str, DataType)]) -> HashMap<String, DataType> {
-        pairs
-            .iter()
-            .map(|(n, t)| (n.to_string(), t.clone()))
-            .collect()
-    }
-
-    /// Unit: cast-back restores each `Utf8View` result column to its declared
-    /// type. A declared `Utf8View` is kept, a declared `Utf8`/`LargeUtf8` is
-    /// restored to exactly that (no widening), a column with no declared match
-    /// (computed) defaults to `LargeUtf8`, and non-string columns are untouched.
-    #[test]
-    fn cast_back_views_restores_each_column_to_its_declared_type() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("large", DataType::Utf8View, false), // declared LargeUtf8, viewed
-            Field::new("small", DataType::Utf8View, false), // declared Utf8, viewed
-            Field::new("keep", DataType::Utf8View, false),  // declared Utf8View, keep
-            Field::new("agg", DataType::Utf8View, false),   // computed, no declared type
-            Field::new("n", DataType::Int64, false),        // non-string
-        ]));
-        let str_col = || Arc::new(StringViewArray::from(vec!["a", "b"]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                str_col(),
-                str_col(),
-                str_col(),
-                str_col(),
-                Arc::new(Int64Array::from(vec![1, 2])),
-            ],
-        )
-        .expect("batch");
-
-        let declared = declared(&[
-            ("large", DataType::LargeUtf8),
-            ("small", DataType::Utf8),
-            ("keep", DataType::Utf8View),
-        ]);
-        let out = cast_back_views(vec![batch], &declared).expect("cast ok");
-        let s = out[0].schema();
-        assert_eq!(
-            s.field(0).data_type(),
-            &DataType::LargeUtf8,
-            "declared LargeUtf8 restored"
-        );
-        assert_eq!(
-            s.field(1).data_type(),
-            &DataType::Utf8,
-            "declared Utf8 restored, no widening"
-        );
-        assert_eq!(
-            s.field(2).data_type(),
-            &DataType::Utf8View,
-            "user-declared view kept"
-        );
-        assert_eq!(
-            s.field(3).data_type(),
-            &DataType::LargeUtf8,
-            "computed view defaults to LargeUtf8"
-        );
-        assert_eq!(
-            s.field(4).data_type(),
-            &DataType::Int64,
-            "non-string untouched"
-        );
-    }
-
-    /// Unit: nulls survive the cast-back intact.
-    #[test]
-    fn cast_back_views_preserves_nulls() {
-        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringViewArray::from(vec![
-                Some("a"),
-                None,
-                Some("c"),
-            ]))],
-        )
-        .expect("batch");
-        let out =
-            cast_back_views(vec![batch], &declared(&[("s", DataType::LargeUtf8)])).expect("cast");
-        let s = out[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("view -> LargeUtf8");
-        assert!(!s.is_null(0));
-        assert!(s.is_null(1), "null preserved through cast-back");
-        assert_eq!(s.value(2), "c");
-    }
-
-    /// Unit: a result with no view column takes the fast path unchanged.
-    #[test]
-    fn cast_back_views_without_views_is_unchanged() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "c",
-            DataType::LargeUtf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(LargeStringArray::from(vec!["x"]))])
-            .expect("batch");
-        let out =
-            cast_back_views(vec![batch], &declared(&[("c", DataType::LargeUtf8)])).expect("ok");
-        assert_eq!(out[0].column(0).data_type(), &DataType::LargeUtf8);
-    }
-
-    /// Unit: `cast_back_schema` yields the same per-column types the data cast
-    /// produces, and preserves nullability + metadata.
-    #[test]
-    fn cast_back_schema_matches_the_data_cast() {
-        let mut md = HashMap::new();
-        md.insert("k".to_string(), "v".to_string());
-        let result = Schema::new_with_metadata(
-            vec![
-                Field::new("keep", DataType::Utf8View, true),
-                Field::new("large", DataType::Utf8View, false),
-                Field::new("n", DataType::Int64, false),
-            ],
-            md,
-        );
-        let out = cast_back_schema(
-            &result,
-            &declared(&[("keep", DataType::Utf8View), ("large", DataType::LargeUtf8)]),
-        );
-        assert_eq!(
-            out.field(0).data_type(),
-            &DataType::Utf8View,
-            "declared view kept"
-        );
-        assert!(out.field(0).is_nullable(), "nullability preserved");
-        assert_eq!(out.field(1).data_type(), &DataType::LargeUtf8);
-        assert_eq!(out.field(2).data_type(), &DataType::Int64);
-        assert_eq!(
-            out.metadata().get("k").map(String::as_str),
-            Some("v"),
-            "metadata preserved"
-        );
-    }
-
     /// Unit: `build_sql_schemas` views the scan schema (non-FTS strings ->
-    /// `Utf8View`, FTS kept), keeps the plain `scalar`, and records declared
-    /// types. This is the walk done once per table.
+    /// `Utf8View`, FTS kept) and keeps the plain `scalar`. The walk done once
+    /// per table.
     #[test]
-    fn build_sql_schemas_views_scan_keeps_scalar_and_declares() {
+    fn build_sql_schemas_views_scan_and_keeps_scalar() {
         let s = build_sql_schemas(&options_id_cat_title());
         // scan: `category` (non-FTS string) viewed; `title` (FTS) kept.
         assert_eq!(
@@ -1014,9 +749,6 @@ mod tests {
                 .data_type(),
             &DataType::LargeUtf8,
         );
-        // declared: name -> declared type.
-        assert_eq!(s.declared().get("category"), Some(&DataType::LargeUtf8));
-        assert_eq!(s.declared().get("title"), Some(&DataType::LargeUtf8));
     }
 
     /// The per-table schemas are built once and memoized on the handle, not
@@ -1032,28 +764,60 @@ mod tests {
         );
     }
 
-    /// Unit: `declared_string_types` collects only string columns.
+    /// A NULL string value survives the view scan + output coercion.
     #[test]
-    fn declared_string_types_collects_string_columns_only() {
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::LargeUtf8, false),
-            Field::new("b", DataType::Utf8, false),
-            Field::new("c", DataType::Utf8View, false),
-            Field::new("n", DataType::Int64, false),
-        ]);
-        let m = declared_string_types(&schema);
-        assert_eq!(m.len(), 3, "only the three string columns");
-        assert_eq!(m.get("a"), Some(&DataType::LargeUtf8));
-        assert_eq!(m.get("b"), Some(&DataType::Utf8));
-        assert_eq!(m.get("c"), Some(&DataType::Utf8View));
-        assert!(!m.contains_key("n"), "non-string skipped");
+    fn query_sql_null_string_survives() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::LargeUtf8, true), // nullable, so we can plant a NULL
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool"),
+        );
+        let opts = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![Some("rust"), None, Some("go")])),
+                Arc::new(LargeStringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        let batches = st
+            .reader()
+            .query_sql("SELECT category FROM supertable")
+            .expect("select");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("category is LargeUtf8");
+        assert_eq!(col.null_count(), 1, "the NULL survives the view + coercion");
     }
 
-    /// A column the user explicitly declared `Utf8View` must come back
-    /// `Utf8View`: cast-back restores declared types, it does not force
-    /// `LargeUtf8` on a type the user chose.
+    /// A column the user declared `Utf8View` comes back `LargeUtf8`: the view
+    /// is an internal scan type, and `expand_views_at_output` coerces every
+    /// view to `LargeUtf8` at the plan output, so SQL results never expose one.
     #[test]
-    fn query_sql_keeps_user_declared_utf8view_column() {
+    fn query_sql_declared_utf8view_column_returns_large_utf8() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("category", DataType::Utf8View, false), // user declares a view
             Field::new("title", DataType::LargeUtf8, false),   // FTS column must be LargeUtf8
@@ -1094,8 +858,8 @@ mod tests {
             .expect("group-by");
         assert_eq!(
             batches[0].column(0).data_type(),
-            &DataType::Utf8View,
-            "a user-declared Utf8View column must not be rewritten by cast-back"
+            &DataType::LargeUtf8,
+            "views are internal; SQL results expose LargeUtf8, not Utf8View"
         );
     }
 
@@ -1119,7 +883,7 @@ mod tests {
     }
 
     /// String column projected through a CTE: the name survives, so it is
-    /// restored to its declared type.
+    /// returned as `LargeUtf8`.
     #[test]
     fn query_sql_cte_string_column_is_declared_type() {
         let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
@@ -1161,14 +925,14 @@ mod tests {
         assert_eq!(got, vec!["go", "rust"]);
     }
 
-    /// No data loss through the view + cast-back for values that stress
+    /// No data loss through the view + coercion for values that stress
     /// `Utf8View`'s layout: strings past the 12-byte inline limit (stored
     /// out-of-line), values sharing a 4-byte prefix (the view compares the
     /// prefix first, so it must fall through to the full bytes and keep them
     /// distinct), an empty string, and multi-byte unicode. GROUP BY exercises
-    /// both the comparison (distinct groups) and the cast-back (exact values).
+    /// both the comparison (distinct groups) and the coercion (exact values).
     #[test]
-    fn query_sql_string_values_survive_view_and_cast_back() {
+    fn query_sql_string_values_survive_view_and_coercion() {
         let vals = [
             "",                        // empty
             "short",                   // inline (<= 12 bytes)
@@ -1188,7 +952,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .expect("category is LargeUtf8 after cast-back");
+            .expect("category is LargeUtf8");
         let mut got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
         got.sort_unstable();
 
@@ -1207,7 +971,7 @@ mod tests {
     }
 
     /// `SELECT DISTINCT` on a viewed string column: dedup compares on the view,
-    /// result comes back the declared type.
+    /// result comes back `LargeUtf8`.
     #[test]
     fn query_sql_distinct_string_is_declared_type() {
         let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
@@ -1226,7 +990,7 @@ mod tests {
     }
 
     /// Self-join whose join key is a viewed string column: the equality runs on
-    /// `Utf8View`, and the projected key comes back its declared type.
+    /// `Utf8View`, and the projected key comes back `LargeUtf8`.
     #[test]
     fn query_sql_self_join_on_string_key() {
         let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);

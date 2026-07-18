@@ -210,9 +210,9 @@ impl fmt::Debug for SupertableProvider {
 ///
 /// - Why: a view compares a 4-byte prefix before full bytes, so string
 ///   GROUP BY / ORDER BY / equality skip most `memcmp`.
-/// - Stored bytes are unchanged; the result is cast back to each column's
-///   declared type at the query boundary (`cast_back_views`), so the view
-///   stays internal and a user-declared `Utf8View` is preserved.
+/// - Stored bytes are unchanged, and `expand_views_at_output` (set in
+///   `budgeted_session_context`) coerces the views back to `LargeUtf8` at the
+///   plan output, so the view stays internal and SQL results expose no view.
 /// - FTS columns keep their stored type: pruning resolves them by it, so
 ///   viewing one would silently disable its pruning.
 pub(crate) fn view_string_schema(schema: &Schema, fts_columns: &HashSet<&str>) -> SchemaRef {
