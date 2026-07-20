@@ -105,7 +105,7 @@ use crate::{
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
-            fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
+            fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
                 CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE, SUB_HEADER_SIZE,
@@ -2272,6 +2272,7 @@ mod tests {
             schema_id_title(),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(tok()),
