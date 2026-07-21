@@ -1955,6 +1955,15 @@ pub mod sql {
             name: "group_by_category",
             sql: "SELECT category, COUNT(*) AS n FROM supertable GROUP BY category",
         },
+        // High-cardinality GROUP BY: `title` is near-unique per row, so the
+        // group key set is ~n_docs. This is the shape where the aggregate's
+        // per-partition partial phase does almost no dedup yet re-hashes every
+        // key; the ORDER BY / LIMIT keeps the output small while still forcing
+        // the full high-cardinality group-id build.
+        SqlQuery {
+            name: "group_by_title_highcard",
+            sql: "SELECT title, COUNT(*) AS n FROM supertable GROUP BY title ORDER BY n DESC LIMIT 10",
+        },
     ];
 
     /// Query literals that depend on the built corpus (sample row values).
