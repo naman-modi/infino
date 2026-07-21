@@ -25,7 +25,7 @@
 //!   as length-prefixed bytes.
 //! - [`encode_vector_summary`] / [`decode_vector_summary`] —
 //!   custom packed: dim (LE u32), centroid (dim × LE f32),
-//!   radius (LE f32).
+//!   then the cluster-centroid block.
 //!
 //! Wrapped variants — [`encode_fts_summary_map`] /
 //! [`encode_vector_summary_map`] — emit the
@@ -36,20 +36,46 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::scalar::ScalarValue;
 use thiserror::Error;
 
-use crate::supertable::manifest::{
-    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+use crate::{
+    superfile::vector::distance::decode_f32_le_vec,
+    supertable::manifest::{
+        ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg, RabitqAdmitCodes,
+        VectorSummary,
+        bloom::Bloom,
+        list::{ScalarStatsAgg, ScalarValueCounts},
+    },
 };
+
+/// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).
+const CLUSTER_CENTROIDS_WIRE_FP32: u32 = 0x3233_4643;
+/// Wire tag for a routing-only summary block (`b"CFR0"`): counts plus
+/// the 1-bit admit slab, **no fp32 payload**. Written only into routing
+/// sibling artifacts that consumer opens fetch instead of the full form;
+/// decodes into the stripped in-memory shape (`vectors_resident()` =
+/// false), so exact scans read the superfile centroid regions.
+const CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY: u32 = 0x3052_4643;
+
+/// Which form of each summary cell's cluster block goes on the wire.
+///
+/// `Full` is the durable commit form (plain fp32, no slab — hydration
+/// prewarm rebuilds slabs from fp32). `RoutingOnly` is the consumer-open
+/// sibling: same entries, but every cluster block that carries a built
+/// admit slab is written as [`CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY`] —
+/// cells without a slab (degenerate dim mismatch) fall back to the full
+/// form so the sibling is always decodable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryWireMode {
+    Full,
+    RoutingOnly,
+}
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -118,8 +144,9 @@ pub enum EncodeError {
 // One RecordBatch carries every column's stats as length-1
 // columns named by suffix: `<col>__min` / `<col>__max`
 // (always, paired), plus optional `<col>__nulls` (UInt64),
-// `<col>__sum` (the column's SUM result type) and
-// `<col>__hll` (Binary, raw HLL registers). The logical
+// `<col>__sum` (the column's SUM result type),
+// `<col>__hll` (Binary, raw HLL registers), and
+// `<col>__value_counts` (Binary, nested Arrow IPC). The logical
 // schema is reconstructed at decode time by stripping the
 // suffixes; data types are preserved by the IPC format
 // itself. Decoding tolerates absent optional stats (segments
@@ -130,6 +157,9 @@ const MAX_SUFFIX: &str = "__max";
 const NULLS_SUFFIX: &str = "__nulls";
 const SUM_SUFFIX: &str = "__sum";
 const HLL_SUFFIX: &str = "__hll";
+const VALUE_COUNTS_SUFFIX: &str = "__value_counts";
+const VALUE_COUNTS_VALUE_FIELD: &str = "value";
+const VALUE_COUNTS_COUNT_FIELD: &str = "count";
 
 pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
     if stats.is_empty() {
@@ -183,6 +213,16 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
             ));
             arrays.push(Arc::new(BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef);
         }
+        if let Some(value_counts) = &agg.value_counts {
+            let encoded = encode_value_counts(value_counts)
+                .expect("value counts built from Arrow values must encode");
+            fields.push(Field::new(
+                format!("{key}{VALUE_COUNTS_SUFFIX}"),
+                DataType::Binary,
+                true,
+            ));
+            arrays.push(Arc::new(BinaryArray::from(vec![encoded.as_slice()])) as ArrayRef);
+        }
     }
     let schema = Arc::new(Schema::new(fields));
     let batch =
@@ -220,6 +260,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
     let mut null_counts: HashMap<String, u64> = HashMap::new();
     let mut sums: HashMap<String, ArrayRef> = HashMap::new();
     let mut hlls: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut value_counts: HashMap<String, ScalarValueCounts> = HashMap::new();
     for (i, field) in schema.fields().iter().enumerate() {
         let name = field.name();
         let column = batch.column(i);
@@ -249,6 +290,16 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
             if !arr.is_empty() && !arr.is_null(0) {
                 hlls.insert(base.to_string(), arr.value(0).to_vec());
             }
+        } else if let Some(base) = name.strip_suffix(VALUE_COUNTS_SUFFIX) {
+            let arr = column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    DecodeError::ArrowIpc(format!("{name}: __value_counts column is not Binary"))
+                })?;
+            if !arr.is_empty() && !arr.is_null(0) {
+                value_counts.insert(base.to_string(), decode_value_counts(arr.value(0))?);
+            }
         } else {
             return Err(DecodeError::ArrowIpc(format!(
                 "unrecognized stats column suffix: {name}"
@@ -270,6 +321,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         let null_count = null_counts.remove(&base);
         let sum = sums.remove(&base);
         let hll = hlls.remove(&base);
+        let value_counts = value_counts.remove(&base);
         stats.insert(
             base,
             ScalarStatsAgg {
@@ -278,6 +330,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
                 null_count,
                 sum,
                 hll,
+                value_counts,
             },
         );
     }
@@ -291,6 +344,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         .keys()
         .chain(sums.keys())
         .chain(hlls.keys())
+        .chain(value_counts.keys())
         .next()
     {
         return Err(DecodeError::ArrowIpc(format!(
@@ -298,6 +352,80 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         )));
     }
     Ok(stats)
+}
+
+pub(crate) fn encode_value_counts(
+    value_counts: &ScalarValueCounts,
+) -> Result<Vec<u8>, EncodeError> {
+    let values = ScalarValue::iter_to_array(
+        value_counts
+            .entries()
+            .iter()
+            .map(|(value, _)| value.clone()),
+    )
+    .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    let counts = Arc::new(UInt64Array::from_iter_values(
+        value_counts.entries().iter().map(|(_, count)| *count),
+    )) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(VALUE_COUNTS_VALUE_FIELD, values.data_type().clone(), false),
+        Field::new(VALUE_COUNTS_COUNT_FIELD, DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values, counts])
+        .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema)
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        writer
+            .finish()
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_value_counts(bytes: &[u8]) -> Result<ScalarValueCounts, DecodeError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+    if batches.len() != 1 {
+        return Err(DecodeError::UnexpectedBatchCount(batches.len()));
+    }
+    let batch = &batches[0];
+    if batch.num_columns() != 2 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "value counts expected 2 columns, got {}",
+            batch.num_columns()
+        )));
+    }
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| DecodeError::ArrowIpc("value counts count column is not UInt64".into()))?;
+    if batch.column(0).len() != counts.len() {
+        return Err(DecodeError::ArrowIpc(
+            "value counts value/count lengths differ".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(counts.len());
+    for row in 0..counts.len() {
+        if batch.column(0).is_null(row) || counts.is_null(row) {
+            return Err(DecodeError::ArrowIpc(
+                "value counts cannot contain nulls".into(),
+            ));
+        }
+        let value = ScalarValue::try_from_array(batch.column(0), row)
+            .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+        entries.push((value, counts.value(row)));
+    }
+    ScalarValueCounts::from_entries(entries)
+        .ok_or_else(|| DecodeError::ArrowIpc("invalid exact value counts".into()))
 }
 
 /// Encode a single length-1 [`ArrayRef`] as Arrow-IPC stream bytes —
@@ -419,13 +547,13 @@ pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
 pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     let mut c = Cursor::new(bytes);
     let bloom_len = read_u32(&mut c, "bloom_len")? as usize;
-    let bloom_bytes = read_n(&mut c, bloom_len, "bloom_bytes")?;
+    let bloom_bytes = view_n(&mut c, bloom_len, "bloom_bytes")?;
     // Empty bloom run ⇒ "no bloom info" (None); a non-empty run must be a
     // valid bloom layout.
     let term_bloom = if bloom_bytes.is_empty() {
         None
     } else {
-        Some(Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
+        Some(Bloom::from_bytes(bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
     };
     let n_terms_distinct = u64::from(read_u32(&mut c, "n_terms_distinct")?);
     let min_len = read_u32(&mut c, "min_term_len")? as usize;
@@ -456,108 +584,207 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 // Layout (all LE):
 //   u32 dim
 //   [dim × f32]   (centroid)
-//   f32 radius
+//   u32 n_cells
+//   per cell:
+//     u32 cell_id (`u32::MAX` = unscoped legacy IVF)
+//     u32 cluster_block_len
+//     cluster-centroid block
 // ---------------------------------------------------------
 
-pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
-    let dim = s.centroid.len();
-    let cl = &s.clusters;
+/// fp32 cluster-centroid block: `n_cent, dim, tag, counts[n_cent],
+/// centroids[n_cent*dim]` — all little-endian.
+pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     let nc = cl.n_cent as usize;
     let cd = cl.dim as usize;
-    let mut out = Vec::with_capacity(4 + dim * 4 + 4 + 8 + nc * (4 + 4 + 4) + nc * cd);
+    // A summary whose fp32 was dropped (`summary_centroids_from_superfiles`,
+    // read-only consumer memory mode) must never reach the wire: the
+    // slow-state blob and manifest parts are re-encoded from these resident
+    // structs, so persisting empty centroids would corrupt routing state
+    // for every future open. Fail loudly instead — only writer handles
+    // (which must keep the mode off) encode summaries.
+    assert!(
+        cl.centroids.len() == nc * cd,
+        "encode_cluster_centroids on a stripped summary ({} of {} fp32 values); \
+         writer handles must not enable summary_centroids_from_superfiles",
+        cl.centroids.len(),
+        nc * cd,
+    );
+    let body = nc * cd;
+    let mut out = Vec::with_capacity(12 + nc * 4 + body * 4);
+    out.extend_from_slice(&cl.n_cent.to_le_bytes());
+    out.extend_from_slice(&cl.dim.to_le_bytes());
+    out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_FP32.to_le_bytes());
+    for &c in &cl.counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    for &v in &cl.centroids {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Append the packed 1-bit admit slab (rot seed, word width, codes,
+/// norms) — the tail of the `CFR0` routing wire form.
+fn append_admit_slab(out: &mut Vec<u8>, admit: &RabitqAdmitCodes) {
+    out.extend_from_slice(&admit.rot_seed.to_le_bytes());
+    out.extend_from_slice(&(admit.words_per_code as u32).to_le_bytes());
+    for &word in &admit.codes {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for &norm in &admit.norms {
+        out.extend_from_slice(&norm.to_le_bytes());
+    }
+}
+
+/// Routing-only encoder (`CFR0`): counts plus the admit slab, no fp32
+/// payload. Reads only the slab and counts, so it works from both full
+/// and stripped instances. A cell without a built slab (degenerate dim
+/// mismatch — the prewarm skips those) falls back to the plain fp32
+/// form so the artifact stays decodable everywhere.
+pub(crate) fn encode_cluster_centroids_routing(cl: &ClusterCentroids) -> Vec<u8> {
+    let Some(admit) = cl.admit_codes_built() else {
+        return encode_cluster_centroids(cl);
+    };
+    let nc = cl.n_cent as usize;
+    let mut out =
+        Vec::with_capacity(12 + nc * 4 + 12 + admit.codes.len() * 8 + admit.norms.len() * 4);
+    out.extend_from_slice(&cl.n_cent.to_le_bytes());
+    out.extend_from_slice(&cl.dim.to_le_bytes());
+    out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY.to_le_bytes());
+    for &c in &cl.counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    append_admit_slab(&mut out, admit);
+    out
+}
+
+pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
+    let cdim = read_u32(&mut c, "cluster_dim")? as usize;
+
+    if n_cent == 0 {
+        return Ok(ClusterCentroids::empty());
+    }
+
+    let tag = read_u32(&mut c, "cluster_wire_tag")?;
+    if tag != CLUSTER_CENTROIDS_WIRE_FP32 && tag != CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY {
+        return Err(DecodeError::InvalidVectorSummary(format!(
+            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x} \
+             or {CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY:#010x}"
+        )));
+    }
+
+    let counts_b = view_n(&mut c, n_cent * 4, "cluster_counts")?;
+    let counts: Vec<u32> = counts_b
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("chunks_exact(4) yields 4-byte slices")))
+        .collect();
+
+    if tag == CLUSTER_CENTROIDS_WIRE_FP32 {
+        // n_cent * cdim can't overflow usize on 64-bit (both are u32), but
+        // the *4 byte size can — check the whole chain so a crafted header
+        // errors rather than wrapping to a short read (silent truncation).
+        let body_bytes = n_cent
+            .checked_mul(cdim)
+            .and_then(|body| body.checked_mul(4))
+            .ok_or_else(|| {
+                DecodeError::InvalidVectorSummary(format!(
+                    "cluster centroids byte size overflow: n_cent={n_cent} dim={cdim}"
+                ))
+            })?;
+        let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
+        let centroids = decode_f32_le_vec(centroids_b);
+        return Ok(ClusterCentroids::from_decoded(
+            n_cent as u32,
+            cdim as u32,
+            centroids,
+            counts,
+        ));
+    }
+
+    // Routing-only block (`CFR0`): no fp32 payload on the wire. The
+    // instance decodes into the stripped shape; exact scans read the
+    // slow-CAS centroid section (hidden) or full parts (user) instead.
+
+    let rot_seed = read_u64(&mut c, "admit_rot_seed")?;
+    let words_per_code = read_u32(&mut c, "admit_words_per_code")? as usize;
+    // Reject a header whose word width disagrees with the declared dim —
+    // scoring would slice the code slab at the wrong stride.
+    let expected_words = cdim.div_ceil(ADMIT_CODE_WORD_BITS);
+    if words_per_code != expected_words {
+        return Err(DecodeError::InvalidVectorSummary(format!(
+            "admit slab words_per_code {words_per_code}, want {expected_words} for dim {cdim}"
+        )));
+    }
+    let codes_bytes = n_cent
+        .checked_mul(words_per_code)
+        .and_then(|words| words.checked_mul(8))
+        .ok_or_else(|| {
+            DecodeError::InvalidVectorSummary(format!(
+                "admit slab byte size overflow: n_cent={n_cent} words_per_code={words_per_code}"
+            ))
+        })?;
+    let codes_b = view_n(&mut c, codes_bytes, "admit_codes")?;
+    let codes: Vec<u64> = codes_b
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().expect("chunks_exact(8) yields 8-byte slices")))
+        .collect();
+    let norms_b = view_n(&mut c, n_cent * 4, "admit_norms")?;
+    let norms = decode_f32_le_vec(norms_b);
+    let admit = RabitqAdmitCodes {
+        rot_seed,
+        words_per_code,
+        codes,
+        norms,
+    };
+
+    Ok(ClusterCentroids::from_decoded_routing(
+        n_cent as u32,
+        cdim as u32,
+        counts,
+        admit,
+    ))
+}
+
+pub fn encode_vector_summary(s: &VectorSummary, mode: SummaryWireMode) -> Vec<u8> {
+    let dim = s.centroid.len();
+    let mut out = Vec::new();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     for &v in &s.centroid {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&s.radius.to_le_bytes());
-    // Per-cluster centroid block: n_cent, dim, then counts / mins /
-    // scales / Sq8 codes. `n_cent == 0` encodes a superfile with no
-    // vector index for the column (empty trailer).
-    out.extend_from_slice(&cl.n_cent.to_le_bytes());
-    out.extend_from_slice(&cl.dim.to_le_bytes());
-    for &c in &cl.counts {
-        out.extend_from_slice(&c.to_le_bytes());
+    out.extend_from_slice(&(s.cells.len() as u32).to_le_bytes());
+    for cell in &s.cells {
+        out.extend_from_slice(&cell.cell_id.unwrap_or(u32::MAX).to_le_bytes());
+        let encoded = match mode {
+            SummaryWireMode::Full => encode_cluster_centroids(&cell.clusters),
+            SummaryWireMode::RoutingOnly => encode_cluster_centroids_routing(&cell.clusters),
+        };
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
     }
-    for &m in &cl.mins {
-        out.extend_from_slice(&m.to_le_bytes());
-    }
-    for &sc in &cl.scales {
-        out.extend_from_slice(&sc.to_le_bytes());
-    }
-    out.extend_from_slice(&cl.codes);
     out
 }
 
 pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError> {
     let mut c = Cursor::new(bytes);
     let dim = read_u32(&mut c, "dim")? as usize;
-    let mut centroid = Vec::with_capacity(dim);
-    for i in 0..dim {
-        let b = read_n(&mut c, 4, "centroid_float")?;
-        if b.len() != 4 {
-            return Err(DecodeError::InvalidVectorSummary(format!(
-                "truncated centroid at index {i}"
-            )));
-        }
-        let arr = [b[0], b[1], b[2], b[3]];
-        centroid.push(f32::from_le_bytes(arr));
-    }
-    let rb = read_n(&mut c, 4, "radius")?;
-    if rb.len() != 4 {
-        return Err(DecodeError::InvalidVectorSummary("truncated radius".into()));
-    }
-    let radius = f32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
+    let centroid_bytes = view_n(&mut c, dim * 4, "centroid")?;
+    let centroid = decode_f32_le_vec(centroid_bytes);
 
-    // Per-cluster centroid block (new-engine format). `n_cent == 0` is
-    // a superfile with no vector index for the column.
-    let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
-    let cdim = read_u32(&mut c, "cluster_dim")? as usize;
-
-    let counts_b = read_n(&mut c, n_cent * 4, "cluster_counts")?;
-    if counts_b.len() != n_cent * 4 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster counts".into(),
-        ));
+    let n_cells = read_u32(&mut c, "vector_summary_n_cells")? as usize;
+    let mut cells = Vec::with_capacity(n_cells);
+    for _ in 0..n_cells {
+        let raw_cell_id = read_u32(&mut c, "vector_summary_cell_id")?;
+        let block_len = read_u32(&mut c, "vector_summary_cluster_block_len")? as usize;
+        let block = view_n(&mut c, block_len, "vector_summary_cluster_block")?;
+        cells.push(CellVectorSummary {
+            cell_id: (raw_cell_id != u32::MAX).then_some(raw_cell_id),
+            clusters: decode_cluster_centroids(block)?,
+        });
     }
-    let counts: Vec<u32> = counts_b
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-
-    let ms_b = read_n(&mut c, n_cent * 8, "cluster_min_scale")?;
-    if ms_b.len() != n_cent * 8 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster min/scale".into(),
-        ));
-    }
-    let floats: Vec<f32> = ms_b
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    let mins = floats[0..n_cent].to_vec();
-    let scales = floats[n_cent..2 * n_cent].to_vec();
-
-    let codes_b = read_n(&mut c, n_cent * cdim, "cluster_codes")?;
-    if codes_b.len() != n_cent * cdim {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster codes".into(),
-        ));
-    }
-    let codes = codes_b.to_vec();
-
-    Ok(VectorSummary {
-        centroid,
-        radius,
-        clusters: ClusterCentroids {
-            n_cent: n_cent as u32,
-            dim: cdim as u32,
-            codes,
-            mins,
-            scales,
-            counts,
-            code_moments: OnceLock::new(),
-        },
-    })
+    Ok(VectorSummary { centroid, cells })
 }
 
 // ---------------------------------------------------------
@@ -598,20 +825,23 @@ pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary
         let key = String::from_utf8(k)
             .map_err(|e| DecodeError::ArrowIpc(format!("fts key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "fts_value_len")? as usize;
-        let v = read_n(&mut c, vl, "fts_value")?;
-        out.insert(key, decode_fts_summary(&v)?);
+        let v = view_n(&mut c, vl, "fts_value")?;
+        out.insert(key, decode_fts_summary(v)?);
     }
     Ok(out)
 }
 
-pub fn encode_vector_summary_map(map: &HashMap<String, VectorSummary>) -> Vec<u8> {
+pub fn encode_vector_summary_map(
+    map: &HashMap<String, VectorSummary>,
+    mode: SummaryWireMode,
+) -> Vec<u8> {
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     let mut out = Vec::new();
     out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     for k in keys {
         let key_bytes = k.as_bytes();
-        let value_bytes = encode_vector_summary(&map[k]);
+        let value_bytes = encode_vector_summary(&map[k], mode);
         out.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(key_bytes);
         out.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
@@ -632,8 +862,8 @@ pub fn decode_vector_summary_map(
         let key = String::from_utf8(k)
             .map_err(|e| DecodeError::ArrowIpc(format!("vec key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "vec_value_len")? as usize;
-        let v = read_n(&mut c, vl, "vec_value")?;
-        out.insert(key, decode_vector_summary(&v)?);
+        let v = view_n(&mut c, vl, "vec_value")?;
+        out.insert(key, decode_vector_summary(v)?);
     }
     Ok(out)
 }
@@ -643,11 +873,33 @@ pub fn decode_vector_summary_map(
 // ---------------------------------------------------------
 
 fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
-    let b = read_n(c, 4, what)?;
-    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    let b = view_n(c, 4, what)?;
+    Ok(u32::from_le_bytes(
+        b.try_into().expect("view_n(4) yields a 4-byte slice"),
+    ))
+}
+
+fn read_u64(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u64, DecodeError> {
+    let b = view_n(c, 8, what)?;
+    Ok(u64::from_le_bytes(
+        b.try_into().expect("view_n(8) yields an 8-byte slice"),
+    ))
 }
 
 fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+    view_n(c, n, what).map(<[u8]>::to_vec)
+}
+
+/// Borrow the next `n` bytes from the cursor without copying. The payload
+/// decoders (centroids, bloom blocks) view the wire bytes in place and do
+/// one SIMD pass straight into their final allocation — the manifest's
+/// centroid regions are pure little-endian fp32, so decode stays a bounds
+/// check plus a cast-speed copy, never a per-element parse.
+fn view_n<'a>(
+    c: &mut Cursor<&'a [u8]>,
+    n: usize,
+    what: &'static str,
+) -> Result<&'a [u8], DecodeError> {
     let pos = c.position() as usize;
     let buf = *c.get_ref();
     if pos + n > buf.len() {
@@ -657,9 +909,8 @@ fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>
             had: buf.len().saturating_sub(pos),
         });
     }
-    let out = buf[pos..pos + n].to_vec();
     c.set_position((pos + n) as u64);
-    Ok(out)
+    Ok(&buf[pos..pos + n])
 }
 
 #[cfg(test)]
@@ -675,9 +926,10 @@ mod decode_error_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, ScalarStatsAgg, decode_fts_summary, decode_fts_summary_map,
-        decode_length1_array, decode_scalar_stats, decode_vector_summary,
-        decode_vector_summary_map, encode_length1_array, encode_scalar_stats, read_n, read_u32,
+        DecodeError, ScalarStatsAgg, ScalarValue, ScalarValueCounts, decode_fts_summary,
+        decode_fts_summary_map, decode_length1_array, decode_scalar_stats, decode_value_counts,
+        decode_vector_summary, decode_vector_summary_map, encode_length1_array,
+        encode_scalar_stats, read_n, read_u32,
     };
 
     /// Hand-build a `decode_fts_summary` payload: no bloom, a given
@@ -706,6 +958,86 @@ mod decode_error_tests {
             w.finish().expect("ipc finish");
         }
         out
+    }
+
+    /// `decode_value_counts` rejects corrupt / wrong-shaped manifest bytes with
+    /// a typed `DecodeError` (never a panic): manifest bytes are read from
+    /// object storage and can be truncated or corrupted.
+    #[test]
+    fn decode_value_counts_rejects_malformed_input() {
+        use arrow_array::UInt64Array;
+
+        // Not an Arrow-IPC stream at all → reader init / collect fails.
+        assert!(matches!(
+            decode_value_counts(b"definitely-not-arrow-ipc"),
+            Err(DecodeError::ArrowIpc(_))
+        ));
+
+        // A single-column batch (the wire form is value + count = 2 columns).
+        let one_col = ipc_batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+        );
+        assert!(matches!(
+            decode_value_counts(&one_col),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("2 columns")
+        ));
+
+        // Count column typed Int64 instead of UInt64 → downcast rejected.
+        let wrong_count = ipc_batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new("count", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![7i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+            ],
+        );
+        assert!(matches!(
+            decode_value_counts(&wrong_count),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("UInt64")
+        ));
+
+        // A null value entry → value counts must not carry nulls.
+        let with_null = ipc_batch(
+            vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new("count", DataType::UInt64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef,
+            ],
+        );
+        assert!(matches!(
+            decode_value_counts(&with_null),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("null")
+        ));
+    }
+
+    /// `decode_length1_array` rejects corrupt / wrong-shaped bytes with a typed
+    /// error rather than panicking.
+    #[test]
+    fn decode_length1_array_rejects_malformed_input() {
+        // Garbage bytes → IPC error.
+        assert!(decode_length1_array(b"not-ipc").is_err());
+
+        // Two columns where a length-1 aggregate wire form has exactly one.
+        let two_col = ipc_batch(
+            vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2i64])) as ArrayRef,
+            ],
+        );
+        assert!(
+            decode_length1_array(&two_col).is_err(),
+            "a multi-column batch is not a valid length-1 aggregate",
+        );
     }
 
     /// An empty blob decodes to an empty table (the zero-length sentinel
@@ -738,6 +1070,10 @@ mod decode_error_tests {
                 null_count: Some(7),
                 sum: Some(i64_arr(5050)),
                 hll: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                value_counts: ScalarValueCounts::from_entries(vec![
+                    (ScalarValue::Int64(Some(1)), 2),
+                    (ScalarValue::Int64(Some(100)), 3),
+                ]),
             },
         );
         // Min/max only (the `from_min_max` shape).
@@ -754,6 +1090,7 @@ mod decode_error_tests {
                 null_count: Some(2),
                 sum: None,
                 hll: None,
+                value_counts: None,
             },
         );
 
@@ -1080,8 +1417,8 @@ mod decode_error_tests {
 
 #[cfg(test)]
 mod vector_summary_tests {
-    use super::{decode_vector_summary, encode_vector_summary};
-    use crate::supertable::manifest::{ClusterCentroids, VectorSummary};
+    use super::{SummaryWireMode, decode_vector_summary, encode_vector_summary};
+    use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
 
     #[test]
     fn round_trips_with_cluster_centroids() {
@@ -1098,45 +1435,227 @@ mod vector_summary_tests {
         let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
         let s = VectorSummary {
             centroid: vec![1.0, 2.0, 3.0, 4.0],
-            radius: 9.0,
-            clusters,
+            cells: vec![CellVectorSummary {
+                cell_id: Some(7),
+                clusters,
+            }],
         };
 
-        let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
+        let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
+            .expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert!((got.radius - s.radius).abs() < 1e-9);
-        assert_eq!(got.clusters.n_cent, n_cent);
-        assert_eq!(got.clusters.dim, dim);
-        assert_eq!(got.clusters.counts, counts);
-        assert_eq!(got.clusters.codes, s.clusters.codes);
-        assert_eq!(got.clusters.mins, s.clusters.mins);
-        assert_eq!(got.clusters.scales, s.clusters.scales);
+        assert_eq!(got.cells[0].cell_id, Some(7));
+        assert_eq!(got.cells[0].clusters.n_cent, n_cent);
+        assert_eq!(got.cells[0].clusters.dim, dim);
+        assert_eq!(got.cells[0].clusters.counts, counts);
+        assert_eq!(
+            got.cells[0].clusters.centroids,
+            s.cells[0].clusters.centroids
+        );
 
-        // Dequantized centroids are within one Sq8 step of the source.
-        for c in 0..n_cent as usize {
-            let mut out = vec![0f32; dim as usize];
-            got.clusters.dequantize_into(c, &mut out);
-            let src = &centroids[c * dim as usize..(c + 1) * dim as usize];
-            let step = got.clusters.scales[c];
-            for (o, e) in out.iter().zip(src) {
-                assert!(
-                    (o - e).abs() <= step + 1e-6,
-                    "cluster {c}: dequant {o} vs {e} (step {step})"
-                );
-            }
-        }
+        // fp32 storage is lossless: decode returns the input centroids verbatim.
+        let roundtrip = got.cells[0].clusters.to_fp32();
+        assert_eq!(roundtrip, centroids);
     }
 
     #[test]
     fn round_trips_with_empty_clusters() {
         let s = VectorSummary {
             centroid: vec![0.5, -0.5],
-            radius: 1.0,
-            clusters: ClusterCentroids::empty(),
+            cells: Vec::new(),
         };
-        let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
+        let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
+            .expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert!(got.clusters.is_empty());
-        assert_eq!(got.clusters.n_cent, 0);
+        assert!(got.cells.is_empty());
+    }
+
+    /// A stripped summary (read-only consumer memory mode) must never be
+    /// re-serialized — silently persisting empty centroids would corrupt
+    /// the slow-state blob / manifest part for every future open.
+    #[test]
+    #[should_panic(expected = "stripped summary")]
+    fn encode_stripped_summary_panics() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 16;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut clusters = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        clusters.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let _ = super::encode_cluster_centroids(&clusters);
+    }
+
+    /// Same guard on the summary-wire path (the encoder a real part /
+    /// slow-blob write goes through): a stripped instance carries a slab
+    /// but no fp32, and must fail loudly rather than serialize short.
+    #[test]
+    #[should_panic(expected = "stripped summary")]
+    fn encode_vector_summary_on_stripped_panics() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 16;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut clusters = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        clusters.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let s = VectorSummary {
+            centroid: vec![0.0; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(1),
+                clusters,
+            }],
+        };
+        let _ = encode_vector_summary(&s, SummaryWireMode::Full);
+    }
+
+    /// One wire home per byte: the FULL form carries fp32 only (no slab —
+    /// hydration prewarm rebuilds writer-side slabs), the ROUTING form
+    /// carries the slab only, and a write-time slab round-trips bit-exact
+    /// through the routing wire.
+    #[test]
+    fn round_trips_admit_slab_alongside_centroids() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 32;
+        const ROT_SEED: u64 = 7;
+        let n_cent = 3u32;
+        let mut centroids = vec![0.0f32; 3 * DIM];
+        centroids[0] = 1.0;
+        centroids[DIM + 4] = 1.0;
+        centroids[2 * DIM + 9] = -1.0;
+        let counts = vec![5u32, 0, 7];
+        let clusters = ClusterCentroids::from_fp32(n_cent, DIM as u32, &centroids, counts.clone());
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let expected_slab = clusters
+            .admit_codes_built()
+            .expect("slab built at write time")
+            .clone();
+        let s = VectorSummary {
+            centroid: vec![0.25; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(3),
+                clusters,
+            }],
+        };
+
+        let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
+            .expect("decode");
+        let decoded = &got.cells[0].clusters;
+        assert_eq!(decoded.centroids, centroids, "fp32 must survive");
+        assert_eq!(decoded.counts, counts);
+        assert!(
+            decoded.admit_codes_built().is_none(),
+            "the FULL wire form must not carry a slab — its only wire home is the routing form"
+        );
+
+        let routing =
+            decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::RoutingOnly))
+                .expect("decode routing");
+        let routing_decoded = &routing.cells[0].clusters;
+        assert!(
+            !routing_decoded.vectors_resident(),
+            "routing form sheds fp32"
+        );
+        assert_eq!(
+            *routing_decoded
+                .admit_codes_built()
+                .expect("routing decode must seed the admit slab"),
+            expected_slab,
+            "persisted slab must round-trip bit-exact through the routing wire"
+        );
+    }
+
+    /// Routing-only wire form: no fp32 on the wire; decode lands in the
+    /// stripped shape with counts and the slab intact — the same state a
+    /// hydration-time strip produces, so the query path needs no cases.
+    #[test]
+    fn routing_only_round_trips_stripped_with_slab() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 32;
+        const ROT_SEED: u64 = 7;
+        let n_cent = 3u32;
+        let mut centroids = vec![0.0f32; 3 * DIM];
+        centroids[1] = 1.0;
+        centroids[DIM + 5] = -1.0;
+        centroids[2 * DIM + 8] = 1.0;
+        let counts = vec![4u32, 9, 0];
+        let clusters = ClusterCentroids::from_fp32(n_cent, DIM as u32, &centroids, counts.clone());
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let expected_slab = clusters.admit_codes_built().expect("slab").clone();
+        let s = VectorSummary {
+            centroid: vec![0.5; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(11),
+                clusters,
+            }],
+        };
+
+        let full = encode_vector_summary(&s, SummaryWireMode::Full);
+        let routing = encode_vector_summary(&s, SummaryWireMode::RoutingOnly);
+        assert!(
+            routing.len() < full.len() - n_cent as usize * DIM * 4 / 2,
+            "routing form must shed the fp32 payload ({} vs {} bytes)",
+            routing.len(),
+            full.len()
+        );
+
+        let got = decode_vector_summary(&routing).expect("decode routing");
+        let decoded = &got.cells[0].clusters;
+        assert_eq!(got.centroid, s.centroid, "summary centroid survives");
+        assert_eq!(decoded.n_cent, n_cent);
+        assert_eq!(decoded.dim, DIM as u32);
+        assert_eq!(decoded.counts, counts);
+        assert!(
+            !decoded.vectors_resident(),
+            "routing decode must land in the stripped shape"
+        );
+        assert_eq!(
+            *decoded.admit_codes_built().expect("slab seeded"),
+            expected_slab,
+            "slab must round-trip bit-exact through the routing form"
+        );
+    }
+
+    /// A cell without a built slab can't be written routing-only; the
+    /// encoder falls back to the full form so the artifact stays decodable.
+    #[test]
+    fn routing_only_falls_back_to_full_without_slab() {
+        let (n_cent, dim) = (2u32, 4u32);
+        let centroids = vec![0.25f32; 8];
+        let counts = vec![3u32, 1];
+        let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
+        let s = VectorSummary {
+            centroid: vec![0.0; 4],
+            cells: vec![CellVectorSummary {
+                cell_id: None,
+                clusters,
+            }],
+        };
+        let routing = encode_vector_summary(&s, SummaryWireMode::RoutingOnly);
+        let got = decode_vector_summary(&routing).expect("decode fallback");
+        assert_eq!(
+            got.cells[0].clusters.centroids, centroids,
+            "fallback must carry the fp32 payload"
+        );
     }
 }

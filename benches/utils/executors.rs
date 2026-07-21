@@ -12,15 +12,19 @@
 //! per-modality trait here, so the measured + reported surface can never
 //! drift between the two tiers again.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
+    cpu,
     markdown::fmt_time,
     report::{Better, Cell, context, metric, text},
     rss::{self, RssStats},
 };
 
-/// A warm-latency cell. All three warm metrics (min / p50 / p90) are
+/// A warm-latency cell. All three warm metrics (p50 / p90 / p99) are
 /// Δ-tracked equally here; which one *gates* the A/B regression decision is
 /// chosen downstream by the summary, not at measurement time.
 fn warm_time_cell(ns: f64) -> Cell {
@@ -41,12 +45,69 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() - 1) / 2]
 }
 
-/// Min / p50 / p90 of a timed-sample set.
+/// Mean of per-iteration on-CPU seconds, or `None` when nothing was
+/// sampled (e.g. `/proc/self/task` unavailable).
+fn mean_opt(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    Some(samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
+/// Per-iteration open/search wall + on-CPU samples for one cold measurement.
+///
+/// Shared by every tier's `measure_cold` (FTS / vector / SQL) so the p50 +
+/// mean reduction and the [`ColdTiming`] shape live in exactly one place. A
+/// cold query is mostly object-store I/O wait, so the cost ledger prices its
+/// compute from the measured on-CPU means, not the wall p50s.
+pub struct ColdSamples {
+    open_wall: Vec<Duration>,
+    search_wall: Vec<Duration>,
+    open_cpu: Vec<f64>,
+    search_cpu: Vec<f64>,
+}
+
+impl ColdSamples {
+    pub fn with_capacity(iters: usize) -> Self {
+        Self {
+            open_wall: Vec::with_capacity(iters),
+            search_wall: Vec::with_capacity(iters),
+            open_cpu: Vec::with_capacity(iters),
+            search_cpu: Vec::with_capacity(iters),
+        }
+    }
+
+    /// Record one open's wall duration and (optional) measured on-CPU seconds.
+    pub fn push_open(&mut self, wall: Duration, cpu: Option<f64>) {
+        self.open_wall.push(wall);
+        self.open_cpu.extend(cpu);
+    }
+
+    /// Record one first-search's wall duration and measured on-CPU seconds.
+    /// The search window includes all on-CPU work during a cold query:
+    /// fetch-path decode (TLS, decompress, CRC, cache write) plus IVF scoring.
+    /// I/O wait is off-CPU and excluded by schedstat.
+    pub fn push_search(&mut self, wall: Duration, cpu: Option<f64>) {
+        self.search_wall.push(wall);
+        self.search_cpu.extend(cpu);
+    }
+
+    pub fn finish(mut self) -> ColdTiming {
+        ColdTiming {
+            open: p50(&mut self.open_wall),
+            search: p50(&mut self.search_wall),
+            open_cpu_s: mean_opt(&self.open_cpu),
+            search_cpu_s: mean_opt(&self.search_cpu),
+        }
+    }
+}
+
+/// p50 / p90 / p99 of a timed-sample set.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
-    pub min: Duration,
     pub p50: Duration,
     pub p90: Duration,
+    pub p99: Duration,
 }
 
 /// Batch sub-µs ops up to this span so per-call `Instant::now` overhead
@@ -95,23 +156,53 @@ fn rss_cells(stats: &RssStats) -> Vec<Cell> {
     ]
 }
 
-/// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
+/// Lower-median / nearest-rank p90 / nearest-rank p99 of a sample set
+/// (sorts in place). At small sample counts nearest-rank p99 degenerates
+/// to the max — the honest tail read for the samples taken.
 pub fn summarize(samples: &mut [Duration]) -> Stats {
     let n = samples.len();
     if n == 0 {
         return Stats {
-            min: Duration::ZERO,
             p50: Duration::ZERO,
             p90: Duration::ZERO,
+            p99: Duration::ZERO,
         };
     }
     samples.sort_unstable();
     let p90_rank = (9 * n).div_ceil(10).clamp(1, n);
+    let p99_rank = (99 * n).div_ceil(100).clamp(1, n);
     Stats {
-        min: samples[0],
         p50: samples[(n - 1) / 2],
         p90: samples[p90_rank - 1],
+        p99: samples[p99_rank - 1],
     }
+}
+
+/// Like [`sample_batched`], but also returns the amortized on-CPU seconds per
+/// call (schedstat over the whole sample loop, divided by total invocations),
+/// or `None` when schedstat is unavailable. One warm query is far too short to
+/// sample on-CPU time precisely, so we measure the batch and divide — the same
+/// figure the cost ledger prices warm and cold query compute from.
+pub fn sample_batched_cpu<T>(
+    iters: usize,
+    mut op: impl FnMut() -> T,
+) -> (Vec<Duration>, Option<f64>) {
+    let probe = Instant::now();
+    std::hint::black_box(op());
+    let per_call_ns = (probe.elapsed().as_nanos() as u64).max(1);
+    let batch = (MIN_SAMPLE_NS / per_call_ns).clamp(1, MAX_BATCH) as u32;
+    let mut samples = Vec::with_capacity(iters);
+    let cpu0 = cpu::process_cpu_ns();
+    for _ in 0..iters {
+        let t = Instant::now();
+        for _ in 0..batch {
+            std::hint::black_box(op());
+        }
+        samples.push(t.elapsed() / batch);
+    }
+    let total_calls = (iters as f64) * (batch as f64);
+    let cpu_s = cpu::cpu_seconds_since(cpu0).map(|s| s / total_calls);
+    (samples, cpu_s)
 }
 
 /// Cold timings for one query, split at the open/search boundary:
@@ -124,6 +215,13 @@ pub fn summarize(samples: &mut [Duration]) -> Stats {
 pub struct ColdTiming {
     pub open: Duration,
     pub search: Duration,
+    /// Measured on-CPU seconds for the table-open window (all-thread schedstat
+    /// delta), when sampled.
+    pub open_cpu_s: Option<f64>,
+    /// Measured on-CPU seconds for the first-search window (all-thread
+    /// schedstat delta), when sampled. Includes fetch-path on-CPU work
+    /// (decompress, CRC, cache write) plus scoring; excludes I/O wait.
+    pub search_cpu_s: Option<f64>,
 }
 
 /// Force-open every superfile reader on the consumer's pinned snapshot —
@@ -132,46 +230,7 @@ pub struct ColdTiming {
 /// cache admit → lazy range-GET fallback), concurrently like the query
 /// path, so the subsequent timed search pays only the search work.
 pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
-    let reader = consumer.reader();
-    let manifest = reader.manifest();
-    let store = manifest.options.store.clone();
-    let disk_cache = manifest.options.disk_cache.clone();
-    let storage = manifest.options.storage.clone();
-    // Snapshot the per-superfile open inputs up front so each spawned task
-    // owns its data ('static). `tokio::spawn` per superfile distributes the
-    // per-open CPU parse across the runtime's worker threads — matching the
-    // production vector fan-out (`tokio::spawn` per superfile) instead of
-    // serializing all the parses on a single `try_join_all` poller.
-    let superfiles: Vec<_> = manifest
-        .superfiles
-        .iter()
-        .map(|e| (e.uri, e.subsection_offsets.clone()))
-        .collect();
-    crate::tiers::block_on(async move {
-        let handles: Vec<_> = superfiles
-            .into_iter()
-            .map(|(uri, offsets)| {
-                let store = store.clone();
-                let disk_cache = disk_cache.clone();
-                let storage = storage.clone();
-                tokio::spawn(async move {
-                    infino::supertable::query::superfile_reader::superfile_reader(
-                        &store,
-                        disk_cache.as_ref(),
-                        storage.as_ref(),
-                        &uri,
-                        offsets.as_ref(),
-                    )
-                    .await
-                })
-            })
-            .collect();
-        for h in handles {
-            h.await
-                .expect("cold open: join superfile open task")
-                .expect("cold open: open superfile readers");
-        }
-    });
+    consumer.open_all_superfiles();
 }
 
 pub mod fts {
@@ -190,6 +249,7 @@ pub mod fts {
 
     use super::*;
     use crate::{
+        cpu,
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -647,12 +707,16 @@ pub mod fts {
     }
 
     /// Warm timing (+ RSS) for one query: `warm` is the query phase (id +
-    /// score), `fetched_min` the fetch phase (+ top-k text).
+    /// score), `fetched_p50` the fetch phase (+ top-k text).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
         pub warm: Stats,
-        pub fetched_min: Duration,
+        pub fetched_p50: Duration,
+        /// Amortized on-CPU seconds of one warm query-phase search — the
+        /// query's measured compute (cache hot, 0 GET), the basis for both the
+        /// warm and cold query CPU cost.
+        pub cpu_s: Option<f64>,
         pub rss: RssStats,
     }
 
@@ -673,7 +737,8 @@ pub mod fts {
             std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
         }
         let sampler = PeakSampler::start_default();
-        let mut samples = sample_batched(iters, || reader.bm25_rows(column, &query, k, mode));
+        let (mut samples, cpu_s) =
+            sample_batched_cpu(iters, || reader.bm25_rows(column, &query, k, mode));
         for _ in 0..WARMUP_ITERS {
             std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
         }
@@ -683,7 +748,8 @@ pub mod fts {
         FtsQueryStat {
             name: q.name,
             warm: summarize(&mut samples),
-            fetched_min: summarize(&mut fetched_samples).min,
+            fetched_p50: summarize(&mut fetched_samples).p50,
+            cpu_s,
             rss,
         }
     }
@@ -726,25 +792,17 @@ pub mod fts {
             );
             let query = q.terms.join(" ");
             let mode = to_infino_mode(q.mode);
-            let mut open_samples = Vec::with_capacity(iters);
-            let mut search_samples = Vec::with_capacity(iters);
+            let mut cold = ColdSamples::with_capacity(iters);
             for _ in 0..iters {
-                let t_open = Instant::now();
-                let guard = open_fresh();
-                open_samples.push(t_open.elapsed());
-                let t = Instant::now();
-                let rows = guard.bm25_rows(column, &query, k, mode);
-                search_samples.push(t.elapsed());
+                let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
+                cold.push_open(open_wall, open_cpu);
+                let (rows, search_wall, search_cpu) =
+                    cpu::timed(|| guard.bm25_rows(column, &query, k, mode));
+                cold.push_search(search_wall, search_cpu);
                 std::hint::black_box(rows);
                 drop(guard);
             }
-            out.insert(
-                q.name,
-                ColdTiming {
-                    open: p50(&mut open_samples),
-                    search: p50(&mut search_samples),
-                },
-            );
+            out.insert(q.name, cold.finish());
         }
         out
     }
@@ -752,14 +810,14 @@ pub mod fts {
     fn warm_cells(stat: Option<&FtsQueryStat>) -> Vec<Cell> {
         match stat {
             Some(q) => {
-                let min_ns = q.warm.min.as_secs_f64() * NS_PER_SEC;
                 let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
                 let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
-                let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
+                let p99_ns = q.warm.p99.as_secs_f64() * NS_PER_SEC;
+                let fetched_ns = q.fetched_p50.as_secs_f64() * NS_PER_SEC;
                 let mut cells = vec![
-                    warm_time_cell(min_ns),
                     warm_time_cell(p50_ns),
                     warm_time_cell(p90_ns),
+                    warm_time_cell(p99_ns),
                     context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                 ];
                 cells.extend(rss_cells(&q.rss));
@@ -824,10 +882,10 @@ pub mod fts {
         if warm_map.is_some() {
             header_cols.extend(
                 [
-                    "warm min",
                     "warm p50",
                     "warm p90",
-                    "+fetch min",
+                    "warm p99",
+                    "+fetch p50",
                     "Peak RSS",
                     "Median RSS",
                     "P90 RSS",
@@ -1005,20 +1063,30 @@ pub mod vector {
     use std::{collections::HashMap, hint::black_box};
 
     use infino::{
+        storage::io_counters,
         superfile::{SuperfileReader, reader::VectorSearchOptions},
-        supertable::Supertable,
+        supertable::{
+            manifest::list::PartitionStrategy, query::vector::USER_FINE_RUNS_PER_FRAGMENT,
+        },
     };
 
     use super::*;
     use crate::{
         corpus::{self, Calibrated},
+        cpu,
         markdown::fmt_time,
         report::{Better, Block, Cell, Report, Section, metric, text},
         rss::{PeakSampler, RssStats},
     };
 
-    /// Recall correctness gate (shared by both tiers).
+    /// Recall correctness gate (high-nprobe sanity check). Temporarily
+    /// lowered while the post-drain drain-clustering recall gap is under
+    /// investigation (10M post-drain peaks ~0.975 at nprobe=64); restore to
+    /// 0.98 once cell assignment is fixed.
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
+    /// Default `(nprobe, rerank)` config gate — lower bar so large-scale
+    /// pre-drain staging runs can complete while routing is tuned.
+    pub const DEFAULT_CONFIG_RECALL_FLOOR: f32 = 0.80;
     pub const CORRECTNESS_NPROBE: usize = 64;
     pub const CORRECTNESS_RERANK_MULT: usize = 256;
     pub const N_CORRECTNESS_QUERIES: usize = 20;
@@ -1026,7 +1094,7 @@ pub mod vector {
     pub const N_CALIBRATION_QUERIES: usize = 100;
     pub const CALIBRATION_P50_ITERS: usize = 7;
     /// Recall targets reported (lowest-p50 point clearing each) + `default`.
-    pub const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
+    pub const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.98];
     /// (probe, refine) calibration grid — one shape for both tiers.
     pub const PROBES: &[usize] = &[1, 5, 10, 25, 50, 100, 200, 400, 800];
     pub const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
@@ -1037,15 +1105,29 @@ pub mod vector {
 
     const NS_PER_SEC: f64 = 1e9;
 
-    pub fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
-        VectorSearchOptions::new()
-            .with_nprobe(nprobe)
-            .with_rerank_mult(rerank_mult)
+    /// `nprobe` / `rerank` sentinel meaning "engine default — do not
+    /// override". Rows measured with this value run
+    /// `VectorSearchOptions::default()` exactly, so recorded numbers always
+    /// reflect shipped defaults rather than bench-side overrides.
+    pub const ENGINE_DEFAULT: usize = 0;
+
+    pub fn default_search_opts() -> VectorSearchOptions {
+        VectorSearchOptions::default()
     }
 
-    /// A reader the vector executor runs kNN against, returning **global**
-    /// `(doc_id, score)` hits so recall can be graded against brute-force
-    /// ground truth regardless of how many superfiles back the reader.
+    pub fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
+        let mut opts = VectorSearchOptions::default();
+        if nprobe != ENGINE_DEFAULT {
+            opts = opts.with_nprobe(nprobe);
+        }
+        if rerank_mult != ENGINE_DEFAULT {
+            opts = opts.with_rerank_mult(rerank_mult);
+        }
+        opts
+    }
+
+    /// A reader the vector executor runs kNN against, returning global
+    /// dense `(doc_id, score)` hits for recall vs brute-force ground truth.
     pub trait VectorRead {
         fn topk_global(
             &self,
@@ -1055,6 +1137,29 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)>;
+
+        /// Parameters the reader actually applies. Supertables may translate
+        /// the requested IVF probe count into table-level cell routing.
+        fn search_params(&self, nprobe: usize, rerank: usize) -> String {
+            format!("p={nprobe}, r={rerank}")
+        }
+
+        /// Time the PUBLIC `vector_search` path (routing + rerank + stable
+        /// `_id` resolution + Arrow materialization) — the surface a real
+        /// caller uses. Returns p50 nanoseconds, or `None` for readers that
+        /// only expose `topk_global` (superfile tier, cold guards). Used to
+        /// quantify the `_id`-resolution cost that the `topk_global` /
+        /// `vector_hits` latency excludes.
+        fn full_search_p50_ns(
+            &self,
+            _column: &str,
+            _query: &[f32],
+            _k: usize,
+            _nprobe: usize,
+            _rerank: usize,
+        ) -> Option<f64> {
+            None
+        }
     }
 
     impl VectorRead for SuperfileReader {
@@ -1066,7 +1171,7 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            // Single superfile: local_doc_id == global id.
+            // Single superfile: local_doc_id == dense oracle id.
             crate::tiers::block_on(self.vector_hits_async(
                 column,
                 query,
@@ -1075,9 +1180,62 @@ pub mod vector {
             ))
             .expect("superfile vector_search")
         }
+
+        fn search_params(&self, nprobe: usize, rerank: usize) -> String {
+            let codec = self
+                .vec()
+                .and_then(|vector| vector.vector_columns_config().next())
+                .map(|column| column.rerank_codec.name())
+                .unwrap_or("none");
+            format!("p={nprobe}, r={rerank}, codec={codec}")
+        }
     }
 
-    impl VectorRead for Supertable {
+    /// Supertable recall through the public `vector_search` surface: hits come
+    /// back as stable `_id` + score; `id_to_dense` (one ordered `SELECT _id`
+    /// scan) translates them to the dense oracle rows the brute-force ground
+    /// truth speaks.
+    pub struct SupertableVectorRead<'a> {
+        pub table: &'a infino::supertable::Supertable,
+        pub id_to_dense: Arc<HashMap<i128, u32>>,
+    }
+
+    impl SupertableVectorRead<'_> {
+        pub fn routing_label(&self, nprobe: usize, rerank: usize) -> String {
+            let rerank_label = if rerank == ENGINE_DEFAULT {
+                "r=default".to_string()
+            } else {
+                format!("r{rerank}")
+            };
+            if let Some(hidden) = self.table.vector_index_table() {
+                let reader = hidden.pinned_reader();
+                let manifest = reader.manifest();
+                if !manifest.get_all_superfiles().is_empty()
+                    && let PartitionStrategy::VectorCell { routing, .. } =
+                        manifest.get_partition_strategy()
+                {
+                    return format!(
+                        "hidden: cells {}..{}, fine {}, {}, {rerank_label}",
+                        routing.nprobe_min,
+                        routing.nprobe_max,
+                        routing.fine_nprobe,
+                        hidden.options().vector_columns[0].rerank_codec.name(),
+                    );
+                }
+            }
+            let cells_label = if nprobe == ENGINE_DEFAULT {
+                "routed 1 (default)".to_string()
+            } else {
+                format!("{nprobe}+")
+            };
+            format!(
+                "user: cells {cells_label}, fine {USER_FINE_RUNS_PER_FRAGMENT}/fragment, {}, {rerank_label}",
+                self.table.options().vector_columns[0].rerank_codec.name(),
+            )
+        }
+    }
+
+    impl VectorRead for SupertableVectorRead<'_> {
         fn topk_global(
             &self,
             column: &str,
@@ -1086,28 +1244,25 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            let reader = self.reader();
-            let hits = reader
-                .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
-                .expect("supertable vector_hits");
-            let manifest = reader.manifest();
-            // Per-superfile global-id base offsets in manifest order.
-            let mut offsets: Vec<u32> = Vec::with_capacity(manifest.superfiles.len());
-            let mut acc: u32 = 0;
-            for entry in manifest.superfiles.iter() {
-                offsets.push(acc);
-                acc = acc.saturating_add(entry.n_docs as u32);
-            }
-            hits.into_iter()
-                .map(|h| {
-                    let seg_idx = manifest
-                        .superfiles
-                        .iter()
-                        .position(|e| e.uri == h.superfile)
-                        .expect("hit superfile present in manifest");
-                    (offsets[seg_idx] + h.local_doc_id, h.score)
+            let batches = self
+                .table
+                .reader()
+                .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
+                .expect("supertable vector_search");
+            corpus::id_scores_from_vector_search(&batches)
+                .into_iter()
+                .map(|(id, score)| {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("vector_search returned unknown _id {id}"));
+                    (dense, score)
                 })
                 .collect()
+        }
+
+        fn search_params(&self, nprobe: usize, rerank: usize) -> String {
+            self.routing_label(nprobe, rerank)
         }
     }
 
@@ -1340,11 +1495,16 @@ pub mod vector {
             .collect()
     }
 
-    /// Warm timing (+ RSS) for one config on an already-warm reader,
-    /// gated on `warm.min`.
+    /// Warm timing (+ RSS + measured on-CPU) for one config on an
+    /// already-warm reader, gated on `warm.p50`. `cpu_s` is the amortized
+    /// on-CPU seconds of one warm query — the query's true compute, measured
+    /// (not a wall proxy). It's the basis for BOTH warm and cold query CPU
+    /// cost: a cold query runs the identical scoring, so its compute equals
+    /// this; the cold premium is I/O requests.
     #[derive(Clone, Copy)]
     pub struct VecTiming {
         pub warm: Stats,
+        pub cpu_s: Option<f64>,
         pub rss: RssStats,
     }
 
@@ -1363,13 +1523,54 @@ pub mod vector {
         for _ in 0..WARMUP_ITERS {
             black_box(reader.topk_global(column, query, k, nprobe, rerank));
         }
+        let dump_phases = io_counters::phase_enabled();
+        let mut phase_sums: HashMap<&'static str, u64> = HashMap::new();
         let sampler = PeakSampler::start_default();
-        let mut samples = sample_batched(WARM_SAMPLE_ITERS, || {
-            reader.topk_global(column, query, k, nprobe, rerank)
-        });
+        let (mut samples, cpu_s) = if dump_phases {
+            // Sample one query at a time so phase spans attribute to a single
+            // warm iteration (batched sampling would merge concurrent queries).
+            let mut walls = Vec::with_capacity(WARM_SAMPLE_ITERS);
+            let mut cpu_acc = 0.0f64;
+            for _ in 0..WARM_SAMPLE_ITERS {
+                io_counters::phase_reset();
+                let ((), wall, cpu) = cpu::timed(|| {
+                    black_box(reader.topk_global(column, query, k, nprobe, rerank));
+                });
+                walls.push(wall);
+                if let Some(c) = cpu {
+                    cpu_acc += c;
+                }
+                for (name, us) in io_counters::phase_take_summed() {
+                    *phase_sums.entry(name).or_default() += us;
+                }
+            }
+            let cpu_s = Some(cpu_acc / WARM_SAMPLE_ITERS as f64);
+            (walls, cpu_s)
+        } else {
+            sample_batched_cpu(WARM_SAMPLE_ITERS, || {
+                reader.topk_global(column, query, k, nprobe, rerank)
+            })
+        };
         let rss = sampler.stop_stats();
+        if dump_phases && !phase_sums.is_empty() {
+            let n = WARM_SAMPLE_ITERS as f64;
+            let mut names: Vec<_> = phase_sums.keys().copied().collect();
+            names.sort_unstable();
+            let parts: Vec<String> = names
+                .into_iter()
+                .map(|name| {
+                    let avg_us = *phase_sums.get(name).unwrap_or(&0) as f64 / n;
+                    format!("{name}={avg_us:.0}µs")
+                })
+                .collect();
+            eprintln!(
+                "[vector warm phases] avg over {WARM_SAMPLE_ITERS} queries (Σ across concurrent fan-out units): {}",
+                parts.join("  ")
+            );
+        }
         VecTiming {
             warm: summarize(&mut samples),
+            cpu_s,
             rss,
         }
     }
@@ -1385,22 +1586,17 @@ pub mod vector {
         rerank: usize,
         iters: usize,
     ) -> ColdTiming {
-        let mut open_samples = Vec::with_capacity(iters);
-        let mut search_samples = Vec::with_capacity(iters);
+        let mut cold = ColdSamples::with_capacity(iters);
         for _ in 0..iters {
-            let t_open = Instant::now();
-            let guard = open_fresh();
-            open_samples.push(t_open.elapsed());
-            let t0 = Instant::now();
-            let hits = guard.topk_global(column, query, k, nprobe, rerank);
-            search_samples.push(t0.elapsed());
+            let (guard, open_wall, open_cpu) = cpu::timed(open_fresh);
+            cold.push_open(open_wall, open_cpu);
+            let (hits, search_wall, search_cpu) =
+                cpu::timed(|| guard.topk_global(column, query, k, nprobe, rerank));
+            cold.push_search(search_wall, search_cpu);
             black_box(hits);
             drop(guard);
         }
-        ColdTiming {
-            open: p50(&mut open_samples),
-            search: p50(&mut search_samples),
-        }
+        cold.finish()
     }
 
     /// One rendered recall-table row.
@@ -1412,7 +1608,7 @@ pub mod vector {
         pub cold: Option<ColdTiming>,
     }
 
-    /// Gate latency cell (warm min, cold search).
+    /// Gate latency cell (warm p50, cold search).
     fn time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             metric(ns, fmt_time(ns), Better::Lower)
@@ -1421,7 +1617,7 @@ pub mod vector {
         }
     }
 
-    /// Context latency cell (p50/p90, cold open).
+    /// Context latency cell (p90/p99, cold open).
     fn ctx_time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             context(ns, fmt_time(ns), Better::Lower)
@@ -1431,7 +1627,7 @@ pub mod vector {
     }
 
     /// Render the recall/latency table (same columns for both tiers):
-    /// `Recall target | (p, r) | recall | [warm | Peak/Median/P90 RSS] | [cold]`.
+    /// `Recall target | Search parameters | recall | [warm | Peak/Median/P90 RSS] | [cold]`.
     pub fn emit_recall_table(
         report: &mut Report,
         anchor: &str,
@@ -1443,15 +1639,15 @@ pub mod vector {
     ) {
         let mut headers = vec![
             "Recall target".to_string(),
-            "(p, r)".to_string(),
+            "Search parameters".to_string(),
             "recall".to_string(),
         ];
         if include_warm {
             headers.extend(
                 [
-                    "warm min",
                     "warm p50",
                     "warm p90",
+                    "warm p99",
                     "Peak RSS",
                     "Median RSS",
                     "P90 RSS",
@@ -1471,12 +1667,12 @@ pub mod vector {
                 if include_warm {
                     match &r.warm {
                         Some(w) => {
-                            let min_ns = w.warm.min.as_secs_f64() * NS_PER_SEC;
                             let p50_ns = w.warm.p50.as_secs_f64() * NS_PER_SEC;
                             let p90_ns = w.warm.p90.as_secs_f64() * NS_PER_SEC;
-                            cells.push(warm_time_cell(min_ns));
+                            let p99_ns = w.warm.p99.as_secs_f64() * NS_PER_SEC;
                             cells.push(warm_time_cell(p50_ns));
                             cells.push(warm_time_cell(p90_ns));
+                            cells.push(warm_time_cell(p99_ns));
                             cells.extend(rss_cells(&w.rss));
                         }
                         None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
@@ -1540,30 +1736,51 @@ pub mod vector {
         let mut rows: Vec<RecallRow> = Vec::new();
         let default_recall: Option<f32>;
         if skip_calibration {
-            // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
-            // high-recall correctness gate, no recall-target grid — only
-            // the fixed `(default_nprobe, default_rerank)` recall sample.
-            eprintln!(
-                "[{log_prefix}] skip-calibration: default-config recall@{k} at p={default_nprobe}, r={default_rerank} ({} queries)...",
-                q_correct.len(),
-            );
-            let default = mean_recall(
-                warm_reader,
-                column,
-                q_correct,
-                gt_correct,
-                k,
-                default_nprobe,
-                default_rerank,
-            );
-            eprintln!(
-                "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
-            );
-            default_recall = Some(default);
+            // Skip-calibration mode (both tiers' default — see each
+            // tier's `RUN_CALIBRATION_GRID`): no recall-target grid; the
+            // fixed `(default_nprobe, default_rerank)` recall sample IS
+            // the gate, asserted against the floor below.
+            if gt_correct.is_empty() {
+                // No brute-force ground truth was built (skip-calibration / no
+                // corpus). Recall is not measured — render "—", not a bogus 0.000.
+                eprintln!(
+                    "[{log_prefix}] skip-calibration: {} — no ground truth, recall not measured",
+                    warm_reader.search_params(default_nprobe, default_rerank),
+                );
+                default_recall = None;
+            } else {
+                eprintln!(
+                    "[{log_prefix}] skip-calibration: {} ({} queries)...",
+                    warm_reader.search_params(default_nprobe, default_rerank),
+                    q_correct.len(),
+                );
+                let default = mean_recall(
+                    warm_reader,
+                    column,
+                    q_correct,
+                    gt_correct,
+                    k,
+                    default_nprobe,
+                    default_rerank,
+                );
+                eprintln!(
+                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {DEFAULT_CONFIG_RECALL_FLOOR:.2})",
+                );
+                // The printed floor is a real gate, not decoration — this
+                // was previously print-only, so a recall collapse in skip
+                // mode sailed through green.
+                assert!(
+                    default >= DEFAULT_CONFIG_RECALL_FLOOR,
+                    "{log_prefix} default-config vector recall@{k} {default:.3} < floor \
+                     {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
+                );
+                default_recall = Some(default);
+            }
         } else {
             eprintln!(
-                "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
+                "[{log_prefix}] correctness: recall@{k} on {} queries ({})...",
                 q_correct.len(),
+                warm_reader.search_params(CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT),
             );
             let recall = mean_recall(
                 warm_reader,
@@ -1594,12 +1811,11 @@ pub mod vector {
                 default_rerank,
             );
             assert!(
-                default >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                default >= DEFAULT_CONFIG_RECALL_FLOOR,
+                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
             );
             eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
             default_recall = Some(default);
-
             // Small corpora afford the exhaustive grid; past the cap the
             // staircase walk gets the same answers from O(P + R)
             // evaluations (see `calibrate_staircase`).
@@ -1627,7 +1843,7 @@ pub mod vector {
                 match cal[i] {
                     Some(c) => rows.push(RecallRow {
                         target: format!("{target:.2}"),
-                        params: format!("p={}, r={}", c.probe, c.refine),
+                        params: warm_reader.search_params(c.probe, c.refine),
                         recall: format!("{:.3}", c.recall),
                         warm: include_warm
                             .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
@@ -1647,7 +1863,7 @@ pub mod vector {
         }
         rows.push(RecallRow {
             target: "default".into(),
-            params: format!("p={default_nprobe}, r={default_rerank}"),
+            params: warm_reader.search_params(default_nprobe, default_rerank),
             recall: default_recall
                 .map(|r| format!("{r:.3}"))
                 .unwrap_or_else(|| "—".into()),
@@ -1665,6 +1881,24 @@ pub mod vector {
                 )
             }),
         });
+
+        // `topk_global` times the public `vector_search` path for supertable.
+        if include_warm
+            && let (Some(full_p50), Some(hits_p50)) = (
+                warm_reader.full_search_p50_ns(column, q0, k, default_nprobe, default_rerank),
+                rows.last()
+                    .and_then(|r| r.warm.as_ref())
+                    .map(|w| w.warm.p50.as_secs_f64() * NS_PER_SEC),
+            )
+            && (full_p50 - hits_p50).abs() > 1.0
+        {
+            eprintln!(
+                "[{log_prefix}] public vector_search (_id-resolved) p50 = {} vs vector_hits p50 = {} (id-resolve delta = {})",
+                fmt_time(full_p50),
+                fmt_time(hits_p50),
+                fmt_time((full_p50 - hits_p50).max(0.0)),
+            );
+        }
 
         emit_recall_table(
             report,
@@ -1686,6 +1920,7 @@ pub mod sql {
 
     use super::*;
     use crate::{
+        cpu,
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -1737,6 +1972,10 @@ pub mod sql {
         /// Run a one-row `SELECT COUNT(*)`-shaped aggregate and return the
         /// scalar `Int64` value — used by the correctness gate.
         fn query_count(&self, sql: &str) -> i64;
+        /// Settle any background work the preceding (warmup) queries kicked
+        /// off, so timed iterations measure the steady state instead of
+        /// racing it. No-op for tiers with no background machinery.
+        fn settle_warm(&self) {}
     }
 
     impl SqlRead for InfinoSqlIndex {
@@ -1766,7 +2005,16 @@ pub mod sql {
         fn query_count(&self, sql: &str) -> i64 {
             scalar_i64(&self.reader().query_sql(sql).expect("query_sql count"))
         }
+        fn settle_warm(&self) {
+            self.wait_until_warm(WARM_SETTLE_TIMEOUT)
+                .expect("settle background fills");
+        }
     }
+
+    /// Generous ceiling for settling a single query's background fills;
+    /// scoped to the query's own working set, so the typical wait is the
+    /// few files that query opened — not the table.
+    const WARM_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 
     /// Extract the single `Int64` aggregate value from a one-row result.
     fn scalar_i64(batches: &[arrow_array::RecordBatch]) -> i64 {
@@ -1803,6 +2051,9 @@ pub mod sql {
         pub name: &'static str,
         pub warm: Stats,
         pub rows: usize,
+        /// Amortized on-CPU seconds of one warm query — the query's measured
+        /// compute (cache hot), the basis for both warm and cold query CPU.
+        pub cpu_s: Option<f64>,
         pub rss: RssStats,
     }
 
@@ -1824,13 +2075,17 @@ pub mod sql {
         for _ in 0..WARMUP_ITERS {
             warm_rows = reader.query_rows(sql);
         }
+        // Warmup opened this query's working set; settle its background
+        // fills so the timed iterations measure steady state.
+        reader.settle_warm();
         let sampler = PeakSampler::start_default();
-        let mut samples = sample_batched(iters, || reader.query_rows(sql));
+        let (mut samples, cpu_s) = sample_batched_cpu(iters, || reader.query_rows(sql));
         let rss = sampler.stop_stats();
         SqlQueryStat {
             name,
             warm: summarize(&mut samples),
             rows: warm_rows,
+            cpu_s,
             rss,
         }
     }
@@ -1957,14 +2212,14 @@ pub mod sql {
     }
 
     fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
-        let min_ns = stat.warm.min.as_secs_f64() * 1e9;
         let p50_ns = stat.warm.p50.as_secs_f64() * 1e9;
         let p90_ns = stat.warm.p90.as_secs_f64() * 1e9;
+        let p99_ns = stat.warm.p99.as_secs_f64() * 1e9;
         let mut cells = vec![
             text(stat.name),
-            warm_time_cell(min_ns),
             warm_time_cell(p50_ns),
             warm_time_cell(p90_ns),
+            warm_time_cell(p99_ns),
             text(fmt_count(stat.rows)),
         ];
         cells.extend(rss_cells(&stat.rss));
@@ -1974,9 +2229,9 @@ pub mod sql {
     fn query_headers() -> Vec<String> {
         vec![
             "Query".into(),
-            "warm min".into(),
             "warm p50".into(),
             "warm p90".into(),
+            "warm p99".into(),
             "Rows".into(),
             "Peak RSS".into(),
             "Median RSS".into(),
@@ -2038,25 +2293,16 @@ pub mod sql {
                 "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
                 q.name
             );
-            let mut open_samples = Vec::with_capacity(iters);
-            let mut search_samples = Vec::with_capacity(iters);
+            let mut cold = ColdSamples::with_capacity(iters);
             for _ in 0..iters {
-                let t_open = Instant::now();
-                let guard = open_fresh();
-                open_samples.push(t_open.elapsed());
-                let t0 = Instant::now();
-                let rows = guard.query_rows(q.sql);
-                search_samples.push(t0.elapsed());
+                let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
+                cold.push_open(open_wall, open_cpu);
+                let (rows, search_wall, search_cpu) = cpu::timed(|| guard.query_rows(q.sql));
+                cold.push_search(search_wall, search_cpu);
                 black_box(rows);
                 drop(guard);
             }
-            out.insert(
-                q.name,
-                ColdTiming {
-                    open: p50(&mut open_samples),
-                    search: p50(&mut search_samples),
-                },
-            );
+            out.insert(q.name, cold.finish());
         }
         out
     }
@@ -2108,19 +2354,19 @@ mod tests {
     }
 
     #[test]
-    fn summarize_picks_min_median_p90() {
+    fn summarize_picks_median_p90_p99() {
         let mut s = [ms(5), ms(1), ms(3), ms(2), ms(4)];
         let out = summarize(&mut s);
-        assert_eq!(out.min, ms(1));
         assert_eq!(out.p50, ms(3)); // lower-median of 5
         assert_eq!(out.p90, ms(5)); // nearest-rank ceil(0.9*5)=5
+        assert_eq!(out.p99, ms(5)); // nearest-rank ceil(0.99*5)=5
     }
 
     #[test]
     fn summarize_single_and_empty() {
         assert_eq!(summarize(&mut [ms(7)]).p90, ms(7));
         let z = summarize(&mut []);
-        assert_eq!((z.min, z.p50, z.p90), (ms(0), ms(0), ms(0)));
+        assert_eq!((z.p50, z.p90, z.p99), (ms(0), ms(0), ms(0)));
     }
 
     #[test]

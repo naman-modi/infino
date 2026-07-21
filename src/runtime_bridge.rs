@@ -37,7 +37,14 @@ use std::{
     thread,
 };
 
-use tokio::{runtime, task::block_in_place};
+use tokio::{
+    runtime::{self, Handle, Runtime},
+    task::block_in_place,
+};
+
+/// Fallback worker count for [`build_query_runtime`] when the host's available
+/// parallelism can't be determined.
+const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
 
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),
@@ -64,10 +71,17 @@ where
 /// one-shot one per call.
 ///
 /// Same `current_thread`-ambient caveat as [`bridge_sync_to_async`].
-pub(crate) fn bridge_on_runtime<F: Future>(fut: F, fallback: &runtime::Runtime) -> F::Output {
-    match runtime::Handle::try_current() {
-        Ok(handle) => block_in_place(|| handle.block_on(fut)),
-        Err(_) => fallback.block_on(fut),
+pub(crate) fn bridge_on_runtime<F: Future>(fut: F, runtime: &Runtime) -> F::Output {
+    // Always drive on the passed `runtime` — callers hand us the runtime the
+    // future's async resources are bound to (e.g. `query_runtime`, where the
+    // disk cache's coordination lives). Driving on a *different* ambient
+    // runtime instead awaits those resources cross-runtime and can lose the
+    // wakeup → deadlock (e.g. a cold disk-cache fetch during search). When an
+    // ambient runtime is present, escape its worker via `block_in_place` so the
+    // nested `block_on` is legal.
+    match Handle::try_current() {
+        Ok(_ambient) => block_in_place(|| runtime.handle().block_on(fut)),
+        Err(_) => runtime.block_on(fut),
     }
 }
 
@@ -120,7 +134,6 @@ pub(crate) fn shared_io_runtime() -> Arc<runtime::Runtime> {
 /// the CPU count so a cold query's per-superfile fan-out overlaps instead
 /// of serializing.
 fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
-    const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
     let workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
@@ -145,4 +158,50 @@ fn build_current_thread_runtime() -> runtime::Runtime {
             "invariant: tokio Runtime build only fails on \
              catastrophic OS resource exhaustion",
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this pins: `bridge_on_runtime` once preferred the
+    /// AMBIENT runtime when one was present, driving the future on a
+    /// runtime other than the one its async resources are bound to.
+    /// Awaiting those resources cross-runtime can lose the wakeup — the
+    /// cold disk-cache fetch during a sync search deadlocked exactly
+    /// this way. The contract: always drive on the PASSED runtime; an
+    /// ambient runtime only decides whether `block_in_place` is needed
+    /// to make the nested `block_on` legal.
+    #[test]
+    fn bridge_on_runtime_drives_on_the_passed_runtime() {
+        let owned = build_query_runtime("bridge-test");
+        let owned_id = format!("{:?}", owned.handle().id());
+
+        // No ambient runtime: drives on the passed runtime.
+        let seen = bridge_on_runtime(async { format!("{:?}", Handle::current().id()) }, &owned);
+        assert_eq!(
+            seen, owned_id,
+            "no-ambient drive must use the passed runtime"
+        );
+
+        // Ambient multi-thread runtime present: the drive must STILL land on
+        // the passed runtime — under the old ambient-preferring behavior this
+        // assertion fails with the ambient's id.
+        let ambient = build_query_runtime("bridge-test-ambient");
+        let owned_for_task = Arc::clone(&owned);
+        let seen = ambient.block_on(async move {
+            tokio::spawn(async move {
+                bridge_on_runtime(
+                    async { format!("{:?}", Handle::current().id()) },
+                    &owned_for_task,
+                )
+            })
+            .await
+            .expect("bridge task")
+        });
+        assert_eq!(
+            seen, owned_id,
+            "an ambient runtime must not capture the drive"
+        );
+    }
 }

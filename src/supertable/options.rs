@@ -47,6 +47,7 @@ use std::{
 
 use arrow_schema::{DataType, Field, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use tokio::sync::Mutex as TokioMutex;
 
 use super::{
     error::BuildError,
@@ -56,7 +57,7 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, StorageBackend, StorageColdFetchMode, ThreadCount},
+    config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
     memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -66,8 +67,12 @@ use crate::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
+        vector::layout::VectorLayout,
     },
-    supertable::manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
+    supertable::{
+        manifest::{UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy},
+        slow_vector_state::CentroidSection,
+    },
 };
 
 /// Vector column dim must be in this inclusive range. Mirrors
@@ -161,9 +166,13 @@ const DEFAULT_READ_STALENESS_SECS: u64 = 1;
 const DEFAULT_TARGET_SUPERFILES_PER_PART: u64 = 10_000;
 /// Default soft cap on a manifest part's compressed size (10 MiB).
 const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
-/// Default: eager-load manifest parts at open when there are at most
-/// this many (open latency vs memory trade-off).
-const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
+/// Default: always eager-load every manifest part at open. Open pays the
+/// full (parallel) part fetch up front so search never issues a serial
+/// manifest GET wave before its data fetches; snapshot refreshes inherit
+/// loaded parts and fetch only the missing ones as part of the query that
+/// triggered them. Lazy load stays available as an explicit opt-in
+/// (`with_eager_load_threshold(0)`).
+const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -171,12 +180,15 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
+/// Default user-superfile batch size for the hidden-index drain. `1` streams
+/// one source superfile at a time to keep drain RAM bounded on large corpora.
+/// `-1` = unbounded (single merge), `0` = skip the drain.
+const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
-
 /// Read-path freshness policy — how an open handle picks up superfiles
 /// committed (by this or another process) after it opened.
 ///
@@ -327,6 +339,17 @@ pub struct SupertableOptions {
     /// that bounds the mmap resident set, this bounds anonymous heap. See
     /// [`crate::memory`].
     pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// Single-slot cache for the slow-CAS centroid-section spill, shared by
+    /// every manifest snapshot of this table handle and keyed by the
+    /// section's content-addressed URI (a new drain generation replaces
+    /// it). Serves the stripped-summary admit rescore from a local
+    /// temp-file spill instead of per-cell object-store reads.
+    pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Single-slot cache for the user table's fp32 fine centroids, hydrated
+    /// once per manifest generation from the FULL manifest parts on the
+    /// first stripped-summary rescore (consumers open with routing parts,
+    /// which carry no fp32). Keyed by `manifest_id`.
+    pub(crate) user_centroid_cache: Arc<TokioMutex<Option<Arc<UserCentroidCache>>>>,
     /// When `true` (default), each commit pre-populates the
     /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
@@ -353,6 +376,7 @@ pub struct SupertableOptions {
     /// the persisted manifest list — config changes after
     /// creation have no effect.
     pub partition_strategy: Option<PartitionStrategy>,
+    pub(crate) vector_layout: VectorLayout,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
     /// the next commit's superfiles for that partition go into
@@ -364,27 +388,46 @@ pub struct SupertableOptions {
     /// `target_superfiles_per_partition`. Default `10 * (1 << 20)`
     /// (10 MiB).
     pub part_size_threshold_bytes: u64,
+    /// Number of user superfiles the hidden-index drain materializes per batch
+    /// before publishing that batch's cell superfiles and freeing its working
+    /// set. Bounds drain RAM to O(batch) instead of O(corpus) — the lever for
+    /// draining at 10M/1B on a fixed-memory box. Each batch appends one
+    /// superfile per touched cell; compaction collapses them later.
+    ///
+    /// `-1` = unbounded (all user superfiles in one merge: lowest cell
+    /// fragmentation, but O(corpus) RAM — the pre-batching behavior). `0` =
+    /// skip the drain entirely. Default [`DEFAULT_DRAIN_BATCH_SUPERFILES`].
+    /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
+    /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
+    pub drain_batch_superfiles: i64,
+    /// Per-cell consolidation op for the hidden-index drain. Default
+    /// [`DrainConsolidate::Kmeans`]. [`SupertableOptions::apply_config`] copies
+    /// `vector.drain_consolidate`; [`Self::with_drain_consolidate`] overrides
+    /// per table (identity tests use splice).
+    pub drain_consolidate: DrainConsolidate,
     /// Eager-load threshold for manifest parts at
     /// [`Supertable::open`] time. When the manifest list
     /// references this many parts or fewer, open parallel-
     /// fetches all parts up front + populates the
-    /// `Manifest.parts` cache. Above the threshold, parts are
+    /// `ManifestSnapshot.parts` cache. Above the threshold, parts are
     /// left in empty `OnceCell`s — the first
-    /// `Manifest::part(id).await` lazy-loads on demand.
+    /// `ManifestSnapshot::part(id).await` lazy-loads on demand.
     ///
-    /// Default `4`. Set to
-    /// `0` to force lazy-load even for tiny manifests
+    /// Default `u32::MAX` — open always eager-loads every part (in
+    /// parallel), so queries on a fresh handle pay zero serial manifest
+    /// GETs; cold open takes proportionally longer on huge tables instead.
+    /// Set to `0` to force lazy-load even for tiny manifests
     /// (useful for tests that want to verify the lazy path).
     ///
-    /// **Eager mode** populates `Manifest.superfile_list.superfiles`
+    /// **Eager mode** populates `ManifestSnapshot.superfile_list.superfiles`
     /// with the flat union of all loaded parts' superfiles —
     /// the legacy query paths (`bm25_search`,
     /// `vector_search`, `query_sql`) iterate this flat view.
     ///
-    /// **Lazy mode** leaves `Manifest.superfile_list.superfiles`
+    /// **Lazy mode** leaves `ManifestSnapshot.superfile_list.superfiles`
     /// empty until the hierarchical query path lands.
     /// Until then, callers using lazy mode must drive
-    /// `Manifest::part(id).await` directly; legacy
+    /// `ManifestSnapshot::part(id).await` directly; legacy
     /// flat-iteration queries return empty results.
     pub eager_load_threshold_parts: u32,
     /// Max OCC retry attempts before `writer.commit()` surfaces
@@ -436,6 +479,28 @@ pub struct SupertableOptions {
     /// the application never refreshes by hand. Default:
     /// [`Consistency::BoundedStaleness`] with a 1s window.
     pub read_consistency: Consistency,
+    /// Read-only-consumer memory mode for per-superfile vector summaries:
+    /// when `true`, manifest hydration derives the 1-bit admit slab +
+    /// norms from each summary's fp32 fine centroids and then drops the
+    /// fp32 vectors from memory. The exact admit rescore reads centroid
+    /// regions from the superfiles through the attached disk cache
+    /// instead (mmap-served warm, range-GET on first touch).
+    ///
+    /// **Read-only handles only.** Writer paths re-encode resident
+    /// summaries back to storage (slow-state blob republish on hidden
+    /// commits / drain checkpoints, latest-part rewrites) — a handle
+    /// that commits with this set would persist empty centroids; the
+    /// encode path asserts against that. Grid (routing) centroids and
+    /// summary `counts` stay resident regardless. Default `false`.
+    pub summary_centroids_from_superfiles: bool,
+    /// Per-table override for the **user** grid's cell count (trained at
+    /// the first commit and stamped into the manifest; changing it later
+    /// affects new tables only). `None` → `vector.user_cell_count` from
+    /// the YAML config.
+    pub user_cell_count: Option<usize>,
+    /// Per-table override for the **hidden** vector-index grid's cell
+    /// count. `None` → `vector.hidden_cell_count` from the YAML config.
+    pub hidden_cell_count: Option<usize>,
 }
 
 impl SupertableOptions {
@@ -569,16 +634,24 @@ impl SupertableOptions {
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
+            centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
+            vector_layout: VectorLayout::Ivf,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
+            drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
+            drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
+            summary_centroids_from_superfiles: false,
+            user_cell_count: None,
+            hidden_cell_count: None,
         })
     }
 
@@ -607,9 +680,9 @@ impl SupertableOptions {
     /// Resolve the effective partition strategy for this
     /// supertable. Called at [`Supertable::create`] time
     /// when nothing's been persisted yet. The default —
-    /// `Hash { column: id_column, n_buckets: 1 }` — is
-    /// observationally equivalent to "no partitioning";
-    /// callers wanting real partitioning set
+    /// `IngestionTime { granularity_secs: 86_400 }`, one-day buckets
+    /// keyed off the injected `_id`'s timestamp — groups each day's
+    /// commits; callers wanting different partitioning set
     /// [`Self::partition_strategy`] via
     /// [`Self::with_partition_strategy`].
     pub fn effective_partition_strategy(&self) -> PartitionStrategy {
@@ -756,6 +829,21 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the hidden-index drain batch size (user superfiles per batch).
+    /// `-1` = unbounded single merge, `0` = skip the drain. See
+    /// [`Self::drain_batch_superfiles`].
+    pub fn with_drain_batch_superfiles(mut self, n: i64) -> Self {
+        self.drain_batch_superfiles = n;
+        self
+    }
+
+    /// Override the hidden-index drain consolidation op. See
+    /// [`Self::drain_consolidate`].
+    pub fn with_drain_consolidate(mut self, mode: DrainConsolidate) -> Self {
+        self.drain_consolidate = mode;
+        self
+    }
+
     /// Override the soft cap on a manifest part's compressed
     /// size in bytes. Default `10 MiB`.
     pub fn with_part_size_threshold_bytes(mut self, n: u64) -> Self {
@@ -803,6 +891,26 @@ impl SupertableOptions {
     /// `true`. See [`Self::verify_crc_on_open`].
     pub fn with_verify_crc_on_open(mut self, v: bool) -> Self {
         self.verify_crc_on_open = v;
+        self
+    }
+
+    /// Read-only-consumer memory mode: derive the 1-bit admit slab at
+    /// hydration and drop summary fp32 fine centroids from memory; the
+    /// exact admit rescore reads superfile centroid regions through the
+    /// disk cache instead. See
+    /// [`Self::summary_centroids_from_superfiles`].
+    pub fn with_summary_centroids_from_superfiles(mut self, v: bool) -> Self {
+        self.summary_centroids_from_superfiles = v;
+        self
+    }
+
+    /// Per-table cell counts for the user and hidden vector grids,
+    /// overriding the YAML config's `vector.user_cell_count` /
+    /// `vector.hidden_cell_count`. Grids are trained at the first commit
+    /// and stamped into the manifest, so this only affects table create.
+    pub fn with_vector_cell_counts(mut self, user: usize, hidden: usize) -> Self {
+        self.user_cell_count = Some(user);
+        self.hidden_cell_count = Some(hidden);
         self
     }
 
@@ -869,6 +977,8 @@ impl SupertableOptions {
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
+        self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.drain_consolidate = cfg.vector.drain_consolidate;
         // The `config.yaml` source for the connection budget; the connect path
         // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
         // Note this replaces the budget outright: don't call `apply_config` on
@@ -977,6 +1087,12 @@ impl SupertableOptions {
         Ok(())
     }
 
+    /// Set the vector index layout passed through to the superfile builder.
+    pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
+        self.vector_layout = layout;
+        self
+    }
+
     /// Construct a `superfile::BuilderOptions` for one rayon
     /// shard worker at commit time. The shard worker constructs
     /// its own `SuperfileBuilder` from this and feeds its slice
@@ -995,6 +1111,7 @@ impl SupertableOptions {
             self.vector_columns.clone(),
             self.tokenizer.clone(),
         )
+        .with_vector_layout(self.vector_layout)
     }
 
     /// Effective scalar-only schema — the user's columns with
@@ -1097,6 +1214,7 @@ mod tests {
             rot_seed: 0,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }
     }
 

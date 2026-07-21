@@ -43,8 +43,8 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use infino::{
     config::{
-        CompactionSettings, Config, MemorySettings, StorageBackend, StorageColdFetchMode,
-        StorageSettings, SupertableSettings,
+        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+        SupertableSettings,
     },
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
@@ -113,7 +113,8 @@ fn real_azure_options(dim: usize) -> infino::supertable::SupertableOptions {
             n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+            provided_centroids: None,
         }],
         Some(infino::test_helpers::default_tokenizer()),
     )
@@ -138,7 +139,7 @@ fn real_azure_config(container: &str, prefix: &str, cache_root: &std::path::Path
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
-        memory: MemorySettings::default(),
+        ..Config::default()
     }
 }
 

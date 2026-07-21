@@ -577,6 +577,15 @@ pub async fn superfile_storage_fixture() -> StorageFixture {
     backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await
 }
 
+/// Concurrent background-fill permits for the bench disk cache — the
+/// engine's default (`DiskCacheConfig::prefetch_concurrency`). Cache
+/// tuning is engine configuration, not a bench env knob.
+fn bench_prefetch_concurrency() -> usize {
+    DiskCacheConfig::default().prefetch_concurrency
+}
+
+/// GiB value from `name`, falling back to `default_gib` when unset,
+/// unparsable, or zero.
 fn env_gib(name: &str, default_gib: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -585,28 +594,8 @@ fn env_gib(name: &str, default_gib: u64) -> u64 {
         .unwrap_or(default_gib)
 }
 
-fn supertable_search_cache_gib() -> Option<u64> {
-    std::env::var("INFINO_SUPERTABLE_SEARCH_CACHE_GIB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-}
-
-/// Concurrent background-fill permits for the bench disk cache. Raising
-/// `INFINO_BENCH_PREFETCH_CONCURRENCY` lets a many-segment supertable
-/// finish `wait_until_warm` within the timeout (256 segments promote in
-/// `ceil(256 / concurrency)` waves). Background memory scales as
-/// `concurrency × cold_fetch_streams × cold_fetch_chunk_bytes`, so e.g.
-/// 64 × 8 × 8 MiB ≈ 4 GiB of in-flight fill buffers.
-fn bench_prefetch_concurrency() -> usize {
-    std::env::var("INFINO_BENCH_PREFETCH_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or_else(|| DiskCacheConfig::default().prefetch_concurrency)
-}
-
-/// Fresh disk cache for ingest producers (8 GiB budget).
+/// Fresh disk cache for ingest producers (8 GiB budget;
+/// `INFINO_SUPERTABLE_INGEST_CACHE_GIB` overrides).
 ///
 /// Ingest attaches this cache only to keep superfile bytes out of the
 /// unbounded in-memory tier; commit-time cache prepopulation is disabled,
@@ -625,10 +614,10 @@ pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<Disk
 /// Fresh disk cache for supertable search consumers.
 ///
 /// Budget selection (first match wins):
-/// 1. `INFINO_SUPERTABLE_SEARCH_CACHE_GIB` env var (explicit override).
+/// 1. `INFINO_SUPERTABLE_SEARCH_CACHE_GIB` (explicit experiment pin).
 /// 2. `index_size_bytes + 10%` when the caller knows the total index
 ///    size from the manifest — ensures the warm bench is truly warm.
-/// 3. `INFINO_SUPERTABLE_INGEST_CACHE_GIB` or 8 GiB fallback.
+/// 3. 8 GiB fallback.
 pub fn fresh_supertable_search_cache(
     storage: Arc<dyn StorageProvider>,
     index_size_bytes: Option<u64>,
@@ -636,12 +625,15 @@ pub fn fresh_supertable_search_cache(
     use std::sync::Once;
     static LOG_ONCE: Once = Once::new();
 
-    let budget_bytes = if let Some(explicit_gib) = supertable_search_cache_gib() {
-        let b = explicit_gib * GIB_BYTES;
+    let env_pin = std::env::var("INFINO_SUPERTABLE_SEARCH_CACHE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0);
+    let budget_bytes = if let Some(gib) = env_pin {
         LOG_ONCE.call_once(|| {
-            eprintln!("[tiers] search cache budget = {explicit_gib} GiB (INFINO_SUPERTABLE_SEARCH_CACHE_GIB)");
+            eprintln!("[tiers] search cache budget = {gib} GiB (env pin)");
         });
-        b
+        gib * GIB_BYTES
     } else if let Some(idx) = index_size_bytes.filter(|&s| s > 0) {
         let b = idx + idx / INDEX_CACHE_HEADROOM_DIVISOR;
         LOG_ONCE.call_once(|| {
@@ -653,14 +645,10 @@ pub fn fresh_supertable_search_cache(
         });
         b
     } else {
-        let gib = env_gib(
-            "INFINO_SUPERTABLE_INGEST_CACHE_GIB",
-            DEFAULT_INGEST_CACHE_GIB,
-        );
         LOG_ONCE.call_once(|| {
-            eprintln!("[tiers] search cache budget = {gib} GiB (default)");
+            eprintln!("[tiers] search cache budget = {DEFAULT_INGEST_CACHE_GIB} GiB (default)");
         });
-        gib * GIB_BYTES
+        DEFAULT_INGEST_CACHE_GIB * GIB_BYTES
     };
     fresh_disk_cache_with_mode(
         storage,
@@ -708,7 +696,7 @@ pub fn open_superfile_cold_reader(
     let offsets = superfile_cold_size_hint(known_size);
     let reader = block_on(async move {
         cache
-            .reader_with_hints(uri, Some(&offsets))
+            .reader_with_hints(uri, Some(&offsets), None, true)
             .await
             .expect("cold reader")
     });
@@ -737,18 +725,51 @@ fn fresh_disk_cache_with_mode(
     (dir, cache)
 }
 
+/// Opt-in for the read-only-consumer summary-centroid memory mode
+/// (`SupertableOptions::summary_centroids_from_superfiles`): hydration
+/// derives the 1-bit admit slab and drops summary fp32 fine centroids;
+/// the exact admit rescore reads superfile centroid regions through the
+/// disk cache. Bench-harness A/B switch; the engine default stays off.
+const SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV: &str =
+    "INFINO_BENCH_SUMMARY_CENTROIDS_FROM_SUPERFILES";
+
 pub fn consumer_options(
     base: SupertableOptions,
     storage: Arc<dyn StorageProvider>,
     cache: Arc<DiskCacheStore>,
 ) -> SupertableOptions {
+    consumer_options_with_knob(base, storage, cache, true)
+}
+
+/// [`consumer_options`] with the consumer-memory-mode env knob gateable.
+/// Handles that drive lifecycle mutations (drain / optimize / delta
+/// commits) must pass `allow_summary_knob = false`: the mode is a
+/// read-only-consumer contract — a writer republishing manifests from
+/// stripped summaries panics on the engine's encode guard.
+pub fn consumer_options_with_knob(
+    base: SupertableOptions,
+    storage: Arc<dyn StorageProvider>,
+    cache: Arc<DiskCacheStore>,
+    allow_summary_knob: bool,
+) -> SupertableOptions {
     // Search benches query a static, already-ingested supertable with no
     // concurrent writers. Snapshot consistency keeps the read path free of
     // pointer-GET refreshes so the measured latency is pure query cost; the
     // one-time cold-open manifest read is timed separately.
+    let knob_env = std::env::var(SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
+    if knob_env && !allow_summary_knob {
+        eprintln!(
+            "[tiers] {SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV} suppressed on this handle: \
+             it drives lifecycle mutations (writer contract needs resident fp32)"
+        );
+    }
     base.with_storage(storage)
         .with_disk_cache(cache)
         .with_read_consistency(infino::supertable::options::Consistency::Snapshot)
+        .with_summary_centroids_from_superfiles(knob_env && allow_summary_knob)
 }
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {

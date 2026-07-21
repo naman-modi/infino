@@ -243,7 +243,16 @@ pub async fn probe_pointer(
 
 pub struct EncodedPart {
     pub part: ManifestPart,
+    /// Primary wire form: FULL (fp32 + admit slab) for user manifests —
+    /// the fp32 store the first rescore hydrates from — ROUTING-only for
+    /// hidden manifests, whose fp32 lives in the slow-CAS centroid
+    /// section instead.
     pub encoded: Vec<u8>,
+    /// Routing-only sibling (counts + admit slab, no fp32) — what
+    /// consumer opens fetch. `None` for hidden manifests: their primary
+    /// form IS routing-shaped, so a sibling would be a byte-identical
+    /// duplicate. PUT together with `encoded` in the same commit.
+    pub routing_encoded: Option<Vec<u8>>,
 }
 
 /// Outcome of writing a manifest part — returned by
@@ -275,9 +284,8 @@ pub struct ManifestWriteResult {
 pub async fn write_manifest_part(
     storage: &dyn StorageProvider,
     part: &ManifestPart,
-    zstd_level: i32,
 ) -> Result<PartWriteResult, CommitError> {
-    let compressed = part_mod::encode(part, zstd_level);
+    let compressed = part_mod::encode(part);
     let content_hash = ContentHash::of(&compressed);
     let uri = part_uri(&content_hash);
     let size_compressed = compressed.len() as u64;
@@ -634,7 +642,7 @@ mod tests {
         }
     }
 
-    // ---- read_pointer / write_pointer / write_manifest_list -------------
+    // ---- read_pointer / write_pointer / write_manifest -------------
     //
     // Drive the storage-touching helpers through LocalFs so the
     // success + storage-not-found + CAS-failure branches all
@@ -753,8 +761,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_manifest_list_succeeds_and_addresses_uri() {
-        // write_manifest_list encodes JSON, computes a hash,
+    async fn write_manifest_succeeds_and_addresses_uri() {
+        // write_manifest encodes JSON, computes a hash,
         // and PUTs at manifest_uri(manifest_id). Verify the
         // returned URI matches the deterministic naming rule
         // and the bytes are reachable through `get`.
@@ -763,6 +771,8 @@ mod tests {
         // columns, an empty schema. Encoding only requires the
         // format header + the empty collections.
         let list = PersistedManifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
             tombstone_seqs: Default::default(),
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -775,6 +785,11 @@ mod tests {
                 column: "_id".into(),
                 granularity_secs: 86_400,
             },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: Vec::new(),
         };
         let res = write_manifest(storage.as_ref(), &list)

@@ -90,6 +90,7 @@ fn build_pipeline_superfile() -> Bytes {
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     );
@@ -397,6 +398,7 @@ fn add_batch_from_reader_mergeability_compatible_superfiles() {
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     );
@@ -628,6 +630,7 @@ fn add_batch_from_reader_mergeability_vector_column_count_mismatch() {
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -681,6 +684,7 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -720,6 +724,7 @@ fn add_batch_from_reader_mergeability_vector_column_name_mismatch() {
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -747,6 +752,7 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -786,6 +792,7 @@ fn add_batch_from_reader_mergeability_vector_dimension_mismatch() {
             rot_seed: 17,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -978,6 +985,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -1027,6 +1035,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_excludes_vectors() {
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         None,
     );
@@ -1181,6 +1190,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     );
@@ -1232,6 +1242,7 @@ fn add_batch_from_reader_with_deleted_docs_bitmap_partial_deletes_mixed_indexes(
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     );

@@ -15,12 +15,18 @@
 //!
 //! [`ManifestPart`]: super::part::ManifestPart
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+};
 
 use arrow::compute::concat;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Schema};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -29,7 +35,10 @@ use crate::supertable::manifest::{
     add_sum_arrays,
     bloom::Bloom,
     column_hll, column_min_max, column_sum,
-    encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array},
+    encoding::{
+        DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
+        decode_value_counts, encode_cluster_centroids, encode_length1_array, encode_value_counts,
+    },
     hll::HllSketch,
     merge_min_max_arrays,
     part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
@@ -43,6 +52,27 @@ use crate::supertable::manifest::{
 /// shape as the [`super::part::FORMAT_VERSION`] policy for
 /// manifest parts).
 pub const FORMAT_VERSION: &str = "1.0";
+/// Reserved list-aggregate key carrying each part's superfile birth range.
+pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version";
+/// Maximum distinct values retained as an exact per-column frequency table.
+/// Columns crossing the cap carry no table, so high-cardinality data has
+/// bounded manifest cost.
+const MAX_EXACT_VALUE_COUNTS: usize = 256;
+
+/// Cells probed per query — exactly one, the grid-nearest. The p=1 read
+/// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs);
+/// recall past its coverage ceiling is bought with boundary replication at
+/// drain time, never by widening the probe set.
+const DEFAULT_CELL_NPROBE_MIN: usize = 1;
+/// Hard cap on cells probed per query. Equal to the floor: adaptive
+/// widening is off — coverage is a drain-side (replication) concern.
+const DEFAULT_CELL_NPROBE_MAX: usize = 1;
+/// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
+/// Inert while `nprobe_max == nprobe_min`; acts only when a table
+/// explicitly widens its persisted routing.
+const DEFAULT_CELL_SLACK: f32 = 1.0;
+/// Fine IVF centroids probed inside the selected cell.
+const DEFAULT_CELL_FINE_NPROBE: usize = 8;
 
 // ---------- Public in-memory shapes ----------
 
@@ -81,6 +111,47 @@ pub struct Manifest {
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
     /// for how the field is resolved.
     pub partition_strategy: PartitionStrategy,
+    /// Object-storage prefix for the hidden vector-index sibling
+    /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
+    /// create when vector columns are configured; immutable.
+    pub vector_index_storage_prefix: Option<String>,
+    /// Global vector cell-index coordination state, owned by THIS (the user)
+    /// table. Source of truth for the immutable cell grids trained from the
+    /// first committed batch: `grid` at `hidden_cell_count` cells (read
+    /// verbatim by the drain, which writes it as the hidden sibling's
+    /// `PartitionStrategy::VectorCell` with live per-cell counts on top) and
+    /// the optional finer `user_grid` at `user_cell_count` cells (user-side
+    /// packing + pre-drain routing only). `None` until the first commit with
+    /// vectors, and on tables without vector columns.
+    pub global_vector_index: Option<GlobalVectorIndex>,
+    /// Drained user commit-versions — **hidden manifest only** (empty on the
+    /// user manifest). The hidden-index drain advances this as it consumes user
+    /// commits into cells; see [`DrainedVersionRanges`].
+    pub drained_ranges: DrainedVersionRanges,
+    /// The deleted-`_id` set's encoded bytes carried INLINE in the list —
+    /// so the set rides the pointer payload and consulting it never costs
+    /// a GET.
+    pub deleted_user_ids_inline: Option<Vec<u8>>,
+    /// Slow-CAS section: content-addressed blob holding this table's
+    /// superfile entries verbatim (the drain-owned routing/centroid state).
+    /// Present only on the hidden vector-index table, stamped exclusively by
+    /// drain / hidden compaction; the user table's slow section stays `None`
+    /// (the inverse of the hidden manifest — same format, no special paths).
+    /// `ManifestSnapshot::update` deliberately does NOT carry these into its
+    /// successor list: any membership change invalidates the blob, and only
+    /// maintenance republishes it. Every consumer keys on ref presence,
+    /// never on table kind.
+    pub slow_vector_state_uri: Option<String>,
+    pub slow_vector_state_content_hash: Option<ContentHash>,
+    /// Centroid-section sibling: every visible entry's fp32 fine centroids
+    /// concatenated contiguously in `(entry, column, cell)` order. The
+    /// stripped-summary admit rescore hydrates it in one fetch on the
+    /// first cold query (NVMe-spilled, page-cache-evictable) instead of
+    /// fanning one block GET per shortlisted cell per query — measured 53
+    /// then 43 GETs on the first two post-drain cold queries at 1M/256.
+    /// Stamped and cleared together with the full ref; absent on older
+    /// manifests (consumers fall back to per-superfile centroid reads).
+    pub slow_vector_state_centroids: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -99,6 +170,158 @@ pub struct Manifest {
     pub tombstone_seqs: BTreeMap<Uuid, u64>,
 }
 
+/// Content-addressed reference to a sibling object of a manifest
+/// artifact: a manifest part's routing form ([`ManifestPartEntry::routing`],
+/// same entries with each vector summary's cluster blocks encoded as
+/// counts + 1-bit admit slab, no fp32 payload) or the slow-CAS centroid
+/// section ([`Manifest::slow_vector_state_centroids`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRef {
+    pub uri: String,
+    pub content_hash: ContentHash,
+}
+
+/// Global vector cell-index state owned by the user-table manifest (see
+/// [`Manifest::global_vector_index`]). Distinct from
+/// [`PartitionStrategy`]: it describes the *global grid the table's vectors are
+/// indexed into*, not how this table partitions its own superfiles (user
+/// superfiles are append-only and span all cells).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalVectorIndex {
+    /// Vector column this grid indexes.
+    pub column: String,
+    /// Immutable cell centroids trained at first commit at
+    /// `hidden_cell_count` cells. This is the grid the drain reads verbatim
+    /// to build the hidden cell index. When `user_grid` is absent it also
+    /// serves the user side (packing + pre-drain routing).
+    pub grid: super::ClusterCentroids,
+    /// Optional finer grid trained at the same first commit at
+    /// `user_cell_count` cells. Used only on the user side: cell-packing
+    /// user superfiles at commit and routing the pre-drain query. The drain
+    /// never reads it. `None` on tables created before it existed (and when
+    /// `user_cell_count == hidden_cell_count`) — consumers fall back to
+    /// `grid` via [`Self::into_user_grid`].
+    pub user_grid: Option<super::ClusterCentroids>,
+}
+
+impl GlobalVectorIndex {
+    /// The grid the user side (commit packing + pre-drain routing) uses:
+    /// `user_grid` when trained, else `grid`. Cell tags stamped into user
+    /// superfiles and the query's cell ranking must come from this one grid.
+    pub fn into_user_grid(self) -> super::ClusterCentroids {
+        self.user_grid.unwrap_or(self.grid)
+    }
+
+    /// Borrowing form of [`Self::into_user_grid`] for the query path.
+    ///
+    /// Callers that only need to score/rank must use this (or
+    /// [`crate::supertable::manifest::ManifestSnapshot::global_vector_index`])
+    /// instead of cloning the index: [`super::ClusterCentroids`]'s transposed
+    /// SIMD cache is per-instance, and a clone that drops it forces a full
+    /// scalar transpose rebuild on the next scan.
+    pub fn user_grid(&self) -> &super::ClusterCentroids {
+        self.user_grid.as_ref().unwrap_or(&self.grid)
+    }
+}
+
+/// Normalized set of drained user commit-versions, stored **only on the hidden
+/// manifest**. Tracks which user `manifest_id`s the hidden-index drain has
+/// consumed into cells, so repeated/incremental drains skip already-drained
+/// commits. Intervals are inclusive `[lo, hi]`, sorted, disjoint, and
+/// adjacent-merged.
+///
+/// The maximal contiguous drained prefix from genesis is just the first
+/// interval; out-of-order completions from **parallel drainers** appear as
+/// extra intervals that merge as the gaps between them fill. Interval count is
+/// bounded by in-flight drain concurrency — not corpus size — so it stays tiny.
+/// Empty on the user manifest (which never drains).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrainedVersionRanges {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl DrainedVersionRanges {
+    /// Rebuild from persisted intervals (normalizes defensively).
+    ///
+    /// Rejects inverted intervals (`lo > hi`) instead of admitting them:
+    /// this decodes remote manifest state, and a malformed interval would
+    /// make `contains`/`covers` lie in release builds — versions could be
+    /// skipped or re-drained. Corruption fails the manifest load loudly.
+    pub fn from_intervals(intervals: Vec<(u64, u64)>) -> Result<Self, ListParseError> {
+        let mut s = Self { ranges: Vec::new() };
+        for (lo, hi) in intervals {
+            if lo > hi {
+                return Err(ListParseError::BadFieldValue(
+                    "drained_ranges",
+                    format!("inverted interval [{lo}, {hi}]"),
+                ));
+            }
+            s.insert_range(lo, hi);
+        }
+        Ok(s)
+    }
+
+    /// The normalized intervals, for serialization.
+    pub fn intervals(&self) -> &[(u64, u64)] {
+        &self.ranges
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Is `version` covered by a drained interval?
+    pub fn contains(&self, version: u64) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(lo, hi)| lo <= version && version <= hi)
+    }
+
+    /// Is every version in inclusive `[lo, hi]` covered by one drained run?
+    pub fn covers(&self, lo: u64, hi: u64) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(drained_lo, drained_hi)| drained_lo <= lo && hi <= drained_hi)
+    }
+
+    /// End of the maximal contiguous drained run anchored at genesis (0), or
+    /// `None` if version 0 isn't covered (no genesis-anchored prefix yet). The
+    /// drain uses this to extend the prefix over **vacuous version gaps** —
+    /// commit-versions that added no superfile (deletes, compaction outputs that
+    /// carry an older birth_version, empty commits). Those versions are never
+    /// reused, so folding them into the prefix keeps the set from fragmenting
+    /// permanently around every superfile-less commit.
+    pub fn prefix_end(&self) -> Option<u64> {
+        match self.ranges.first() {
+            Some(&(0, hi)) => Some(hi),
+            _ => None,
+        }
+    }
+
+    /// Mark a single version drained (merging into the normalized set).
+    pub fn insert(&mut self, version: u64) {
+        self.insert_range(version, version);
+    }
+
+    /// Mark an inclusive `[lo, hi]` interval drained, keeping the set
+    /// normalized (sorted, disjoint, adjacent-merged). Adjacent means
+    /// gap-free: `[1,3]` + `[4,6]` → `[1,6]` (version 4 = 3+1, no hole),
+    /// whereas `[1,3]` + `[5,6]` stays split (version 4 is undrained).
+    pub fn insert_range(&mut self, lo: u64, hi: u64) {
+        debug_assert!(lo <= hi);
+        self.ranges.push((lo, hi));
+        self.ranges.sort_unstable_by_key(|&(l, _)| l);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.ranges.len());
+        for &(l, h) in &self.ranges {
+            match merged.last_mut() {
+                Some(last) if l <= last.1.saturating_add(1) => last.1 = last.1.max(h),
+                _ => merged.push((l, h)),
+            }
+        }
+        self.ranges = merged;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FtsColumnInfo {
     pub column: String,
@@ -115,10 +338,35 @@ pub struct VectorColumnInfo {
     pub metric: String,
 }
 
+/// Adaptive cell-probe tuning for the hidden VectorCell index.
+/// Calibrated per table; persisted in the manifest list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellRoutingParams {
+    /// Nearest cells always probed (recall floor).
+    pub nprobe_min: usize,
+    /// Hard cap on cells probed per query (GET budget).
+    pub nprobe_max: usize,
+    /// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
+    pub slack: f32,
+    /// Fine IVF centroids probed across the selected hidden cells.
+    pub fine_nprobe: usize,
+}
+
+impl Default for CellRoutingParams {
+    fn default() -> Self {
+        Self {
+            nprobe_min: DEFAULT_CELL_NPROBE_MIN,
+            nprobe_max: DEFAULT_CELL_NPROBE_MAX,
+            slack: DEFAULT_CELL_SLACK,
+            fine_nprobe: DEFAULT_CELL_FINE_NPROBE,
+        }
+    }
+}
+
 /// How superfiles are routed into manifest parts. Stamped into
 /// the list on first commit; immutable thereafter (changes
 /// require external compaction).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PartitionStrategy {
     TimeRange {
         column: String,
@@ -134,6 +382,13 @@ pub enum PartitionStrategy {
     ColumnRange {
         column: String,
         boundaries: Vec<Vec<u8>>,
+    },
+    /// Partition by vector distance to fixed global centroids.
+    /// Each row is assigned to the cell whose centroid is nearest.
+    VectorCell {
+        column: String,
+        clusters: super::ClusterCentroids,
+        routing: CellRoutingParams,
     },
     IngestionTime {
         granularity_secs: i64,
@@ -151,6 +406,13 @@ pub struct ManifestPartEntry {
     pub size_bytes_compressed: u64,
     pub size_bytes_uncompressed: u64,
     pub content_hash: ContentHash,
+    /// Routing-only sibling of this part (same entries, vector summaries
+    /// as counts + 1-bit admit slab, no fp32). Consumer opens with
+    /// `summary_centroids_from_superfiles` load it instead of `uri` —
+    /// the user table's fp32 fine centroids stay in storage. Absent on
+    /// parts written before the sibling existed (loads fall back to the
+    /// full part).
+    pub routing: Option<RoutingRef>,
     /// Aggregate id range across this part's superfiles. `i128`
     /// matches the supertable-injected `_id` column type
     /// (`Decimal128(38, 0)`); signed-int comparison gives
@@ -164,16 +426,23 @@ pub struct ManifestPartEntry {
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
-    /// Per-vector-column aggregate centroid envelope.
-    /// Empty → always-keep.
-    pub vector_summary_agg: BTreeMap<String, VectorSummaryAgg>,
 }
 
-/// Aggregate scalar stats across a part's superfiles. Min/max
-/// (and the exact sum) are held as length-1 [`ArrayRef`]s of the
-/// column's Arrow type — the same in-memory shape the per-superfile
-/// `SuperfileEntry.scalar_stats` map uses. They are decoded once when the
-/// manifest list is loaded, so the list-level scalar prune
+impl ManifestPartEntry {
+    /// Inclusive birth-version range for list-level drain pruning.
+    pub(crate) fn birth_version_range(&self) -> Option<(u64, u64)> {
+        let aggregate = self.scalar_stats_agg.get(BIRTH_VERSION_AGGREGATE_COLUMN)?;
+        let min = aggregate.min.as_any().downcast_ref::<UInt64Array>()?;
+        let max = aggregate.max.as_any().downcast_ref::<UInt64Array>()?;
+        Some((min.value(0), max.value(0)))
+    }
+}
+
+/// Aggregate scalar stats across a part's superfiles. Min/max and exact sums
+/// use Arrow arrays; low-cardinality columns may additionally carry a capped
+/// exact value-frequency table. This is the same in-memory shape the
+/// per-superfile `SuperfileEntry.scalar_stats` map uses. Stats are decoded once
+/// when the manifest list is loaded, so the list-level scalar prune
 /// ([`crate::supertable::query::prune`]) compares against them
 /// without a per-query Arrow-IPC decode. The JSON wire form still
 /// stores them as base64 Arrow-IPC bytes (see [`ScalarStatsAggDto`]).
@@ -191,6 +460,161 @@ pub struct ScalarStatsAgg {
     /// Merged HLL distinct sketch (raw registers); `None` when any
     /// segment lacks one.
     pub hll: Option<Vec<u8>>,
+    /// Exact non-null value frequencies when the column has at most
+    /// [`MAX_EXACT_VALUE_COUNTS`] distinct values.
+    pub(crate) value_counts: Option<ScalarValueCounts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScalarValueCounts {
+    entries: Vec<(ScalarValue, u64)>,
+}
+
+impl ScalarValueCounts {
+    fn from_column(column: &ArrayRef) -> Option<Self> {
+        if !exact_value_counts_type(column.data_type()) {
+            return None;
+        }
+        match column.data_type() {
+            DataType::Int64 => {
+                let array = column.as_any().downcast_ref::<Int64Array>()?;
+                return Self::from_int64(array);
+            }
+            DataType::Utf8 => {
+                let array = column.as_any().downcast_ref::<StringArray>()?;
+                return Self::from_strings(
+                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
+                    ScalarValue::Utf8,
+                );
+            }
+            DataType::LargeUtf8 => {
+                let array = column.as_any().downcast_ref::<LargeStringArray>()?;
+                return Self::from_strings(
+                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
+                    ScalarValue::LargeUtf8,
+                );
+            }
+            _ => {}
+        }
+        let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
+        for row in 0..column.len() {
+            if column.is_null(row) {
+                continue;
+            }
+            let value = ScalarValue::try_from_array(column, row).ok()?;
+            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            let count = counts.entry(value).or_default();
+            *count = count.checked_add(1)?;
+        }
+        Self::from_entries(counts.into_iter().collect())
+    }
+
+    fn from_int64(column: &Int64Array) -> Option<Self> {
+        let mut counts: HashMap<i64, u64> = HashMap::new();
+        for row in 0..column.len() {
+            if column.is_null(row) {
+                continue;
+            }
+            let value = column.value(row);
+            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            let count = counts.entry(value).or_default();
+            *count = count.checked_add(1)?;
+        }
+        Self::from_entries(
+            counts
+                .into_iter()
+                .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
+                .collect(),
+        )
+    }
+
+    fn from_strings<'a>(
+        values: impl IntoIterator<Item = Option<&'a str>>,
+        wrap: fn(Option<String>) -> ScalarValue,
+    ) -> Option<Self> {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for value in values.into_iter().flatten() {
+            if let Some(count) = counts.get_mut(value) {
+                *count = count.checked_add(1)?;
+                continue;
+            }
+            if counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            counts.insert(value.to_string(), 1);
+        }
+        Self::from_entries(
+            counts
+                .into_iter()
+                .map(|(value, count)| (wrap(Some(value)), count))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
+        if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
+            return None;
+        }
+        if !exact_value_counts_type(&entries[0].0.data_type()) {
+            return None;
+        }
+        let mut merged: HashMap<ScalarValue, u64> = HashMap::with_capacity(entries.len());
+        for (value, count) in entries {
+            if value.is_null() || count == 0 {
+                return None;
+            }
+            let total = merged.entry(value).or_default();
+            *total = total.checked_add(count)?;
+            if merged.len() > MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+        }
+        let mut entries: Vec<(ScalarValue, u64)> = merged.into_iter().collect();
+        if entries
+            .iter()
+            .any(|(value, _)| value.data_type() != entries[0].0.data_type())
+        {
+            return None;
+        }
+        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
+        {
+            return None;
+        }
+        Some(Self { entries })
+    }
+
+    pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
+        Self::from_entries(self.entries.iter().chain(&other.entries).cloned().collect())
+    }
+
+    pub(crate) fn entries(&self) -> &[(ScalarValue, u64)] {
+        &self.entries
+    }
+}
+
+fn exact_value_counts_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Decimal128(_, _)
+    )
 }
 
 impl PartialEq for ScalarStatsAgg {
@@ -210,6 +634,7 @@ impl PartialEq for ScalarStatsAgg {
             && self.null_count == other.null_count
             && sum_eq
             && self.hll == other.hll
+            && self.value_counts == other.value_counts
     }
 }
 
@@ -222,7 +647,8 @@ impl ScalarStatsAgg {
     /// supported type still returns an aggregate: null min/max plus the
     /// null count, so `IS [NOT] NULL` can prune on it. When present, every
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
-    /// same pass; sum/hll stay `None` for types that don't support them.
+    /// same pass; sum/HLL/value counts stay `None` for unsupported types or
+    /// when the exact-value cardinality cap is exceeded.
     pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {
         let (min, max) = column_min_max(column)?;
         let null_count = u64::try_from(column.null_count()).ok();
@@ -233,6 +659,7 @@ impl ScalarStatsAgg {
             null_count,
             sum: column_sum(column),
             hll: column_hll(column).map(|s| s.as_bytes().to_vec()),
+            value_counts: ScalarValueCounts::from_column(column),
         })
     }
 
@@ -330,6 +757,10 @@ impl ScalarStatsAgg {
             },
             _ => None,
         };
+        self.value_counts = match (&self.value_counts, &other.value_counts) {
+            (Some(left), Some(right)) => left.merged_with(right),
+            _ => None,
+        };
         Ok(())
     }
 
@@ -371,6 +802,7 @@ impl ScalarStatsAgg {
             null_count: None,
             sum: None,
             hll: None,
+            value_counts: None,
         }
     }
 }
@@ -562,126 +994,6 @@ fn union_blooms(a: &Bloom, b: &Bloom) -> Option<Bloom> {
     Bloom::from_bytes(&ab)
 }
 
-/// Aggregate vector summary across a part's superfiles —
-/// mean-of-centroids + max-distance-with-superfile-radius (one
-/// outer ball bounding every superfile's vector ball). The
-/// `Default` shape is treated as "always-keep" by the list-
-/// level pruner.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct VectorSummaryAgg {
-    /// Packed LE f32 — the **mean** centroid (the envelope center),
-    /// same encoding as `VectorSummary.centroid`. Empty ⇒ "no info",
-    /// which the list-level pruner treats as always-keep.
-    pub centroid_envelope: Vec<u8>,
-    /// Number of superfile centroids folded into this envelope. Lets
-    /// [`VectorSummaryAgg::merge`] update the mean exactly (Welford) when
-    /// folding in one more superfile without re-reading the others. `0`
-    /// is the empty/no-info default.
-    pub n_vectors: u32,
-    pub envelope_radius: f32,
-}
-
-impl VectorSummaryAgg {
-    /// Merge `other` aggregate into `self` — the union of two part-level
-    /// envelopes (aggregate-to-aggregate merging).
-    ///
-    /// The merged envelope encloses both input envelopes:
-    ///
-    /// - **Center**: the weighted mean of the two centroids, weighted by
-    ///   `n_vectors` to preserve the overall mean-of-centroids invariant.
-    /// - **Radius**: a conservative triangle bound covering both balls around
-    ///   the new center — `max(dist(center1, new_center) + radius1,
-    ///   dist(center2, new_center) + radius2)`. This may be looser than the
-    ///   batch optimum but is computed without re-reading individual centroids.
-    ///
-    /// An empty base (`n_vectors == 0`) adopts the incoming envelope. A `other`
-    /// with no centroid (no-info) is a no-op. A dimension mismatch poisons the
-    /// envelope to a sticky always-keep.
-    pub fn merge_with(&mut self, other: &VectorSummaryAgg) {
-        if other.n_vectors == 0 {
-            return;
-        }
-        if self.centroid_envelope.is_empty() && self.n_vectors > 0 {
-            // Poisoned envelope; stay always-keep.
-            return;
-        }
-        if self.n_vectors == 0 {
-            self.centroid_envelope = other.centroid_envelope.clone();
-            self.n_vectors = other.n_vectors;
-            self.envelope_radius = other.envelope_radius;
-            return;
-        }
-        let self_center = decode_le_f32(&self.centroid_envelope);
-        let other_center = decode_le_f32(&other.centroid_envelope);
-        if self_center.len() != other_center.len() {
-            // Dim mismatch; poison to always-keep.
-            self.centroid_envelope.clear();
-            self.envelope_radius = 0.0;
-            return;
-        }
-        let n_total = (self.n_vectors as f32) + (other.n_vectors as f32);
-        let mut new_center = vec![0.0; self_center.len()];
-        for (i, &self_c) in self_center.iter().enumerate() {
-            new_center[i] = (self_c * self.n_vectors as f32
-                + other_center[i] * other.n_vectors as f32)
-                / n_total;
-        }
-        let self_reach = l2_distance(&self_center, &new_center) + self.envelope_radius;
-        let other_reach = l2_distance(&other_center, &new_center) + other.envelope_radius;
-        self.centroid_envelope = encode_le_f32(&new_center);
-        self.n_vectors = (self.n_vectors as u64 + other.n_vectors as u64) as u32;
-        self.envelope_radius = self_reach.max(other_reach);
-    }
-
-    /// Merge two per-vector-column summary tables
-    /// (`BTreeMap<String, VectorSummaryAgg>`), folding `other` into `into`.
-    ///
-    /// Column **union**: a column present only in `other` is inserted; a
-    /// column present in both is merged per-column via
-    /// [`VectorSummaryAgg::merge`]. Folding this over a set of per-part
-    /// tables yields the table-level aggregate.
-    pub fn merge(
-        into: &mut BTreeMap<String, VectorSummaryAgg>,
-        other: &BTreeMap<String, VectorSummaryAgg>,
-    ) {
-        for (col, other_agg) in other {
-            if let Some(existing) = into.get_mut(col) {
-                existing.merge_with(other_agg);
-            } else {
-                into.insert(col.clone(), other_agg.clone());
-            }
-        }
-    }
-}
-
-/// Decode a packed LE-f32 centroid blob (as stored in
-/// [`VectorSummaryAgg::centroid_envelope`]) back to floats.
-fn decode_le_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-/// Pack floats into the LE-f32 blob form used on the wire.
-fn encode_le_f32(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-/// Euclidean (L2) distance — the metric the vector envelope uses for its
-/// bounding ball (cosine/negdot over normalized centroids reduce to L2).
-fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum::<f32>()
-        .sqrt()
-}
-
 // ---------- Errors ----------
 
 #[derive(Debug, Error)]
@@ -741,9 +1053,34 @@ struct ManifestDto {
     id_column: String,
     fts_columns: Vec<FtsColumnInfo>,
     vector_columns: Vec<VectorColumnInfoDto>,
+    #[serde(default)]
+    vector_index_storage_prefix: Option<String>,
+    #[serde(default)]
+    deleted_user_ids_inline_b64: Option<String>, // base64 of encoded id set
+    #[serde(default)]
+    slow_vector_state_uri: Option<String>,
+    #[serde(default)]
+    slow_vector_state_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroids_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
+    #[serde(default)]
+    global_vector_index: Option<GlobalVectorIndexDto>,
+    #[serde(default)]
+    drained_ranges: Vec<(u64, u64)>,
     parts: Vec<ManifestPartEntryDto>,
     tombstone_seqs: BTreeMap<String, u64>, // UUID keys
+}
+
+#[derive(Serialize, Deserialize)]
+struct GlobalVectorIndexDto {
+    column: String,
+    grid_b64: String,
+    /// Absent on manifests written before the user-side grid existed.
+    #[serde(default)]
+    user_grid_b64: Option<String>,
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -792,9 +1129,62 @@ enum PartitionStrategyDto {
         column: String,
         boundaries: Vec<String>, // base64 per boundary
     },
+    VectorCell {
+        column: String,
+        clusters_b64: String,
+        #[serde(default)]
+        routing: Option<CellRoutingParamsDto>,
+    },
     IngestionTime {
         granularity_secs: i64,
     },
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct CellRoutingParamsDto {
+    #[serde(default)]
+    nprobe_min: usize,
+    #[serde(default)]
+    nprobe_max: usize,
+    /// `Option` rather than a zero sentinel: `slack = 0.0` is a meaningful
+    /// persisted value (no near-tie widening — τ = d* exactly), so absence
+    /// must be distinguishable from explicit zero. The `usize` knobs keep
+    /// the zero sentinel — zero probes/fine-runs is not a valid config.
+    #[serde(default)]
+    slack: Option<f32>,
+    #[serde(default)]
+    fine_nprobe: usize,
+}
+
+impl From<CellRoutingParams> for CellRoutingParamsDto {
+    fn from(r: CellRoutingParams) -> Self {
+        Self {
+            nprobe_min: r.nprobe_min,
+            nprobe_max: r.nprobe_max,
+            slack: Some(r.slack),
+            fine_nprobe: r.fine_nprobe,
+        }
+    }
+}
+
+impl From<CellRoutingParamsDto> for CellRoutingParams {
+    fn from(d: CellRoutingParamsDto) -> Self {
+        let mut r = CellRoutingParams::default();
+        if d.nprobe_min > 0 {
+            r.nprobe_min = d.nprobe_min;
+        }
+        if d.nprobe_max > 0 {
+            r.nprobe_max = d.nprobe_max;
+        }
+        if let Some(slack) = d.slack {
+            r.slack = slack;
+        }
+        if d.fine_nprobe > 0 {
+            r.fine_nprobe = d.fine_nprobe;
+        }
+        r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
+        r
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -805,6 +1195,10 @@ struct ManifestPartEntryDto {
     size_bytes_compressed: u64,
     size_bytes_uncompressed: u64,
     content_hash: String, // "blake3:<hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing_content_hash: Option<String>, // "blake3:<hex>"
     // i128 stringified as decimal — JSON numbers are bounded
     // to f64 precision (~53 bits) so we can't round-trip a
     // 128-bit value as a JSON number without loss. Decimal
@@ -814,7 +1208,6 @@ struct ManifestPartEntryDto {
     id_range: (String, String),
     scalar_stats_agg: BTreeMap<String, ScalarStatsAggDto>,
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
-    vector_summary_agg: BTreeMap<String, VectorSummaryAggDto>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -823,12 +1216,14 @@ struct ScalarStatsAggDto {
     max: String, // base64
     /// `None` ↔ field absent in JSON (parts written before the stat
     /// existed decode cleanly).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     null_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     sum: Option<String>, // base64
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     hll: Option<String>, // base64
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value_counts: Option<String>, // base64 Arrow IPC
 }
 
 #[derive(Serialize, Deserialize)]
@@ -850,16 +1245,6 @@ struct FtsSummaryAggDto {
 struct TermRangeUnionDto {
     min: String, // base64
     max: String, // base64
-}
-
-#[derive(Serialize, Deserialize)]
-struct VectorSummaryAggDto {
-    centroid_envelope: String, // base64
-    // Absent in pre-existing manifests (written before incremental merge);
-    // serde defaults it to 0, which reads as the empty/no-info count.
-    #[serde(default)]
-    n_vectors: u32,
-    envelope_radius: f32,
 }
 
 // ---------- DTO conversions ----------
@@ -919,6 +1304,17 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                 null_count: v.null_count,
                 sum,
                 hll: v.hll.as_deref().map(encode_b64),
+                value_counts: v
+                    .value_counts
+                    .as_ref()
+                    .map(encode_value_counts)
+                    .transpose()
+                    .map_err(|source| ListEncodeError::ScalarStats {
+                        field: "scalar_stats_agg.value_counts",
+                        source,
+                    })?
+                    .as_deref()
+                    .map(encode_b64),
             },
         );
     }
@@ -929,6 +1325,8 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         size_bytes_compressed: e.size_bytes_compressed,
         size_bytes_uncompressed: e.size_bytes_uncompressed,
         content_hash: encode_hash(&e.content_hash),
+        routing_uri: e.routing.as_ref().map(|r| r.uri.clone()),
+        routing_content_hash: e.routing.as_ref().map(|r| encode_hash(&r.content_hash)),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
         scalar_stats_agg,
         fts_summary_agg: e
@@ -948,20 +1346,6 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                             min: encode_b64(mn),
                             max: encode_b64(mx),
                         }),
-                    },
-                )
-            })
-            .collect(),
-        vector_summary_agg: e
-            .vector_summary_agg
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    VectorSummaryAggDto {
-                        centroid_envelope: encode_b64(&v.centroid_envelope),
-                        n_vectors: v.n_vectors,
-                        envelope_radius: v.envelope_radius,
                     },
                 )
             })
@@ -1010,6 +1394,17 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
                     .as_deref()
                     .map(|s| decode_b64(s, "scalar_stats_agg.hll"))
                     .transpose()?,
+                value_counts: v
+                    .value_counts
+                    .as_deref()
+                    .map(|encoded| {
+                        decode_value_counts(&decode_b64(encoded, "scalar_stats_agg.value_counts")?)
+                            .map_err(|source| ListParseError::ScalarStats {
+                                field: "scalar_stats_agg.value_counts",
+                                source,
+                            })
+                    })
+                    .transpose()?,
             },
         );
     }
@@ -1044,17 +1439,6 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
             },
         );
     }
-    let mut vector_summary_agg = BTreeMap::new();
-    for (k, v) in d.vector_summary_agg {
-        vector_summary_agg.insert(
-            k,
-            VectorSummaryAgg {
-                centroid_envelope: decode_b64(&v.centroid_envelope, "centroid_envelope")?,
-                n_vectors: v.n_vectors,
-                envelope_radius: v.envelope_radius,
-            },
-        );
-    }
     Ok(ManifestPartEntry {
         part_id,
         uri: d.uri,
@@ -1062,6 +1446,15 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
         size_bytes_compressed: d.size_bytes_compressed,
         size_bytes_uncompressed: d.size_bytes_uncompressed,
         content_hash,
+        // Require both halves, mirroring the slow-state routing ref: a
+        // part carrying only one is treated as having no sibling.
+        routing: match (d.routing_uri, d.routing_content_hash.as_deref()) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
         id_range: {
             let lo =
                 d.id_range.0.parse::<i128>().map_err(|_| {
@@ -1075,7 +1468,6 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
         },
         scalar_stats_agg,
         fts_summary_agg,
-        vector_summary_agg,
     })
 }
 
@@ -1096,6 +1488,18 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
             PartitionStrategyDto::ColumnRange {
                 column: column.clone(),
                 boundaries: boundaries.iter().map(|b| encode_b64(b)).collect(),
+            }
+        }
+        PartitionStrategy::VectorCell {
+            column,
+            clusters,
+            routing,
+        } => {
+            let enc = encode_cluster_centroids(clusters);
+            PartitionStrategyDto::VectorCell {
+                column: column.clone(),
+                clusters_b64: encode_b64(&enc),
+                routing: Some(CellRoutingParamsDto::from(*routing)),
             }
         }
         PartitionStrategy::IngestionTime { granularity_secs } => {
@@ -1126,6 +1530,21 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
             PartitionStrategy::ColumnRange {
                 column,
                 boundaries: bs,
+            }
+        }
+        PartitionStrategyDto::VectorCell {
+            column,
+            clusters_b64,
+            routing,
+        } => {
+            let bytes = decode_b64(&clusters_b64, "partition_strategy.clusters")?;
+            let clusters = decode_cluster_centroids(&bytes).map_err(|e| {
+                ListParseError::BadFieldValue("partition_strategy.clusters", e.to_string())
+            })?;
+            PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: routing.map(CellRoutingParams::from).unwrap_or_default(),
             }
         }
         PartitionStrategyDto::IngestionTime { granularity_secs } => {
@@ -1159,6 +1578,30 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             })
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
+        vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
+        global_vector_index: l
+            .global_vector_index
+            .as_ref()
+            .map(|g| GlobalVectorIndexDto {
+                column: g.column.clone(),
+                grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
+                user_grid_b64: g
+                    .user_grid
+                    .as_ref()
+                    .map(|grid| encode_b64(&encode_cluster_centroids(grid))),
+            }),
+        drained_ranges: l.drained_ranges.intervals().to_vec(),
+        deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
+        slow_vector_state_uri: l.slow_vector_state_uri.clone(),
+        slow_vector_state_content_hash: l.slow_vector_state_content_hash.as_ref().map(encode_hash),
+        slow_vector_state_centroids_uri: l
+            .slow_vector_state_centroids
+            .as_ref()
+            .map(|r| r.uri.clone()),
+        slow_vector_state_centroids_content_hash: l
+            .slow_vector_state_centroids
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1195,6 +1638,70 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             })
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
+        vector_index_storage_prefix: d.vector_index_storage_prefix,
+        global_vector_index: d
+            .global_vector_index
+            .map(|g| -> Result<GlobalVectorIndex, ListParseError> {
+                let bytes = decode_b64(&g.grid_b64, "global_vector_index.grid")?;
+                let grid = decode_cluster_centroids(&bytes).map_err(|e| {
+                    ListParseError::BadFieldValue("global_vector_index.grid", e.to_string())
+                })?;
+                let user_grid = g
+                    .user_grid_b64
+                    .as_deref()
+                    .map(|b64| -> Result<_, ListParseError> {
+                        let bytes = decode_b64(b64, "global_vector_index.user_grid")?;
+                        decode_cluster_centroids(&bytes).map_err(|e| {
+                            ListParseError::BadFieldValue(
+                                "global_vector_index.user_grid",
+                                e.to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                Ok(GlobalVectorIndex {
+                    column: g.column,
+                    grid,
+                    user_grid,
+                })
+            })
+            .transpose()?,
+        drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges)?,
+        deleted_user_ids_inline: d
+            .deleted_user_ids_inline_b64
+            .as_deref()
+            .map(|b64| decode_b64(b64, "deleted_user_ids_inline"))
+            .transpose()?,
+        // Atomic pair: unlike the centroids section below (whose contract is
+        // fall-back-to-None), the slow-state ref is required where present —
+        // a half-written ref is corruption, not an absent section.
+        slow_vector_state_uri: match (&d.slow_vector_state_uri, &d.slow_vector_state_content_hash) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ListParseError::BadFieldValue(
+                    "slow_vector_state",
+                    "uri and content_hash must be present together".into(),
+                ));
+            }
+            _ => d.slow_vector_state_uri,
+        },
+        slow_vector_state_content_hash: d
+            .slow_vector_state_content_hash
+            .as_deref()
+            .map(decode_hash)
+            .transpose()?,
+        // Require both halves: a manifest carrying only one is treated as
+        // having no section (consumers fall back to per-superfile reads)
+        // rather than failing the whole list decode.
+        slow_vector_state_centroids: match (
+            d.slow_vector_state_centroids_uri,
+            d.slow_vector_state_centroids_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
         parts,
         tombstone_seqs: d
             .tombstone_seqs
@@ -1267,6 +1774,7 @@ mod tests {
 
     use super::{
         super::{
+            ClusterCentroids,
             bloom::BloomBuilder,
             part::{ContentHash, PartId},
         },
@@ -1287,6 +1795,32 @@ mod tests {
             .value(0)
     }
 
+    /// `birth_version_range` reads the UInt64 min/max of the birth-version
+    /// aggregate; an entry lacking that aggregate has no range.
+    #[test]
+    fn birth_version_range_reads_uint64_bounds() {
+        use arrow_array::UInt64Array;
+        let mut entry = rich_entry(1);
+        let mut stats = HashMap::new();
+        stats.insert(
+            BIRTH_VERSION_AGGREGATE_COLUMN.to_string(),
+            ScalarStatsAgg {
+                min: Arc::new(UInt64Array::from(vec![10u64])) as ArrayRef,
+                max: Arc::new(UInt64Array::from(vec![20u64])) as ArrayRef,
+                null_count: None,
+                sum: None,
+                hll: None,
+                value_counts: None,
+            },
+        );
+        entry.scalar_stats_agg = stats;
+        assert_eq!(entry.birth_version_range(), Some((10, 20)));
+
+        let mut bare = rich_entry(2);
+        bare.scalar_stats_agg = HashMap::new();
+        assert_eq!(bare.birth_version_range(), None);
+    }
+
     #[test]
     fn scalar_agg_from_column_computes_min_max_sum_nullcount() {
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(7), Some(1)]));
@@ -1296,6 +1830,49 @@ mod tests {
         assert_eq!(agg.null_count, Some(1));
         assert_eq!(i64_at0(agg.sum.as_ref().expect("sum")), 11); // 3 + 7 + 1
         assert!(agg.hll.is_some());
+        assert_eq!(
+            agg.value_counts
+                .as_ref()
+                .expect("low-cardinality counts")
+                .entries(),
+            &[
+                (ScalarValue::Int64(Some(1)), 1),
+                (ScalarValue::Int64(Some(3)), 1),
+                (ScalarValue::Int64(Some(7)), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_value_counts_are_exact_and_capped() {
+        let repeated: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("rust"),
+            Some("go"),
+            Some("rust"),
+            None,
+        ]));
+        let counts = ScalarStatsAgg::from_column(&repeated)
+            .expect("utf8 stats")
+            .value_counts
+            .expect("under cap");
+        assert_eq!(
+            counts.entries(),
+            &[
+                (ScalarValue::Utf8(Some("go".into())), 1),
+                (ScalarValue::Utf8(Some("rust".into())), 2),
+            ]
+        );
+
+        let high_cardinality: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        assert!(
+            ScalarStatsAgg::from_column(&high_cardinality)
+                .expect("int stats")
+                .value_counts
+                .is_none(),
+            "the 257th distinct value must drop the exact table"
+        );
     }
 
     #[test]
@@ -1352,6 +1929,28 @@ mod tests {
         assert_eq!(i64_at0(a.sum.as_ref().expect("sum")), 95); // 60 + 35
         assert_eq!(a.null_count, Some(0));
         assert!(a.hll.is_some());
+        assert_eq!(
+            a.value_counts
+                .as_ref()
+                .expect("merged counts")
+                .entries()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn scalar_agg_merge_drops_value_counts_above_cap() {
+        let left: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64,
+        ));
+        let right: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        let mut left = ScalarStatsAgg::from_column(&left).expect("left stats");
+        let right = ScalarStatsAgg::from_column(&right).expect("right stats");
+        left.merge_with(&right).expect("same type");
+        assert!(left.value_counts.is_none());
     }
 
     #[test]
@@ -1362,6 +1961,7 @@ mod tests {
         b.sum = None;
         b.null_count = None;
         b.hll = None;
+        b.value_counts = None;
         a.merge_with(&b).expect("same type merges");
         // min/max still merge (union semantics over the bounds).
         assert_eq!(i64_at0(&a.min), 1);
@@ -1370,6 +1970,7 @@ mod tests {
         assert!(a.sum.is_none());
         assert!(a.null_count.is_none());
         assert!(a.hll.is_none());
+        assert!(a.value_counts.is_none());
     }
 
     #[test]
@@ -1679,6 +2280,8 @@ mod tests {
 
     fn empty_list() -> Manifest {
         Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
             tombstone_seqs: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -1691,6 +2294,11 @@ mod tests {
                 column: "doc_id".into(),
                 n_buckets: 64,
             },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![],
         }
     }
@@ -1710,6 +2318,10 @@ mod tests {
                     null_count: Some(u64::from(seed)),
                     sum: Some(Arc::new(Int64Array::from(vec![i64::from(seed) * 7])) as ArrayRef),
                     hll: Some(vec![seed; 4]),
+                    value_counts: ScalarValueCounts::from_entries(vec![(
+                        ScalarValue::Int64(Some(i64::from(seed))),
+                        1,
+                    )]),
                 },
             );
         }
@@ -1735,16 +2347,6 @@ mod tests {
             },
         );
 
-        let mut vec_agg = BTreeMap::new();
-        vec_agg.insert(
-            "emb".into(),
-            VectorSummaryAgg {
-                centroid_envelope: 0.5_f32.to_le_bytes().repeat(8),
-                n_vectors: 3,
-                envelope_radius: 0.71_f32,
-            },
-        );
-
         ManifestPartEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
@@ -1752,10 +2354,15 @@ mod tests {
             size_bytes_compressed: 10_485_760,
             size_bytes_uncompressed: 26_214_400,
             content_hash: ContentHash([seed; 32]),
+            // Alternate present/absent so the round-trip covers both the
+            // stamped sibling and the pre-sibling (legacy) shape.
+            routing: (seed % 2 == 1).then(|| RoutingRef {
+                uri: format!("manifests/part-{seed:02x}-routing.avro.zst"),
+                content_hash: ContentHash([seed ^ 0xff; 32]),
+            }),
             id_range: (0, 245_678_901),
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
-            vector_summary_agg: vec_agg,
         }
     }
 
@@ -1800,26 +2407,10 @@ mod tests {
             "size_bytes_uncompressed"
         );
         assert_eq!(a.content_hash, b.content_hash, "content_hash");
+        assert_eq!(a.routing, b.routing, "routing");
         assert_eq!(a.id_range, b.id_range, "id_range");
         assert_eq!(a.scalar_stats_agg, b.scalar_stats_agg, "scalar_stats_agg");
         assert_eq!(a.fts_summary_agg, b.fts_summary_agg, "fts_summary_agg");
-        assert_eq!(
-            a.vector_summary_agg.len(),
-            b.vector_summary_agg.len(),
-            "vector_summary_agg count"
-        );
-        for (k, av) in &a.vector_summary_agg {
-            let bv = b
-                .vector_summary_agg
-                .get(k)
-                .unwrap_or_else(|| panic!("missing vec {k}"));
-            assert_eq!(av.centroid_envelope, bv.centroid_envelope, "vec {k} env");
-            assert_eq!(
-                av.envelope_radius.to_bits(),
-                bv.envelope_radius.to_bits(),
-                "vec {k} radius bits"
-            );
-        }
     }
 
     fn assert_lists_equal(a: &Manifest, b: &Manifest) {
@@ -1830,6 +2421,7 @@ mod tests {
         assert_eq!(a.id_column, b.id_column);
         assert_eq!(a.fts_columns, b.fts_columns);
         assert_eq!(a.vector_columns, b.vector_columns);
+        assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
         assert_eq!(a.partition_strategy, b.partition_strategy);
         assert_eq!(a.parts.len(), b.parts.len());
         for (a_e, b_e) in a.parts.iter().zip(b.parts.iter()) {
@@ -1887,6 +2479,46 @@ mod tests {
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
     }
 
+    /// An explicitly-persisted `slack = 0.0` must survive the round-trip:
+    /// the DTO once used zero as its "field absent" sentinel, so reopening
+    /// a manifest silently widened the probe threshold back to the default
+    /// slack — a routing behavior change on tables that intentionally
+    /// persist no near-tie widening. Absent stays default.
+    #[test]
+    fn cell_routing_params_zero_slack_roundtrip() {
+        let mut list = empty_list();
+        list.partition_strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::from_fp32(1, 4, &[0.5, 0.5, 0.5, 0.5], vec![1]),
+            routing: CellRoutingParams {
+                slack: 0.0,
+                ..CellRoutingParams::default()
+            },
+        };
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        let PartitionStrategy::VectorCell { routing, .. } = &decoded.partition_strategy else {
+            panic!("VectorCell strategy must survive the round-trip");
+        };
+        assert_eq!(
+            routing.slack, 0.0,
+            "explicit zero slack must not decode back to the default"
+        );
+        // A JSON body without the field still lands on the default.
+        let s = from_utf8(&bytes).expect("utf8");
+        let stripped = s.replace("\"slack\": 0.0,", "");
+        assert_ne!(stripped, s, "fixture must actually strip the field");
+        let legacy = decode(stripped.as_bytes()).expect("decode without slack");
+        let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
+            panic!("VectorCell strategy must survive the stripped decode");
+        };
+        assert_eq!(
+            routing.slack,
+            CellRoutingParams::default().slack,
+            "absent slack keeps the default"
+        );
+    }
+
     #[test]
     fn partition_strategy_column_range_roundtrip() {
         let mut list = empty_list();
@@ -1901,6 +2533,202 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
+    }
+
+    #[test]
+    fn partition_strategy_vector_cell_roundtrip() {
+        use super::super::ClusterCentroids;
+        let mut list = empty_list();
+        list.partition_strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::from_fp32(
+                2,
+                4,
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                vec![1, 1],
+            ),
+            routing: CellRoutingParams::default(),
+        };
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.partition_strategy, list.partition_strategy);
+    }
+
+    #[test]
+    fn global_vector_index_roundtrip() {
+        use super::super::ClusterCentroids;
+        let mut list = empty_list();
+        list.global_vector_index = Some(GlobalVectorIndex {
+            column: "emb".into(),
+            grid: ClusterCentroids::from_fp32(
+                2,
+                4,
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                vec![3, 5],
+            ),
+            user_grid: None,
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.global_vector_index, list.global_vector_index);
+        // With no user grid, the user side falls back to the drain grid.
+        let fallback = decoded
+            .global_vector_index
+            .clone()
+            .expect("index present")
+            .into_user_grid();
+        assert_eq!(
+            Some(&fallback),
+            list.global_vector_index.as_ref().map(|g| &g.grid)
+        );
+
+        // Finer user-side grid rides along and decodes distinct from `grid`.
+        let user_grid = ClusterCentroids::from_fp32(1, 4, &[8.0, 9.0, 10.0, 11.0], vec![7]);
+        if let Some(g) = list.global_vector_index.as_mut() {
+            g.user_grid = Some(user_grid.clone());
+        }
+        let bytes = encode(&list).expect("encode with user grid");
+        let decoded = decode(&bytes).expect("decode with user grid");
+        assert_eq!(decoded.global_vector_index, list.global_vector_index);
+        assert_eq!(
+            *decoded
+                .global_vector_index
+                .as_ref()
+                .expect("index present")
+                .user_grid(),
+            user_grid
+        );
+        // Absent by default (back-compat: old manifests without the field).
+        assert!(empty_list().global_vector_index.is_none());
+    }
+
+    #[test]
+    fn slow_vector_state_ref_roundtrip() {
+        let mut list = empty_list();
+        list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
+        list.slow_vector_state_content_hash = Some(ContentHash([7u8; 32]));
+        list.slow_vector_state_centroids = Some(RoutingRef {
+            uri: "slow-vector-state/state-def.centroids.bin".into(),
+            content_hash: ContentHash([8u8; 32]),
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.slow_vector_state_uri, list.slow_vector_state_uri);
+        assert_eq!(
+            decoded.slow_vector_state_content_hash,
+            list.slow_vector_state_content_hash
+        );
+        assert_eq!(
+            decoded.slow_vector_state_centroids,
+            list.slow_vector_state_centroids
+        );
+        // Absent by default (user tables and old manifests without the field).
+        let plain = empty_list();
+        let bytes = encode(&plain).expect("encode");
+        assert!(
+            !from_utf8(&bytes)
+                .expect("utf8")
+                .contains("slow_vector_state_centroids"),
+            "absent section ref must not serialize null fields"
+        );
+        let decoded = decode(&bytes).expect("decode");
+        assert!(decoded.slow_vector_state_uri.is_none());
+        assert!(decoded.slow_vector_state_content_hash.is_none());
+        assert!(decoded.slow_vector_state_centroids.is_none());
+    }
+
+    /// A slow-state hash that isn't `blake3:<64hex>` is rejected with
+    /// `BadContentHash` (same `decode_hash` used by every other hash field).
+    #[test]
+    fn slow_vector_state_bad_hash_rejected() {
+        let mut list = empty_list();
+        list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
+        list.slow_vector_state_content_hash = Some(ContentHash([9u8; 32]));
+        let bytes = encode(&list).expect("encode");
+        let s = from_utf8(&bytes).expect("utf8");
+        let full = "09".repeat(BLAKE3_DIGEST_BYTES);
+        let tampered = s.replacen(&format!("blake3:{full}"), "blake3:xyz", 1);
+        assert_ne!(tampered, s, "tamper must change the bytes");
+        let err = decode(tampered.as_bytes()).expect_err("bad slow-state hash");
+        assert!(
+            matches!(err, ListParseError::BadContentHash(_)),
+            "expected BadContentHash, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn drained_version_ranges_merge_and_contains() {
+        let mut d = DrainedVersionRanges::default();
+        assert!(!d.contains(1));
+        // Contiguous inserts merge into one interval.
+        d.insert(1);
+        d.insert(2);
+        d.insert(3);
+        assert_eq!(d.intervals(), &[(1, 3)]);
+        // A gap stays split.
+        d.insert(5);
+        assert_eq!(d.intervals(), &[(1, 3), (5, 5)]);
+        assert!(d.contains(2) && d.contains(5) && !d.contains(4));
+        // Filling the gap merges everything.
+        d.insert(4);
+        assert_eq!(d.intervals(), &[(1, 5)]);
+        // Out-of-order inserts (the parallel-drainer case) coalesce as holes fill.
+        d.insert_range(10, 12);
+        d.insert(8);
+        assert_eq!(d.intervals(), &[(1, 5), (8, 8), (10, 12)]);
+        d.insert(9);
+        assert_eq!(d.intervals(), &[(1, 5), (8, 12)]);
+        // from_intervals normalizes unsorted/overlapping input.
+        let d2 = DrainedVersionRanges::from_intervals(vec![(5, 7), (1, 3), (4, 4)])
+            .expect("valid intervals");
+        assert_eq!(d2.intervals(), &[(1, 7)]);
+    }
+
+    #[test]
+    fn drained_ranges_prefix_absorbs_vacuous_gaps() {
+        // The drain's lo logic: extend the genesis-anchored prefix over
+        // commit-versions that have no superfile (deletes, etc.).
+        let mut p = DrainedVersionRanges::default();
+        assert_eq!(p.prefix_end(), None);
+        p.insert_range(0, 3);
+        assert_eq!(p.prefix_end(), Some(3));
+        // Versions 4..6 are vacuous (no superfiles); next drained superfile is v7.
+        // The drain inserts [prefix_end+1 ..= 7] = [4..=7], folding the gap.
+        let lo = p.prefix_end().map(|e| e + 1).unwrap_or(0);
+        p.insert_range(lo, 7);
+        assert_eq!(
+            p.intervals(),
+            &[(0, 7)],
+            "vacuous gap [4..6] must fold into the prefix, not fragment"
+        );
+        assert_eq!(p.prefix_end(), Some(7));
+        // A set not anchored at genesis (e.g. a parallel high-slice) has no prefix.
+        assert_eq!(
+            DrainedVersionRanges::from_intervals(vec![(5, 7)])
+                .expect("valid intervals")
+                .prefix_end(),
+            None
+        );
+    }
+
+    #[test]
+    fn drained_ranges_roundtrip() {
+        let mut list = empty_list();
+        list.drained_ranges =
+            DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]).expect("valid intervals");
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.drained_ranges, list.drained_ranges);
+        assert!(empty_list().drained_ranges.is_empty());
+    }
+
+    #[test]
+    fn drained_ranges_cover_only_complete_intervals() {
+        let ranges =
+            DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]).expect("valid intervals");
+        assert!(ranges.covers(2, 4));
+        assert!(!ranges.covers(3, 7));
+        assert!(!ranges.covers(5, 6));
     }
 
     #[test]
@@ -2078,7 +2906,7 @@ mod tests {
         // both reference the same entry must round-trip into
         // bit-equal entries — the property that lets readers
         // Arc::clone the part from the prior in-memory
-        // Manifest into the new one.
+        // ManifestSnapshot into the new one.
         let entry = rich_entry(99);
 
         let mut list_v42 = empty_list();
@@ -2102,7 +2930,7 @@ mod tests {
 
     #[test]
     fn json_top_level_keys_are_jq_friendly() {
-        // Manifest list is the operator's debugging surface;
+        // ManifestSnapshot list is the operator's debugging surface;
         // the top-level keys are the contract.
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");
@@ -2116,6 +2944,7 @@ mod tests {
             "id_column",
             "fts_columns",
             "vector_columns",
+            "vector_index_storage_prefix",
             "partition_strategy",
             "parts",
         ];
@@ -2128,6 +2957,17 @@ mod tests {
                 .unwrap_or("")
                 .starts_with("blake3:"),
             "options_hash should be 'blake3:<hex>' for jq-debuggability"
+        );
+    }
+
+    #[test]
+    fn vector_index_storage_prefix_roundtrip() {
+        let mut list = empty_list();
+        list.vector_index_storage_prefix = Some("_infino_deadbeef_vector_index".into());
+        let got = decode(&encode(&list).expect("encode")).expect("decode");
+        assert_eq!(
+            got.vector_index_storage_prefix,
+            list.vector_index_storage_prefix
         );
     }
 
@@ -2409,353 +3249,5 @@ mod tests {
         FtsSummaryAgg::merge(&mut into, &other);
         // Both had None blooms, result should be None (dropped)
         assert!(into.is_empty());
-    }
-
-    // ----- Tests for VectorSummaryAgg::merge_agg -----
-
-    #[test]
-    fn vector_merge_empty_other_is_noop() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
-            n_vectors: 5,
-            envelope_radius: 0.5,
-        };
-        let other = VectorSummaryAgg::default();
-        let before = agg.clone();
-        agg.merge_with(&other);
-        assert_eq!(agg, before, "merging empty other should be a no-op");
-    }
-
-    #[test]
-    fn vector_merge_empty_self_adopts_other() {
-        let mut agg = VectorSummaryAgg::default();
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
-            n_vectors: 3,
-            envelope_radius: 0.75,
-        };
-        agg.merge_with(&other);
-        assert_eq!(decode_le_f32(&agg.centroid_envelope), vec![1.0, 2.0, 3.0]);
-        assert_eq!(agg.n_vectors, 3);
-        assert_eq!(agg.envelope_radius, 0.75);
-    }
-
-    #[test]
-    fn vector_merge_poisoned_stays_poisoned() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: Vec::new(),
-            n_vectors: 5,
-            envelope_radius: 0.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-            n_vectors: 3,
-            envelope_radius: 0.5,
-        };
-        agg.merge_with(&other);
-        // Poisoned envelope should stay empty and never merge
-        assert!(agg.centroid_envelope.is_empty());
-        assert_eq!(agg.n_vectors, 5, "poisoned count should not change");
-    }
-
-    #[test]
-    fn vector_merge_weighted_mean_centroid() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0, 0.0]),
-            n_vectors: 3,
-            envelope_radius: 0.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[6.0, 6.0, 6.0]),
-            n_vectors: 3,
-            envelope_radius: 0.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
-        // Weighted mean: (0*3 + 6*3)/(3+3) = 3.0 per coordinate
-        for &c in &merged_center {
-            assert!((c - 3.0).abs() < 1e-4);
-        }
-        assert_eq!(agg.n_vectors, 6);
-    }
-
-    #[test]
-    fn vector_merge_unequal_weights() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
-            n_vectors: 1,
-            envelope_radius: 0.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[10.0, 10.0]),
-            n_vectors: 9,
-            envelope_radius: 0.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
-        // Weighted mean: (0*1 + 10*9)/(1+9) = 9.0 per coordinate
-        for &c in &merged_center {
-            assert!((c - 9.0).abs() < 1e-4);
-        }
-    }
-
-    #[test]
-    fn vector_merge_dimension_mismatch_poisons() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-            n_vectors: 3,
-            envelope_radius: 0.4,
-        };
-        agg.merge_with(&other);
-        // Dimension mismatch should poison to always-keep
-        assert!(agg.centroid_envelope.is_empty());
-        assert_eq!(agg.envelope_radius, 0.0);
-        assert!(agg.n_vectors > 0, "count should not change");
-    }
-
-    #[test]
-    fn vector_merge_encloses_both_balls() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
-            n_vectors: 1,
-            envelope_radius: 1.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[10.0, 0.0]),
-            n_vectors: 1,
-            envelope_radius: 1.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
-        // Center should be at (5, 0)
-        assert!((merged_center[0] - 5.0).abs() < 1e-4);
-        assert!(merged_center[1].abs() < 1e-4);
-        // Radius should enclose both: dist(0,5) + 1 = 6, dist(10,5) + 1 = 6
-        assert!(agg.envelope_radius >= 6.0 - 1e-4);
-    }
-
-    #[test]
-    fn vector_merge_radius_conservative_bound() {
-        // Test that the radius is conservative (no false negatives)
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[5.0, 0.0]),
-            n_vectors: 2,
-            envelope_radius: 3.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[5.0, 4.0]),
-            n_vectors: 2,
-            envelope_radius: 2.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
-        // Both original balls should be enclosed by the merged envelope
-        let reach1 = l2_distance(&[5.0, 0.0], &merged_center) + 3.0;
-        let reach2 = l2_distance(&[5.0, 4.0], &merged_center) + 2.0;
-        assert!(
-            reach1 <= agg.envelope_radius + 1e-4,
-            "first ball should be enclosed"
-        );
-        assert!(
-            reach2 <= agg.envelope_radius + 1e-4,
-            "second ball should be enclosed"
-        );
-    }
-
-    #[test]
-    fn vector_merge_updates_n_vectors_count() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0]),
-            n_vectors: 7,
-            envelope_radius: 0.1,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[2.0]),
-            n_vectors: 5,
-            envelope_radius: 0.2,
-        };
-        agg.merge_with(&other);
-        assert_eq!(agg.n_vectors, 12);
-    }
-
-    // ----- Tests for VectorSummaryAgg::merge_tables -----
-
-    #[test]
-    fn vector_merge_empty_into_and_empty_other() {
-        let mut into = BTreeMap::new();
-        let other = BTreeMap::new();
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert!(into.is_empty());
-    }
-
-    #[test]
-    fn vector_merge_empty_into_adopts_other() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
-            n_vectors: 4,
-            envelope_radius: 0.5,
-        };
-        other.insert("vec_col".to_string(), summary.clone());
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 1);
-        assert_eq!(into["vec_col"], summary);
-    }
-
-    #[test]
-    fn vector_merge_preserves_columns_only_in_into() {
-        let mut into = BTreeMap::new();
-        let other = BTreeMap::new();
-        let summary = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-            n_vectors: 2,
-            envelope_radius: 0.3,
-        };
-        into.insert("only_in_into".to_string(), summary.clone());
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 1);
-        assert_eq!(into["only_in_into"], summary);
-    }
-
-    #[test]
-    fn vector_merge_merges_shared_columns() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary1 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
-            n_vectors: 2,
-            envelope_radius: 1.0,
-        };
-        let summary2 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[10.0, 0.0]),
-            n_vectors: 2,
-            envelope_radius: 1.0,
-        };
-        into.insert("shared".to_string(), summary1);
-        other.insert("shared".to_string(), summary2);
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 1);
-        // After merge: n_vectors should be sum, centroid should be weighted mean
-        assert_eq!(into["shared"].n_vectors, 4);
-        let merged_center = decode_le_f32(&into["shared"].centroid_envelope);
-        assert!((merged_center[0] - 5.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn vector_merge_poisons_on_dimension_mismatch() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary1 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        let summary2 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        into.insert("col".to_string(), summary1);
-        other.insert("col".to_string(), summary2);
-        VectorSummaryAgg::merge(&mut into, &other);
-        // On dimension mismatch, the column is poisoned but not dropped
-        assert_eq!(into.len(), 1);
-        assert!(into["col"].centroid_envelope.is_empty());
-        assert_eq!(into["col"].envelope_radius, 0.0);
-    }
-
-    #[test]
-    fn vector_merge_union_of_columns() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        into.insert(
-            "vec1".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-                n_vectors: 2,
-                envelope_radius: 0.1,
-            },
-        );
-        other.insert(
-            "vec2".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[3.0, 4.0]),
-                n_vectors: 2,
-                envelope_radius: 0.2,
-            },
-        );
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 2);
-        assert!(into.contains_key("vec1"));
-        assert!(into.contains_key("vec2"));
-    }
-
-    #[test]
-    fn vector_merge_with_default_other() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        into.insert("col".to_string(), summary.clone());
-        let default_other = VectorSummaryAgg::default();
-        other.insert("col".to_string(), default_other);
-        VectorSummaryAgg::merge(&mut into, &other);
-        // Merging with default (empty) other should be a no-op
-        assert_eq!(into["col"], summary);
-    }
-
-    #[test]
-    fn vector_merge_tables_complex_scenario() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        // into has vec1 and vec2
-        into.insert(
-            "vec1".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-                n_vectors: 1,
-                envelope_radius: 0.1,
-            },
-        );
-        into.insert(
-            "vec2".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[3.0, 4.0]),
-                n_vectors: 1,
-                envelope_radius: 0.2,
-            },
-        );
-        // other has vec1 (to merge), vec3 (to add)
-        other.insert(
-            "vec1".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
-                n_vectors: 1,
-                envelope_radius: 0.1,
-            },
-        );
-        other.insert(
-            "vec3".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[5.0, 6.0]),
-                n_vectors: 1,
-                envelope_radius: 0.3,
-            },
-        );
-        VectorSummaryAgg::merge(&mut into, &other);
-        // into should now have vec1 (merged), vec2 (unchanged), vec3 (added)
-        assert_eq!(into.len(), 3);
-        assert_eq!(into["vec1"].n_vectors, 2);
-        assert_eq!(into["vec2"].n_vectors, 1);
-        assert_eq!(into["vec3"].n_vectors, 1);
     }
 }
