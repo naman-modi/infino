@@ -43,6 +43,20 @@
 //! fold shrinks the run count by at least one, so the loop is bounded
 //! by the input count; the final pass produces the published outputs.
 //!
+//! The reserves are metadata-derived estimates (parquet's encoded-
+//! but-uncompressed page sizes), and decoded Arrow batches can
+//! outgrow them — dictionary- or RLE-heavy pages decode into far more
+//! memory than they occupy encoded. A pass whose actual working set
+//! exhausts its pool is therefore *retried*, not failed: first at
+//! half the fan-in (remembered for the rest of the job — reserves
+//! that under-admitted once would under-admit again), and once the
+//! fan-in has narrowed all the way to the minimum, with a doubled
+//! pool per attempt, bounded by
+//! [`STREAMING_MERGE_MAX_POOL_DOUBLINGS`]. Every retry either shrinks
+//! the fan-in or is bounded by the doubling cap, so the job still
+//! terminates; without the retry a single under-estimate would abort
+//! the whole compaction and leave the table unconverged.
+//!
 //! # What the ceiling does and does not bound
 //!
 //! The memory pool bounds the merge's *decoded* working set — the
@@ -55,7 +69,9 @@
 //! they replace. A pass whose admitted runs' reserve exceeds the
 //! ceiling still gets a pool large enough for its minimum working set
 //! (see [`pass_pool_bytes`]), so a pathological pair of runs degrades
-//! to an over-ceiling pool rather than an unmergeable table.
+//! to an over-ceiling pool (further grown by the bounded retry
+//! doublings above when even that estimate falls short) rather than
+//! an unmergeable table.
 //!
 //! # Identity and re-runs
 //!
@@ -87,6 +103,7 @@ use futures::{StreamExt, executor::block_on, stream};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use roaring::RoaringBitmap;
 use tokio::sync::mpsc;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -326,6 +343,16 @@ const STREAMING_MERGE_MIN_FAN_IN: usize = 2;
 /// pool-exhaustion errors so they attribute to this path.
 const STREAMING_MERGE_CONSUMER: &str = "clustered-streaming-merge";
 
+/// Bounded pool growth for a minimum-fan-in pass that still exhausts
+/// its pool: each retry doubles the pool, up to this many doublings
+/// (2^8 = 256x — enough headroom for dictionary-heavy inputs whose
+/// decoded batches dwarf parquet's encoded-uncompressed estimate).
+/// Growth only engages once the fan-in has already narrowed to
+/// [`STREAMING_MERGE_MIN_FAN_IN`], extending the documented
+/// over-ceiling degradation for pathological pairs; a pass that still
+/// exhausts after the last doubling surfaces the resources error.
+const STREAMING_MERGE_MAX_POOL_DOUBLINGS: u32 = 8;
+
 /// Absolute minimum for a pass's memory pool. The per-run reserves are
 /// derived from parquet's `total_byte_size`, which meters
 /// encoded-but-uncompressed pages: small files whose whole payload is
@@ -354,10 +381,36 @@ pub(super) struct StreamingMergeReport {
     pub(super) cascade_folds: usize,
 }
 
-/// One key-ordered superfile inside a run.
+/// One key-ordered superfile inside a run. Cloning is cheap (two
+/// refcounts), which is what lets a pool-exhausted pass retry from
+/// the same inputs.
+#[derive(Clone)]
 struct RunFile {
     reader: Arc<SuperfileReader>,
     tombstones: Option<Arc<RoaringBitmap>>,
+}
+
+/// Why one merge pass failed. Pool exhaustion is retryable — the
+/// admission reserves are metadata-derived estimates, so a pass whose
+/// actual decoded working set outgrows them narrows its fan-in (or, at
+/// the minimum fan-in, grows its pool) and tries again. Anything else
+/// aborts the job.
+enum PassError {
+    PoolExhausted(BuildError),
+    Fatal(BuildError),
+}
+
+/// Classify one merged-stream error: the memory pool's refusal
+/// surfaces as `ResourcesExhausted` (possibly wrapped) and is the
+/// retryable case; everything else is fatal.
+fn classify_merge_error(e: DataFusionError) -> PassError {
+    let retryable = matches!(e.find_root(), DataFusionError::ResourcesExhausted(_));
+    let wrapped = BuildError::Store(format!("streaming clustered merge: {e}"));
+    if retryable {
+        PassError::PoolExhausted(wrapped)
+    } else {
+        PassError::Fatal(wrapped)
+    }
 }
 
 /// One sorted run: a chain of key-ordered superfiles whose ranges
@@ -441,77 +494,157 @@ pub(super) async fn streaming_clustered_merge(
         .collect();
     let mut cascade_folds = 0usize;
     let mut output_idx = 0usize;
+    // Narrowed when a pass exhausts its pool, and remembered for the
+    // rest of the job: reserves that under-admitted once would
+    // under-admit again on the very next pass.
+    let mut fan_in_cap = usize::MAX;
     loop {
-        let fan_in = admitted_fan_in(&runs, &shapes, merge_memory_bytes)?;
-        let is_final = runs.len() <= fan_in;
-        let pass_runs: Vec<SortedRun> = if is_final {
-            mem::take(&mut runs)
-        } else {
-            runs.drain(..fan_in).collect()
-        };
-        let ctx = MergePassContext {
-            options: Arc::clone(&options),
-            scalar_schema: scalar_schema.clone(),
-            stream_schema: stream_schema.clone(),
-            shapes: Arc::clone(&shapes),
-            rows_per_cut,
-            pool_bytes: pass_pool_bytes(&pass_runs, &shapes, merge_memory_bytes)?,
-        };
+        let mut fan_in = admitted_fan_in(&runs, &shapes, merge_memory_bytes)?.min(fan_in_cap);
+        let mut pool_doublings = 0u32;
+        // One pass, retried on pool exhaustion: narrower fan-in first,
+        // then a doubled pool once the fan-in is already minimal. The
+        // runs stay untouched until an attempt succeeds, so a retry
+        // rebuilds its streams from the same (cheaply cloned) inputs.
+        loop {
+            let is_final = runs.len() <= fan_in;
+            let take = if is_final { runs.len() } else { fan_in };
+            let pass_runs: Vec<SortedRun> = runs[..take].to_vec();
+            let pool_bytes = pass_pool_bytes(&pass_runs, &shapes, merge_memory_bytes)?
+                .saturating_mul(1usize << pool_doublings);
+            let ctx = MergePassContext {
+                options: Arc::clone(&options),
+                scalar_schema: scalar_schema.clone(),
+                stream_schema: stream_schema.clone(),
+                shapes: Arc::clone(&shapes),
+                rows_per_cut,
+                pool_bytes,
+            };
 
-        let (tx, mut rx) = mpsc::channel(SHARD_CHANNEL_CAPACITY);
-        let pool = Arc::clone(&options.writer_pool);
-        pool.spawn(move || drive_merge_pass(ctx, pass_runs, &tx));
+            let (tx, rx) = mpsc::channel(SHARD_CHANNEL_CAPACITY);
+            let pool = Arc::clone(&options.writer_pool);
+            pool.spawn(move || drive_merge_pass(ctx, pass_runs, &tx));
 
-        if is_final {
-            let mut prepared = Vec::new();
-            while let Some(item) = rx.recv().await {
-                let shard = item?;
-                if let Some(output) = prepare_streaming_output(
+            let outcome = if is_final {
+                consume_final_pass(
                     inner,
                     &storage,
                     &options,
-                    shard,
+                    rx,
                     compaction_id,
-                    output_idx,
+                    &mut output_idx,
                 )
-                .await?
-                {
-                    prepared.push(output);
+                .await
+                .map(PassOutcome::Outputs)
+            } else {
+                consume_fold_pass(&options, rx)
+                    .await
+                    .map(PassOutcome::Chain)
+            };
+            match outcome {
+                Ok(PassOutcome::Outputs(prepared)) => {
+                    return Ok(StreamingMergeReport {
+                        prepared,
+                        cascade_folds,
+                    });
                 }
-                output_idx += 1;
+                Ok(PassOutcome::Chain(chain)) => {
+                    runs.drain(..take);
+                    runs.push(chain);
+                    cascade_folds += 1;
+                    break;
+                }
+                Err(PassError::PoolExhausted(error)) => {
+                    if fan_in > STREAMING_MERGE_MIN_FAN_IN {
+                        fan_in = (fan_in / 2).max(STREAMING_MERGE_MIN_FAN_IN);
+                        fan_in_cap = fan_in;
+                        warn!(
+                            fan_in,
+                            "compact: streaming merge pass exhausted its pool; retrying narrower"
+                        );
+                    } else if pool_doublings < STREAMING_MERGE_MAX_POOL_DOUBLINGS {
+                        pool_doublings += 1;
+                        warn!(
+                            pool_doublings,
+                            "compact: minimum-fan-in streaming merge pass exhausted its pool; \
+                             retrying with a doubled pool"
+                        );
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(PassError::Fatal(error)) => return Err(error),
             }
-            return Ok(StreamingMergeReport {
-                prepared,
-                cascade_folds,
-            });
         }
-
-        // Cascade fold: reopen each intermediate output as a run file.
-        // The chain is a consecutive slice of one sorted pass, so it is
-        // itself a sorted run for the next pass.
-        let mut chain: SortedRun = Vec::new();
-        while let Some(item) = rx.recv().await {
-            let shard = item?;
-            let reader =
-                SuperfileReader::open_with(shard.bytes().clone(), options.superfile_open_options())
-                    .map_err(|e| {
-                        BuildError::Store(format!(
-                            "streaming clustered merge: reopen intermediate: {e}"
-                        ))
-                    })?;
-            chain.push(RunFile {
-                reader: Arc::new(reader),
-                tombstones: None,
-            });
-        }
-        if chain.is_empty() {
-            return Err(BuildError::Store(
-                "streaming clustered merge: cascade fold produced no rows".to_string(),
-            ));
-        }
-        runs.push(chain);
-        cascade_folds += 1;
     }
+}
+
+/// What one successful merge pass produced.
+enum PassOutcome {
+    /// Final pass: the publish-ready outputs, already durable.
+    Outputs(Vec<PreparedSuperfile>),
+    /// Cascade fold: the intermediate chain, one new sorted run.
+    Chain(SortedRun),
+}
+
+/// Final-pass consumer: publish every cut as it arrives (upload +
+/// release). `output_idx` advances across attempts, never per attempt:
+/// a retried pass must not reuse a deterministic output identity whose
+/// bytes may already exist with the failed attempt's content (the
+/// upload treats an already-present object as success). Burned indices
+/// from a failed attempt are unreferenced uploads the gc sweep
+/// reclaims.
+async fn consume_final_pass(
+    inner: &Arc<SupertableInner>,
+    storage: &Arc<dyn StorageProvider>,
+    options: &Arc<SupertableOptions>,
+    mut rx: mpsc::Receiver<Result<ShardOutput, PassError>>,
+    compaction_id: Uuid,
+    output_idx: &mut usize,
+) -> Result<Vec<PreparedSuperfile>, PassError> {
+    let mut prepared = Vec::new();
+    while let Some(item) = rx.recv().await {
+        let shard = item?;
+        let idx = *output_idx;
+        *output_idx += 1;
+        if let Some(output) =
+            prepare_streaming_output(inner, storage, options, shard, compaction_id, idx)
+                .await
+                .map_err(PassError::Fatal)?
+        {
+            prepared.push(output);
+        }
+    }
+    Ok(prepared)
+}
+
+/// Cascade-fold consumer: reopen each intermediate output as a run
+/// file. The chain is a consecutive slice of one sorted pass, so it is
+/// itself a sorted run for the next pass.
+async fn consume_fold_pass(
+    options: &Arc<SupertableOptions>,
+    mut rx: mpsc::Receiver<Result<ShardOutput, PassError>>,
+) -> Result<SortedRun, PassError> {
+    let mut chain: SortedRun = Vec::new();
+    while let Some(item) = rx.recv().await {
+        let shard = item?;
+        let reader =
+            SuperfileReader::open_with(shard.bytes().clone(), options.superfile_open_options())
+                .map_err(|e| {
+                    PassError::Fatal(BuildError::Store(format!(
+                        "streaming clustered merge: reopen intermediate: {e}"
+                    )))
+                })?;
+        chain.push(RunFile {
+            reader: Arc::new(reader),
+            tombstones: None,
+        });
+    }
+    if chain.is_empty() {
+        return Err(PassError::Fatal(BuildError::Store(
+            "streaming clustered merge: cascade fold produced no rows".to_string(),
+        )));
+    }
+    Ok(chain)
 }
 
 /// Conservative ceiling charge for streaming one run: double its
@@ -740,7 +873,7 @@ fn split_buffered_at(
 fn drive_merge_pass(
     ctx: MergePassContext,
     runs: Vec<SortedRun>,
-    tx: &mpsc::Sender<Result<ShardOutput, BuildError>>,
+    tx: &mpsc::Sender<Result<ShardOutput, PassError>>,
 ) {
     if let Err(e) = drive_merge_pass_inner(&ctx, runs, tx) {
         // Best effort: the consumer may already be gone.
@@ -751,8 +884,8 @@ fn drive_merge_pass(
 fn drive_merge_pass_inner(
     ctx: &MergePassContext,
     runs: Vec<SortedRun>,
-    tx: &mpsc::Sender<Result<ShardOutput, BuildError>>,
-) -> Result<(), BuildError> {
+    tx: &mpsc::Sender<Result<ShardOutput, PassError>>,
+) -> Result<(), PassError> {
     let streams: Vec<SendableRecordBatchStream> = runs
         .into_iter()
         .map(|run| chained_run_stream(run, ctx.stream_schema.clone(), Arc::clone(&ctx.shapes)))
@@ -762,7 +895,8 @@ fn drive_merge_pass_inner(
         &ctx.stream_schema,
         &ctx.options.cluster_by,
         ctx.pool_bytes,
-    )?;
+    )
+    .map_err(PassError::Fatal)?;
 
     let mut pending: Vec<BufferedBatch> = Vec::new();
     let mut pending_rows = 0usize;
@@ -770,12 +904,12 @@ fn drive_merge_pass_inner(
     // parks; `block_on` just adapts the stream interface on this
     // dedicated pool worker.
     while let Some(item) = block_on(merged.next()) {
-        let batch =
-            item.map_err(|e| BuildError::Store(format!("streaming clustered merge: {e}")))?;
+        let batch = item.map_err(classify_merge_error)?;
         if batch.num_rows() == 0 {
             continue;
         }
-        let mut buffered = merged_batch_to_buffered(&batch, &ctx.scalar_schema, &ctx.shapes)?;
+        let mut buffered = merged_batch_to_buffered(&batch, &ctx.scalar_schema, &ctx.shapes)
+            .map_err(PassError::Fatal)?;
         drop(batch);
         loop {
             let rows = buffered.scalar.num_rows();
@@ -806,13 +940,16 @@ fn drive_merge_pass_inner(
 fn emit_shard(
     ctx: &MergePassContext,
     pending: &mut Vec<BufferedBatch>,
-    tx: &mpsc::Sender<Result<ShardOutput, BuildError>>,
-) -> Result<(), BuildError> {
+    tx: &mpsc::Sender<Result<ShardOutput, PassError>>,
+) -> Result<(), PassError> {
     let chunk = mem::take(pending);
-    let shard = build_one_shard_with_layout(&chunk, &ctx.options, ctx.options.vector_layout, None)?;
+    let shard = build_one_shard_with_layout(&chunk, &ctx.options, ctx.options.vector_layout, None)
+        .map_err(PassError::Fatal)?;
     drop(chunk);
     tx.blocking_send(Ok(shard)).map_err(|_| {
-        BuildError::Store("streaming clustered merge: output consumer dropped".to_string())
+        PassError::Fatal(BuildError::Store(
+            "streaming clustered merge: output consumer dropped".to_string(),
+        ))
     })
 }
 
@@ -1157,5 +1294,28 @@ mod tests {
             (1..=11).collect::<Vec<i64>>(),
             "every input row must appear exactly once"
         );
+    }
+
+    /// The retry trigger: only the memory pool's refusal is retryable
+    /// (directly or wrapped), everything else is fatal — a retry on a
+    /// fatal error would loop on a pass that can never succeed.
+    #[test]
+    fn classify_merge_error_retries_only_pool_exhaustion() {
+        let exhausted = DataFusionError::ResourcesExhausted("pool".to_string());
+        assert!(matches!(
+            classify_merge_error(exhausted),
+            PassError::PoolExhausted(_)
+        ));
+
+        // Wrapped exhaustion (context frames) still classifies by root.
+        let wrapped = DataFusionError::ResourcesExhausted("pool".to_string())
+            .context("while merging sorted runs");
+        assert!(matches!(
+            classify_merge_error(wrapped),
+            PassError::PoolExhausted(_)
+        ));
+
+        let fatal = DataFusionError::External(Box::new(BuildError::Store("io".to_string())));
+        assert!(matches!(classify_merge_error(fatal), PassError::Fatal(_)));
     }
 }
