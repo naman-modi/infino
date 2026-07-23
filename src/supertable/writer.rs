@@ -6737,12 +6737,14 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 #[cfg(test)]
 mod tests {
     use std::{
+        iter::repeat_n,
         sync::Arc,
         time::{Duration, Instant},
     };
 
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use figment::{
@@ -6799,9 +6801,6 @@ mod tests {
     fn split_buffer_by_vector_cell_routes_rows_to_nearest_cell() {
         use std::collections::HashMap;
 
-        use arrow_array::{Float32Array, RecordBatch, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-
         let dim = 4usize;
         // Two centroids: e_0 and e_1.
         let centroids = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -6839,6 +6838,277 @@ mod tests {
             rows_by_cell.get(&1).copied(),
             Some(2),
             "two rows must route to the e_1 cell"
+        );
+    }
+
+    // ---- chunked clustering sort ------------------------------------
+
+    /// Tiny row cap forcing multi-chunk sorted output on small fixtures.
+    const SORT_CHUNK_TEST_ROW_CAP: usize = 3;
+    /// Tiny analog of the per-column var-unit cap: with 8-byte keys, at
+    /// most three rows of string payload fit in one chunk.
+    const SORT_CHUNK_TEST_VAR_UNIT_CAP: usize = 24;
+    /// Vector dimension for the sort fixtures (minimum accepted dim).
+    const SORT_CHUNK_TEST_DIM: usize = 16;
+
+    /// Options with `cluster_by = ["k"]` over `[k: Utf8?, seed: Int64]`
+    /// plus one vector column, for driving the chunked sort directly
+    /// (no table, no storage).
+    fn sort_chunk_test_options() -> SupertableOptions {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, true),
+            Field::new("seed", DataType::Int64, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    SORT_CHUNK_TEST_DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let vector = VectorConfig {
+            column: "emb".into(),
+            dim: SORT_CHUNK_TEST_DIM,
+            n_cent: 4,
+            rot_seed: 0,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
+        };
+        SupertableOptions::new(schema, vec![], vec![vector], None)
+            .expect("valid options")
+            .with_cluster_by(vec!["k".into()])
+            .expect("valid clustering key")
+    }
+
+    /// One buffered batch over `[k, seed]` where row i carries the
+    /// unique id `first_seed + i` and the vector `[seed; DIM]`, so any
+    /// scalar/vector misalignment through the sort is visible.
+    fn sort_chunk_test_batch(keys: &[Option<&str>], first_seed: i64) -> BufferedBatch {
+        let scalar_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, true),
+            Field::new("seed", DataType::Int64, false),
+        ]));
+        let seeds: Vec<i64> = (0..keys.len() as i64).map(|i| first_seed + i).collect();
+        let scalar = RecordBatch::try_new(
+            scalar_schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())),
+                Arc::new(Int64Array::from(seeds.clone())),
+            ],
+        )
+        .expect("scalar batch");
+        let flat: Vec<f32> = seeds
+            .iter()
+            .flat_map(|&s| repeat_n(s as f32, SORT_CHUNK_TEST_DIM))
+            .collect();
+        BufferedBatch {
+            scalar,
+            vectors: vec![Arc::new(Float32Array::from(flat))],
+        }
+    }
+
+    /// `(k, seed, vector)` per row across all chunks, in physical order.
+    fn flatten_sorted_chunks(chunks: &[BufferedBatch]) -> Vec<(Option<String>, i64, Vec<f32>)> {
+        let mut rows = Vec::new();
+        for chunk in chunks {
+            let keys = chunk
+                .scalar
+                .column_by_name("k")
+                .expect("k column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("k is Utf8");
+            let seeds = chunk
+                .scalar
+                .column_by_name("seed")
+                .expect("seed column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("seed is Int64");
+            let flat: &[f32] = chunk.vectors[0].values();
+            for i in 0..chunk.scalar.num_rows() {
+                rows.push((
+                    keys.is_valid(i).then(|| keys.value(i).to_string()),
+                    seeds.value(i),
+                    flat[i * SORT_CHUNK_TEST_DIM..(i + 1) * SORT_CHUNK_TEST_DIM].to_vec(),
+                ));
+            }
+        }
+        rows
+    }
+
+    /// Forcing a tiny row cap must split the sorted output into many
+    /// chunks that still read as ONE globally ordered run — ascending,
+    /// nulls last, duplicate keys keeping buffer order — with every
+    /// row's vector travelling with its scalars across chunk
+    /// boundaries.
+    #[test]
+    fn cluster_sort_chunked_output_stays_globally_ordered() {
+        let options = sort_chunk_test_options();
+        // Duplicates ("m", "a", "z") and nulls, scattered across three
+        // batches far from key order; seeds mint one unique id per row
+        // in buffer order.
+        let batches = vec![
+            sort_chunk_test_batch(&[Some("m"), None, Some("a"), Some("m")], 0),
+            sort_chunk_test_batch(&[Some("z"), Some("a"), None, Some("m")], 4),
+            sort_chunk_test_batch(&[Some("b"), Some("z"), Some("a"), Some("q")], 8),
+        ];
+        let total_rows = 12;
+
+        let sorted = sort_buffer_by_cluster_key_chunked(
+            &batches,
+            &options,
+            SORT_CHUNK_TEST_ROW_CAP,
+            usize::MAX,
+        )
+        .expect("chunked sort");
+
+        assert!(
+            sorted.len() > 1,
+            "tiny row cap must force multiple chunks, got {}",
+            sorted.len()
+        );
+        for chunk in &sorted {
+            assert!(
+                chunk.scalar.num_rows() <= SORT_CHUNK_TEST_ROW_CAP,
+                "chunk exceeds the row cap"
+            );
+        }
+
+        let rows = flatten_sorted_chunks(&sorted);
+        assert_eq!(rows.len(), total_rows, "no rows lost or duplicated");
+        // Global order across chunk boundaries: ascending, nulls last;
+        // equal keys keep buffer order, and seeds ARE the buffer order,
+        // so the comparable triple must be strictly increasing.
+        for pair in rows.windows(2) {
+            let a = (pair[0].0.is_none(), pair[0].0.clone(), pair[0].1);
+            let b = (pair[1].0.is_none(), pair[1].0.clone(), pair[1].1);
+            assert!(a < b, "rows out of order across chunks: {a:?} then {b:?}");
+        }
+        let mut seeds: Vec<i64> = rows.iter().map(|row| row.1).collect();
+        seeds.sort_unstable();
+        assert_eq!(
+            seeds,
+            (0..total_rows as i64).collect::<Vec<_>>(),
+            "every input row must appear exactly once"
+        );
+        for (key, seed, vector) in &rows {
+            assert!(
+                vector.iter().all(|v| *v == *seed as f32),
+                "row (k={key:?}, seed={seed}) lost its vector through the sort"
+            );
+        }
+    }
+
+    /// The 100M-row overflow, shrunk: key bytes totalling far beyond
+    /// the per-column cap analog must gather into several chunks, each
+    /// holding at most the cap's worth of string payload — never one
+    /// concatenated array, which is exactly where the real commit died
+    /// on Arrow's i32 offset overflow. A lone row wider than the cap
+    /// still ships, as its own chunk.
+    #[test]
+    fn cluster_sort_splits_chunks_at_the_column_byte_cap() {
+        let options = sort_chunk_test_options();
+        // Seventeen 8-byte keys (136 bytes >> the 24-byte cap) plus one
+        // 40-byte key that alone exceeds the cap, scattered across
+        // three batches; the `* 7 % 18` walk scrambles the key order.
+        let scrambled: Vec<String> = (0..18)
+            .map(|i| format!("key-{:04}", (i * 7) % 18))
+            .collect();
+        let oversized = format!("key-0009-{}", "x".repeat(31));
+        assert!(oversized.len() > SORT_CHUNK_TEST_VAR_UNIT_CAP);
+        let mut keys: Vec<Option<&str>> = scrambled.iter().map(|k| Some(k.as_str())).collect();
+        keys[5] = Some(oversized.as_str());
+        let batches = vec![
+            sort_chunk_test_batch(&keys[0..6], 0),
+            sort_chunk_test_batch(&keys[6..12], 6),
+            sort_chunk_test_batch(&keys[12..18], 12),
+        ];
+
+        let sorted = sort_buffer_by_cluster_key_chunked(
+            &batches,
+            &options,
+            usize::MAX,
+            SORT_CHUNK_TEST_VAR_UNIT_CAP,
+        )
+        .expect("chunked sort");
+
+        assert!(
+            sorted.len() > 1,
+            "the byte cap must force multiple chunks, got {}",
+            sorted.len()
+        );
+        let mut oversized_chunks = 0;
+        for chunk in &sorted {
+            let keys = chunk
+                .scalar
+                .column_by_name("k")
+                .expect("k column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("k is Utf8");
+            let chunk_bytes: usize = (0..keys.len()).map(|i| keys.value(i).len()).sum();
+            if chunk_bytes > SORT_CHUNK_TEST_VAR_UNIT_CAP {
+                // Only a single row may exceed the cap, and only alone.
+                assert_eq!(
+                    chunk.scalar.num_rows(),
+                    1,
+                    "an over-cap chunk must hold exactly the one oversized row"
+                );
+                oversized_chunks += 1;
+            }
+        }
+        assert_eq!(
+            oversized_chunks, 1,
+            "exactly one chunk carries the oversized row"
+        );
+
+        // Chunking must not disturb the global order or lose rows.
+        let rows = flatten_sorted_chunks(&sorted);
+        assert_eq!(rows.len(), 18, "no rows lost or duplicated");
+        for pair in rows.windows(2) {
+            let a = (pair[0].0.clone(), pair[0].1);
+            let b = (pair[1].0.clone(), pair[1].1);
+            assert!(a < b, "rows out of order across chunks: {a:?} then {b:?}");
+        }
+        for (key, seed, vector) in &rows {
+            assert!(
+                vector.iter().all(|v| *v == *seed as f32),
+                "row (k={key:?}, seed={seed}) lost its vector through the sort"
+            );
+        }
+    }
+
+    /// The production entry point (default caps) on a small buffer:
+    /// one chunk out, identical row order to the tiny-cap run — the
+    /// caps only bound chunk size, never change the order.
+    #[test]
+    fn cluster_sort_default_caps_match_tiny_cap_order() {
+        let options = sort_chunk_test_options();
+        let batches = vec![
+            sort_chunk_test_batch(&[Some("m"), None, Some("a"), Some("m")], 0),
+            sort_chunk_test_batch(&[Some("z"), Some("a"), None, Some("m")], 4),
+        ];
+
+        let default_sorted = sort_buffer_by_cluster_key(&batches, &options).expect("default sort");
+        assert_eq!(
+            default_sorted.len(),
+            1,
+            "a small buffer fits one chunk under the default caps"
+        );
+        let tiny_sorted = sort_buffer_by_cluster_key_chunked(
+            &batches,
+            &options,
+            SORT_CHUNK_TEST_ROW_CAP,
+            SORT_CHUNK_TEST_VAR_UNIT_CAP,
+        )
+        .expect("tiny-cap sort");
+        assert_eq!(
+            flatten_sorted_chunks(&default_sorted),
+            flatten_sorted_chunks(&tiny_sorted),
+            "chunk caps must not change the sorted row order"
         );
     }
 
