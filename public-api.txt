@@ -239,6 +239,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::GcSettings
 impl core::panic::unwind_safe::UnwindSafe for infino::GcSettings
 pub struct infino::IndexSpec
 impl infino::IndexSpec
+pub fn infino::IndexSpec::cluster_by<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::IndexSpec::new() -> Self
 pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, usize, infino::Metric) -> Self
