@@ -18,6 +18,7 @@ use std::{
     time::Instant,
 };
 
+use arrow_array::Float32Array;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{
@@ -25,7 +26,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use roaring::RoaringBitmap;
-use tokio::time;
+use tokio::{sync::oneshot, time};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -33,9 +34,15 @@ use crate::{
     Supertable,
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
-    superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
+    superfile::{
+        SuperfileReader,
+        builder::{BuilderOptions, SuperfileBuilder, merge_rows_from_reader},
+        error::BuildError as SuperfileBuildError,
+        vector::layout::VectorLayout,
+    },
     supertable::{
-        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri,
+        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, SupertableOptions,
+        build::fanout_shards_in_pool_scope,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
@@ -45,8 +52,9 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, prepare_superfile, refresh_slow_vector_state,
+            BufferedBatch, NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
+            build_one_shard_with_layout, finalize_compaction_commit, prepare_superfile,
+            refresh_slow_vector_state, sort_buffer_by_cluster_key, split_buffer_into_row_shards,
             split_overflow_cells, try_commit_attempt,
         },
     },
@@ -61,6 +69,16 @@ impl Drop for CompactionSlot<'_> {
 }
 
 const MIB: u64 = 1024 * 1024;
+
+/// How many multiples of the raw input size an unordered merge reserves from
+/// the connection budget: the merge still materializes every input at once,
+/// and the builder holds roughly another copy until `finish`.
+const MERGE_MEMORY_RESERVE_FACTOR: u64 = 2;
+
+/// A clustered merge concatenates the materialized inputs and gathers a
+/// sorted copy while the originals are still alive, so its transient peak
+/// holds one more copy of the payload than the unordered merge.
+const CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR: u64 = 3;
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,9 +375,27 @@ impl Supertable {
             }
             None => vec![stats],
         };
+        // Clustered tables fuse same-partition sibling jobs (bounded by the
+        // same memory ceiling a single job respects) so one global sort can
+        // slice them into range-disjoint outputs; each fused job then asks
+        // the merge for enough outputs to stay near the target size.
+        let clustered = !inner.options.cluster_by.is_empty();
+        let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+        let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
         for stats in &stat_groups {
-            for job in select(stats, cfg) {
-                table.run_compaction_job(job, stale_seal_timeout).await?;
+            let mut jobs = select(stats, cfg);
+            if clustered {
+                jobs = coalesce_clustered_jobs(jobs, stats, max_memory_bytes);
+            }
+            for job in jobs {
+                let n_outputs = if clustered {
+                    clustered_output_count(job.estimated_output_bytes, target_bytes)
+                } else {
+                    1
+                };
+                table
+                    .run_compaction_job(job, n_outputs, stale_seal_timeout)
+                    .await?;
                 table
                     .refresh()
                     .await
@@ -370,16 +406,29 @@ impl Supertable {
         Ok(())
     }
 
-    /// Merges the given superfiles into one
+    /// Merges the given superfiles.
+    ///
+    /// Unclustered tables (and the sq8 IVF vector routes, whose row order is
+    /// dictated by the vector layout) produce exactly one merged superfile
+    /// with rows in input-concatenation order — `n_outputs` is ignored.
+    ///
+    /// When the table declares a clustering key, the merge instead re-sorts
+    /// the combined live rows by the key (the same lexicographic ascending,
+    /// nulls-last order every commit is written in) and splits the one
+    /// sorted run into up to `n_outputs` contiguous chunks, so consecutive
+    /// outputs carry non-overlapping key ranges and the ordered scan path
+    /// can fire across them.
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
-    ) -> Result<PreparedSuperfile, BuildError> {
+        n_outputs: usize,
+    ) -> Result<Vec<PreparedSuperfile>, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
         let storage = manifest.options.storage.clone();
         let tombstone_cache = self.inner().tombstone_cache.clone();
+        let clustered = !self.inner().options.cluster_by.is_empty();
 
         // This reserves budget for the whole input size since merge still
         // loads it all at once. Real fix is streaming the merge and pooling
@@ -388,8 +437,14 @@ impl Supertable {
             .iter()
             .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
             .sum();
-        // double the input bytes to account for the merge buffer and any overhead
-        let estimated_bytes = input_bytes.saturating_mul(2) as usize;
+        // Multiply the input bytes to cover the merge buffer and overhead; a
+        // clustered merge holds one more transient copy for the sort gather.
+        let reserve_factor = if clustered {
+            CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR
+        } else {
+            MERGE_MEMORY_RESERVE_FACTOR
+        };
+        let estimated_bytes = input_bytes.saturating_mul(reserve_factor) as usize;
         let _memory_reservation = manifest
             .options
             .connection_memory_budget
@@ -429,16 +484,42 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
+        let first_vec = readers_with_tombstones
+            .first()
+            .and_then(|(reader, _)| reader.vec());
+        let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+        let sq8_merge = first_vec.and_then(|v| {
+            v.vector_columns_config()
+                .next()
+                .map(|c| c.rerank_codec.is_sq8_residual_family())
+        });
+
+        // Clustered merge (row-materializing route only): sort the combined
+        // live rows by the key and build one superfile per contiguous chunk.
+        // The sq8 IVF routes byte-splice their vector blobs and pin the row
+        // order to the vector layout, so they cannot re-sort; their merged
+        // ranges simply keep overlapping and the scan stays on its unordered
+        // fallback for those tables.
+        if clustered && !multi_cell && sq8_merge != Some(true) {
+            let shard_outputs = clustered_merge_shards(
+                Arc::clone(&self.inner().options),
+                readers_with_tombstones,
+                n_outputs,
+            )
+            .await?;
+            let mut prepared = Vec::with_capacity(shard_outputs.len());
+            for shard in shard_outputs {
+                if let Some(superfile) = prepare_superfile(self.inner().as_ref(), shard)? {
+                    prepared.push(superfile);
+                }
+            }
+            if prepared.is_empty() {
+                return Err(BuildError::NoDocsToBuild);
+            }
+            return Ok(prepared);
+        }
+
         let (merged_bytes, superfile_stats) = {
-            let first_vec = readers_with_tombstones
-                .first()
-                .and_then(|(reader, _)| reader.vec());
-            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
-            let sq8_merge = first_vec.and_then(|v| {
-                v.vector_columns_config()
-                    .next()
-                    .map(|c| c.rerank_codec.is_sq8_residual_family())
-            });
             if multi_cell && sq8_merge == Some(true) {
                 SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&readers_with_tombstones)?
             } else if sq8_merge == Some(true) {
@@ -459,12 +540,20 @@ impl Supertable {
 
         let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
 
-        prepared_superfile.ok_or(BuildError::NoDocsToBuild)
+        prepared_superfile
+            .map(|superfile| vec![superfile])
+            .ok_or(BuildError::NoDocsToBuild)
     }
 
+    /// Executes one compaction job: seal the inputs, merge them, and swap
+    /// the merged output(s) into the manifest. `n_outputs` only matters for
+    /// clustered tables, where it caps how many contiguous key-range chunks
+    /// the merged rows split into (see [`Supertable::merge_superfiles`]);
+    /// pass 1 everywhere else.
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
+        n_outputs: usize,
         stale_seal_timeout: std::time::Duration,
     ) -> Result<(), CompactionError> {
         let inner = self.inner();
@@ -527,39 +616,54 @@ impl Supertable {
             });
         }
 
-        let merged_segment = match self.merge_superfiles(&inputs).await {
-            Ok(seg) => seg,
+        let merged_segments = match self.merge_superfiles(&inputs, n_outputs).await {
+            Ok(segments) => segments,
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
                 return Err(CompactionError::Build(e.to_string()));
             }
         };
 
-        let PreparedSuperfile {
-            entry: merged_prepared,
-            bytes_for_store,
-            bytes_for_storage,
-            bytes_for_cache,
-        } = merged_segment;
-        let merged_entry = Arc::new(SuperfileEntry {
-            // Carry the OLDEST input's birth_version so a merge of
-            // already-drained inputs stays <= the drain watermark (skipped, not
-            // re-drained). See the hidden-index `drained_ranges` design.
-            birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
-            // Left empty: the manifest's `update()` stamps the
-            // partition key at commit time from `partition_hint`.
-            partition_key: Vec::new(),
-            partition_hint: inputs.first().and_then(|e| e.partition_hint),
-            vector_layout: inputs
-                .first()
-                .map(|e| e.vector_layout)
-                .unwrap_or(VectorLayout::Ivf),
-            ..(*merged_prepared).clone()
-        });
-        let merged_superfile_id = merged_entry.superfile_id;
-        let new_entries = vec![merged_entry];
-        let mut pending_storage_writes =
-            vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?];
+        // Carry the OLDEST input's birth_version so a merge of
+        // already-drained inputs stays <= the drain watermark (skipped, not
+        // re-drained). See the hidden-index `drained_ranges` design. Every
+        // output of a multi-output clustered merge holds rows from any
+        // input, so they all share the same conservative stamp.
+        let birth_version = inputs.iter().map(|e| e.birth_version).min().unwrap_or(0);
+        let partition_hint = inputs.first().and_then(|e| e.partition_hint);
+        let vector_layout = inputs
+            .first()
+            .map(|e| e.vector_layout)
+            .unwrap_or(VectorLayout::Ivf);
+
+        let mut new_entries = Vec::with_capacity(merged_segments.len());
+        let mut pending_storage_writes = Vec::with_capacity(merged_segments.len());
+        let mut reader_cache_warms = Vec::new();
+        let mut pending_cache_inserts = Vec::new();
+        for segment in merged_segments {
+            let PreparedSuperfile {
+                entry: merged_prepared,
+                bytes_for_store,
+                bytes_for_storage,
+                bytes_for_cache,
+            } = segment;
+            let merged_entry = Arc::new(SuperfileEntry {
+                birth_version,
+                // Left empty: the manifest's `update()` stamps the
+                // partition key at commit time from `partition_hint`.
+                partition_key: Vec::new(),
+                partition_hint,
+                vector_layout,
+                ..(*merged_prepared).clone()
+            });
+            if let Some(warm) = bytes_for_store {
+                reader_cache_warms.push((merged_entry.superfile_id, warm));
+            }
+            pending_cache_inserts.extend(bytes_for_cache);
+            new_entries.push(merged_entry);
+            pending_storage_writes
+                .push(bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?);
+        }
 
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
@@ -586,18 +690,18 @@ impl Supertable {
             {
                 Ok(new_manifest) => {
                     inner.manifest.store(Arc::new(new_manifest));
-                    // Warm the merged superfile into the in-memory reader
+                    // Warm the merged superfile(s) into the in-memory reader
                     // cache, same as a normal writer commit does. Without
-                    // this every query against it misses and re-fetches +
+                    // this every query against them misses and re-fetches +
                     // re-opens from storage every single time.
-                    if let Some((uri, bytes)) = bytes_for_store
-                        && let Err(e) = opts.store.insert(uri, bytes)
-                    {
-                        warn!(
-                            superfile_id = %merged_superfile_id,
-                            error = %e,
-                            "compact: failed to warm reader cache for merged superfile"
-                        );
+                    for (superfile_id, (uri, bytes)) in reader_cache_warms {
+                        if let Err(e) = opts.store.insert(uri, bytes) {
+                            warn!(
+                                superfile_id = %superfile_id,
+                                error = %e,
+                                "compact: failed to warm reader cache for merged superfile"
+                            );
+                        }
                     }
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.
@@ -609,7 +713,6 @@ impl Supertable {
                     // Disk-cache warm + background storage reclaim ride the
                     // shared post-commit finalizer (the same path writer
                     // commits use), so the two paths can't drift.
-                    let pending_cache_inserts = bytes_for_cache.into_iter().collect::<Vec<_>>();
                     finalize_compaction_commit(
                         Arc::clone(inner),
                         &storage,
@@ -648,6 +751,134 @@ impl Supertable {
             "commit retries exhausted".to_string(),
         ))
     }
+}
+
+/// Ceiling count of target-sized outputs a clustered merge should split
+/// into, from the job's live-byte estimate. A zero target (or estimate)
+/// degrades to a single output.
+fn clustered_output_count(estimated_live_bytes: u64, target_bytes: u64) -> usize {
+    if target_bytes == 0 {
+        return 1;
+    }
+    estimated_live_bytes.div_ceil(target_bytes).max(1) as usize
+}
+
+/// Fuse a clustered table's same-partition jobs into multi-output jobs.
+///
+/// `select` packs each partition's fragments into independent target-sized
+/// jobs. Merging each of those on its own would sort each output
+/// independently, leaving sibling outputs overlapping in key range, so the
+/// scan's ordering declaration could never fire across them. Fusing the
+/// siblings into one job makes the merge sort ALL their rows in a single
+/// run and slice it into contiguous chunks — pairwise-disjoint outputs.
+///
+/// Fusion is capped by the same `max_memory_bytes` ceiling a single job's
+/// raw input bytes already respect, so a partition too big to sort in one
+/// bounded pass degrades to per-job merges (each still internally sorted,
+/// ranges possibly overlapping). Selection is untouched: exactly the
+/// superfiles `select` picked get merged, only the job boundaries move.
+/// Relies on `select` emitting same-partition jobs consecutively (it packs
+/// partitions in `BTreeMap` order).
+fn coalesce_clustered_jobs(
+    jobs: Vec<CompactionJob>,
+    superfiles: &[SuperfileStats],
+    max_memory_bytes: u64,
+) -> Vec<CompactionJob> {
+    let size_by_id: HashMap<Uuid, u64> = superfiles
+        .iter()
+        .map(|s| (s.superfile_id, s.size_bytes))
+        .collect();
+    let raw_bytes = |job: &CompactionJob| -> u64 {
+        job.inputs
+            .iter()
+            .map(|id| size_by_id.get(id).copied().unwrap_or(0))
+            .sum()
+    };
+    let mut fused: Vec<(CompactionJob, u64)> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let job_raw = raw_bytes(&job);
+        match fused.last_mut() {
+            Some((acc, acc_raw))
+                if acc.partition_key == job.partition_key
+                    && acc_raw.saturating_add(job_raw) <= max_memory_bytes =>
+            {
+                acc.inputs.extend(job.inputs);
+                acc.estimated_output_bytes = acc
+                    .estimated_output_bytes
+                    .saturating_add(job.estimated_output_bytes);
+                *acc_raw = acc_raw.saturating_add(job_raw);
+            }
+            _ => fused.push((job, job_raw)),
+        }
+    }
+    fused.into_iter().map(|(job, _)| job).collect()
+}
+
+/// CPU half of a clustered merge, bridged onto the writer rayon pool via a
+/// oneshot so the calling tokio worker keeps driving I/O while the sort and
+/// the chunk builds run.
+async fn clustered_merge_shards(
+    options: Arc<SupertableOptions>,
+    readers: Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)>,
+    n_outputs: usize,
+) -> Result<Vec<ShardOutput>, BuildError> {
+    let pool = Arc::clone(&options.writer_pool);
+    let (tx, rx) = oneshot::channel();
+    pool.spawn(move || {
+        let result = clustered_merge_shards_in_pool(&options, &readers, n_outputs);
+        let _ = tx.send(result);
+    });
+    rx.await
+        .map_err(|_| BuildError::Store("clustered merge task dropped its result".to_string()))?
+}
+
+/// Body of [`clustered_merge_shards`]; runs on a writer-pool worker thread.
+///
+/// Materializes each input's live rows (the batch read already dropped
+/// tombstoned rows, so the sort only ever sees survivors), runs them
+/// through the same clustering sort every commit uses, splits the single
+/// sorted run into `n_outputs` contiguous row chunks, and builds one
+/// superfile per chunk on the pool. Because the chunks slice one globally
+/// sorted run, consecutive outputs partition the key space in order instead
+/// of being independently sorted, and each output's column statistics are
+/// computed from exactly its own chunk.
+fn clustered_merge_shards_in_pool(
+    options: &SupertableOptions,
+    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    n_outputs: usize,
+) -> Result<Vec<ShardOutput>, BuildError> {
+    let first = readers
+        .first()
+        .ok_or(BuildError::Superfile(SuperfileBuildError::BatchReadError))?;
+    // Validate every input against the first one's shape, exactly like the
+    // unordered merge (`SuperfileBuilder::build_from_readers`) does.
+    let merge_opts = BuilderOptions::new_from_reader(&first.0);
+    let mut buffered = Vec::with_capacity(readers.len());
+    for (reader, bitmap) in readers {
+        let (scalar, vectors) = merge_rows_from_reader(&merge_opts, reader, bitmap.clone())?;
+        if scalar.num_rows() == 0 {
+            // Fully tombstoned input: nothing live to carry forward.
+            continue;
+        }
+        let vectors = vectors
+            .into_iter()
+            .map(|values| Arc::new(Float32Array::from(values)))
+            .collect();
+        buffered.push(BufferedBatch { scalar, vectors });
+    }
+
+    let sorted = sort_buffer_by_cluster_key(&buffered, options)?;
+    drop(buffered);
+    let total_rows: usize = sorted.iter().map(|b| b.scalar.num_rows()).sum();
+    if total_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let vector_dims: Vec<usize> = options.vector_columns.iter().map(|vc| vc.dim).collect();
+    let shards = split_buffer_into_row_shards(sorted, n_outputs.clamp(1, total_rows), &vector_dims);
+    fanout_shards_in_pool_scope(&shards, |slice| {
+        build_one_shard_with_layout(slice.as_slice(), options, options.vector_layout, None)
+    })
 }
 
 /// One superfile this attempt sealed: enough to unseal it later with
@@ -754,6 +985,7 @@ mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
     use arrow_array::LargeStringArray;
+    use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
     use tokio::task;
 
@@ -764,6 +996,7 @@ mod tests {
         memory::ConnectionMemoryBudget,
         supertable::{
             error::CompactionError,
+            manifest::list::ScalarStatsAgg,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
         test_helpers::{build_title_batch, default_supertable_options},
@@ -1006,7 +1239,7 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .run_compaction_job(job, 1, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error on unknown input");
         assert!(
@@ -1089,7 +1322,7 @@ mod tests {
             estimated_output_bytes: 1,
         };
         let err = st
-            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .run_compaction_job(job, 1, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must conflict on entry_b");
         assert!(matches!(err, CompactionError::SidecarConflict { .. }));
@@ -1339,9 +1572,11 @@ mod tests {
 
         // Merge the superfiles - should succeed
         let _merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, 1)
             .await
-            .expect("merge_superfiles should succeed");
+            .expect("merge_superfiles should succeed")
+            .pop()
+            .expect("exactly one merged superfile");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1393,9 +1628,11 @@ mod tests {
 
         // Merge should succeed and preserve scalar stats
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, 1)
             .await
-            .expect("merge_superfiles should succeed");
+            .expect("merge_superfiles should succeed")
+            .pop()
+            .expect("exactly one merged superfile");
 
         // Verify merged superfile stats match expected values
         assert_eq!(
@@ -1473,9 +1710,11 @@ mod tests {
 
         // Merging 3 superfiles should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, 1)
             .await
-            .expect("merge_superfiles should succeed");
+            .expect("merge_superfiles should succeed")
+            .pop()
+            .expect("exactly one merged superfile");
 
         // Verify merged superfile stats
         assert_eq!(
@@ -1548,7 +1787,7 @@ mod tests {
         let reader = st.reader();
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
 
-        match st.merge_superfiles(&superfiles).await {
+        match st.merge_superfiles(&superfiles, 1).await {
             Err(BuildError::MemoryBudgetExceeded(_)) => {}
             Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
             Ok(_) => panic!("merge must be refused over budget"),
@@ -1585,9 +1824,11 @@ mod tests {
 
         // Merging a single superfile should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles)
+            .merge_superfiles(&superfiles, 1)
             .await
-            .expect("merge_superfiles should succeed");
+            .expect("merge_superfiles should succeed")
+            .pop()
+            .expect("exactly one merged superfile");
 
         // Verify merged superfile stats
         assert_eq!(
@@ -1635,6 +1876,283 @@ mod tests {
             1,
             "should find exactly 1 doc matching 'second'"
         );
+    }
+
+    // ---- clustered merges --------------------------------------------
+
+    /// Storage-backed table clustered by `title`.
+    fn make_clustered_st(dir: &TempDir) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        Supertable::create(
+            default_supertable_options()
+                .with_cluster_by(vec!["title".to_string()])
+                .expect("title is a sortable clustering key")
+                .with_storage(Arc::clone(&storage)),
+        )
+        .expect("create clustered supertable")
+    }
+
+    /// The `title` values of one prepared merge output, in file row order.
+    fn titles_of(prepared: &PreparedSuperfile) -> Vec<String> {
+        let reader = prepared
+            .open_reader()
+            .expect("merged superfile has bytes")
+            .expect("open merged superfile");
+        let batch = reader.get_record_batch(None).expect("decode rows");
+        let titles = batch
+            .column_by_name("title")
+            .expect("title column")
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title is LargeUtf8");
+        (0..batch.num_rows())
+            .map(|i| titles.value(i).to_string())
+            .collect()
+    }
+
+    /// `(min, max)` of a title stats entry.
+    fn title_stat_bounds(stats: &ScalarStatsAgg) -> (String, String) {
+        let min = stats
+            .min
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("min is LargeUtf8")
+            .value(0)
+            .to_string();
+        let max = stats
+            .max
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("max is LargeUtf8")
+            .value(0)
+            .to_string();
+        (min, max)
+    }
+
+    /// A clustered merge must emit the combined rows in key order — the
+    /// input files interleave (each commit is sorted, the commits overlap)
+    /// so input-concatenation order would NOT be sorted — and the merged
+    /// entry's column statistics must span exactly the sorted output.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clustered_merge_sorts_live_rows_by_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_clustered_st(&dir);
+        commit_titles(&st, &["delta doc", "alpha doc"]);
+        commit_titles(&st, &["charlie doc", "bravo doc"]);
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1)
+            .await
+            .expect("clustered merge")
+            .pop()
+            .expect("exactly one merged superfile");
+
+        assert_eq!(
+            titles_of(&merged),
+            vec!["alpha doc", "bravo doc", "charlie doc", "delta doc"],
+            "merged rows must be in clustering-key order"
+        );
+        let (min, max) =
+            title_stat_bounds(merged.entry.scalar_stats.get("title").expect("title stats"));
+        assert_eq!((min.as_str(), max.as_str()), ("alpha doc", "delta doc"));
+    }
+
+    /// Tombstone exclusion and the clustering sort compose: the merge
+    /// output holds only live rows, still in key order, and the recomputed
+    /// statistics cover only the survivors.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clustered_merge_excludes_tombstones_and_stays_sorted() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_clustered_st(&dir);
+        commit_titles(&st, &["delta doc", "alpha doc"]);
+        commit_titles(&st, &["charlie doc", "bravo doc"]);
+        {
+            let mut w = st.writer().expect("writer");
+            let pending = w.delete(col("title").eq(lit("delta doc"))).expect("delete");
+            assert_eq!(pending.matched, 1);
+            w.commit().expect("commit delete");
+        }
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1)
+            .await
+            .expect("clustered merge")
+            .pop()
+            .expect("exactly one merged superfile");
+
+        assert_eq!(
+            titles_of(&merged),
+            vec!["alpha doc", "bravo doc", "charlie doc"],
+            "only live rows, in key order"
+        );
+        let (min, max) =
+            title_stat_bounds(merged.entry.scalar_stats.get("title").expect("title stats"));
+        assert_eq!(
+            (min.as_str(), max.as_str()),
+            ("alpha doc", "charlie doc"),
+            "stats must reflect the tombstone-filtered sorted output"
+        );
+    }
+
+    /// `n_outputs > 1` slices ONE globally sorted run into contiguous
+    /// chunks: every output is internally sorted and consecutive outputs'
+    /// key ranges chain without overlap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clustered_merge_splits_into_contiguous_disjoint_chunks() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_clustered_st(&dir);
+        commit_titles(&st, &["golf doc", "echo doc", "alpha doc", "charlie doc"]);
+        commit_titles(&st, &["hotel doc", "foxtrot doc", "bravo doc", "delta doc"]);
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 2)
+            .await
+            .expect("clustered merge");
+        assert_eq!(merged.len(), 2, "two target-sized outputs requested");
+
+        assert_eq!(
+            titles_of(&merged[0]),
+            vec!["alpha doc", "bravo doc", "charlie doc", "delta doc"]
+        );
+        assert_eq!(
+            titles_of(&merged[1]),
+            vec!["echo doc", "foxtrot doc", "golf doc", "hotel doc"]
+        );
+        let (_, first_max) =
+            title_stat_bounds(merged[0].entry.scalar_stats.get("title").expect("stats"));
+        let (second_min, _) =
+            title_stat_bounds(merged[1].entry.scalar_stats.get("title").expect("stats"));
+        assert!(
+            first_max <= second_min,
+            "consecutive outputs must not overlap: {first_max:?} vs {second_min:?}"
+        );
+    }
+
+    /// Byte-behavior guard for tables WITHOUT a clustering key: the merge
+    /// keeps input-concatenation row order exactly (no sort sneaks in).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unclustered_merge_preserves_input_row_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["zulu doc", "alpha doc"]);
+        commit_titles(&st, &["mike doc", "bravo doc"]);
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1)
+            .await
+            .expect("merge")
+            .pop()
+            .expect("exactly one merged superfile");
+
+        assert_eq!(
+            titles_of(&merged),
+            vec!["zulu doc", "alpha doc", "mike doc", "bravo doc"],
+            "unclustered merge must preserve append/manifest order"
+        );
+    }
+
+    /// End-to-end job on a clustered table: multiple outputs land in the
+    /// manifest, replace all inputs, and carry chained (disjoint) key-range
+    /// statistics for the scan's ordering declaration to read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_compaction_job_clustered_publishes_disjoint_outputs() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_clustered_st(&dir);
+        commit_titles(&st, &["golf doc", "alpha doc"]);
+        commit_titles(&st, &["hotel doc", "bravo doc"]);
+        commit_titles(&st, &["echo doc", "charlie doc"]);
+        commit_titles(&st, &["foxtrot doc", "delta doc"]);
+
+        let inputs: Vec<Uuid> = st
+            .reader()
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        let job = CompactionJob {
+            partition_key: Vec::new(),
+            inputs,
+            estimated_output_bytes: 1,
+        };
+        st.run_compaction_job(job, 2, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("clustered job");
+
+        let entries = st.reader().manifest().get_all_superfiles().to_vec();
+        assert_eq!(entries.len(), 2, "the job's two outputs replace all inputs");
+        assert_eq!(entries.iter().map(|e| e.n_docs).sum::<u64>(), 8);
+        let mut bounds: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| title_stat_bounds(e.scalar_stats.get("title").expect("title stats")))
+            .collect();
+        bounds.sort();
+        assert!(
+            bounds[0].1 <= bounds[1].0,
+            "published outputs must carry disjoint key ranges: {bounds:?}"
+        );
+    }
+
+    // ---- coalesce_clustered_jobs / clustered_output_count ------------
+
+    #[test]
+    fn clustered_output_count_rounds_up_and_degrades_to_one() {
+        assert_eq!(clustered_output_count(0, mib(1)), 1);
+        assert_eq!(clustered_output_count(mib(1), mib(1)), 1);
+        assert_eq!(clustered_output_count(mib(1) + 1, mib(1)), 2);
+        assert_eq!(clustered_output_count(mib(5), mib(2)), 3);
+        assert_eq!(clustered_output_count(mib(5), 0), 1, "zero target");
+    }
+
+    #[test]
+    fn coalesce_fuses_same_partition_jobs_up_to_the_memory_ceiling() {
+        let segs: Vec<SuperfileStats> = (0..6).map(|i| seg(i, 100, 1000, 0)).collect();
+        let job = |ids: &[u128]| CompactionJob {
+            partition_key: Vec::new(),
+            inputs: ids.iter().map(|i| Uuid::from_u128(*i)).collect(),
+            estimated_output_bytes: mib(100) * ids.len() as u64,
+        };
+        // Ceiling admits four inputs' raw bytes: jobs A+B fuse, C stays.
+        let fused = coalesce_clustered_jobs(
+            vec![job(&[0, 1]), job(&[2, 3]), job(&[4, 5])],
+            &segs,
+            mib(400),
+        );
+        assert_eq!(fused.len(), 2);
+        assert_eq!(
+            fused[0].inputs,
+            [0u128, 1, 2, 3].map(Uuid::from_u128).to_vec(),
+            "first two jobs fuse in order"
+        );
+        assert_eq!(fused[0].estimated_output_bytes, mib(400));
+        assert_eq!(fused[1].inputs, [4u128, 5].map(Uuid::from_u128).to_vec());
+    }
+
+    #[test]
+    fn coalesce_never_fuses_across_partitions() {
+        let mut segs: Vec<SuperfileStats> = (0..4).map(|i| seg(i, 100, 1000, 0)).collect();
+        segs[0].partition_key = vec![0xA];
+        segs[1].partition_key = vec![0xA];
+        segs[2].partition_key = vec![0xB];
+        segs[3].partition_key = vec![0xB];
+        let job = |key: u8, ids: &[u128]| CompactionJob {
+            partition_key: vec![key],
+            inputs: ids.iter().map(|i| Uuid::from_u128(*i)).collect(),
+            estimated_output_bytes: mib(100),
+        };
+        let fused = coalesce_clustered_jobs(
+            vec![job(0xA, &[0, 1]), job(0xB, &[2, 3])],
+            &segs,
+            mib(10_000),
+        );
+        assert_eq!(fused.len(), 2, "partition boundary blocks fusion");
+        assert_eq!(fused[0].partition_key, vec![0xA]);
+        assert_eq!(fused[1].partition_key, vec![0xB]);
     }
 
     /// An in-memory supertable (no storage, no tombstone cache) takes

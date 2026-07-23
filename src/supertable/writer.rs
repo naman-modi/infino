@@ -393,9 +393,9 @@ impl fmt::Debug for SupertableWriter {
 /// per-shard builders re-derive `&[f32]` slices via
 /// [`Float32Array::values`] without copying.
 #[derive(Clone)]
-struct BufferedBatch {
-    scalar: RecordBatch,
-    vectors: Vec<Arc<Float32Array>>,
+pub(super) struct BufferedBatch {
+    pub(super) scalar: RecordBatch,
+    pub(super) vectors: Vec<Arc<Float32Array>>,
 }
 
 /// Zero-copy view of one vector column across the buffered batches:
@@ -470,7 +470,7 @@ impl<'a> VectorColumnView<'a> {
 /// Trailing empty shards (only possible when `total_rows < n_shards`)
 /// are dropped before return; callers see exactly the shards that
 /// will produce a non-empty superfile.
-fn split_buffer_into_row_shards(
+pub(super) fn split_buffer_into_row_shards(
     buffer: Vec<BufferedBatch>,
     n_shards: usize,
     vector_dims: &[usize],
@@ -535,7 +535,11 @@ fn split_buffer_into_row_shards(
 /// writer rayon pool like the neighboring shard-split waves, never
 /// inline on tokio. Cost is one materialized copy of the commit's
 /// scalar + vector payload; the unclustered path never calls this.
-fn sort_buffer_by_cluster_key(
+///
+/// The clustered compaction merge runs its re-materialized input rows
+/// through this same function, so committed and merged superfiles
+/// share one definition of the physical key order.
+pub(super) fn sort_buffer_by_cluster_key(
     buffer: &[BufferedBatch],
     options: &SupertableOptions,
 ) -> Result<Vec<BufferedBatch>, BuildError> {
@@ -1927,7 +1931,7 @@ fn reserve_build_scratch(
 /// vector layout override. Runs on a rayon worker thread inside the writer
 /// pool's `install`. The commit path always passes an explicit layout +
 /// optional global centroids.
-fn build_one_shard_with_layout(
+pub(super) fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
