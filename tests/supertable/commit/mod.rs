@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
+pub mod clustering;
 pub mod concurrent_threads;
 pub mod id_uniqueness;
 pub mod open_refresh;
