@@ -82,6 +82,11 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # `test-helpers` across the whole dev-target graph (tests, benches,
 # AND examples), so no in-package example can build with it off.
 test-helpers = []
+# Exposes `infino::runtime_metrics` (`io` / `cpu` / `rss`) plus
+# `Connection::usage_snapshot` / `usage_meter` for dependents
+# (e.g. infino-platform Prometheus) without `test-helpers`.
+# Off the curated `public-api.txt` snapshot (default features only).
+metering = []
 # Opt-in diagnostic benches that are useful for storage/request-shape
 # work or release-profile recall gates, but should not run as part of a
 # plain `cargo bench`.

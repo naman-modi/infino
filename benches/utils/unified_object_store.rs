@@ -100,6 +100,7 @@ use infino::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
         SupertableSettings,
     },
+    runtime_metrics::UsageMeter,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
         fts::reader::BoolMode,
@@ -906,7 +907,7 @@ pub(crate) mod diag {
             self.inner.object_store_handle(uri)
         }
 
-        fn usage_meter(&self) -> Arc<infino::storage::UsageMeter> {
+        fn usage_meter(&self) -> Arc<UsageMeter> {
             self.inner.usage_meter()
         }
     }

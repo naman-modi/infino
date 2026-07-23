@@ -566,6 +566,24 @@ fn score_fine_candidates(
     Ok((candidates, deferred))
 }
 
+/// Union of the grid-ranked and fine-ranked cell selections, in probe
+/// priority order: grid picks first, then fine picks not already selected.
+///
+/// The two rankings fail in opposite regimes, so probing their union holds
+/// the coverage floor at every measured scale. Small cells make fine
+/// centroids noisy — grid ranking wins. Large cells make the single grid
+/// centroid a poor proxy — fine ranking wins. Used for filtered search and
+/// explicit caller `nprobe`; default unfiltered stays fine-first.
+fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
+    let mut selected: Vec<u32> = Vec::with_capacity(grid.len() + fine.len());
+    for &cell in grid.iter().chain(fine) {
+        if !selected.contains(&cell) {
+            selected.push(cell);
+        }
+    }
+    selected
+}
+
 /// Default-path cell selection, shared by the hidden (post-drain) and user
 /// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
 /// top cell only when its own fine score is a genuine near-tie of the fine
@@ -593,28 +611,6 @@ fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) 
         }
     }
     cells
-}
-
-/// Union of the grid-ranked and fine-ranked cell selections, in probe
-/// priority order: grid picks first, then fine picks not already selected.
-///
-/// The two rankings fail in opposite regimes, so probing their union holds
-/// the coverage floor at every measured scale. Small cells (100K/64c: ~1.5K
-/// rows, ~3 fine runs each) make fine centroids noisy — grid ranking wins
-/// (measured neighbor coverage 0.950 grid vs 0.700 fine). Large cells
-/// (10M/64c: ~230K rows, ~250 fine runs each) make the single grid centroid
-/// a poor proxy for the cell's extent — fine ranking wins (0.919 fine vs
-/// 0.629 grid; fine p2 = 0.997). Grid-only p=1 routing pinned 10M recall to
-/// the 0.63 ceiling; the union restores the better ranking at each scale for
-/// at most one extra probed cell per pick.
-fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
-    let mut selected: Vec<u32> = Vec::with_capacity(grid.len() + fine.len());
-    for &cell in grid.iter().chain(fine) {
-        if !selected.contains(&cell) {
-            selected.push(cell);
-        }
-    }
-    selected
 }
 
 /// Map a per-superfile vector-search error to a query error. A budget refusal
@@ -1261,10 +1257,6 @@ impl SupertableReader {
             .map(|vc| (vc.metric, vc.rot_seed))
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
-        // Borrow grids only. Cloning `GlobalVectorIndex` / `ClusterCentroids`
-        // on this path cleared the lazily-built transposed cache every query
-        // and rebuilt it with the scalar `transpose_centroids_cluster_major`
-        // loop (~ms at dim=1024) before any SIMD scoring ran.
         let grid = manifest
             .global_vector_index()
             .filter(|g| g.column == column)
@@ -2893,6 +2885,17 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
+    /// Union keeps grid picks first (probe priority), appends fine picks
+    /// not already selected, and collapses to one cell when both rankings
+    /// agree. Filtered search uses this after the exact cell scan.
+    #[test]
+    fn union_cell_selection_dedups_with_grid_priority() {
+        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
+        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
+        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
+        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
+    }
+
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
         let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![
@@ -2907,17 +2910,6 @@ mod tests {
         assert_eq!(ranked[0], (7, 0.2));
         assert_eq!(ranked[1].0, 2, "score tie broken by lower cell id");
         assert_eq!(ranked[2].0, 3);
-    }
-
-    /// Union keeps grid picks first (probe priority), appends fine picks
-    /// not already selected, and collapses to one cell when both rankings
-    /// agree.
-    #[test]
-    fn union_cell_selection_dedups_with_grid_priority() {
-        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
-        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
-        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
-        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
     }
 
     /// The inline stable-id fast path: hits carrying `stable_id` are resolved
