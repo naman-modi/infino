@@ -75,9 +75,12 @@ const MIB: u64 = 1024 * 1024;
 /// and the builder holds roughly another copy until `finish`.
 const MERGE_MEMORY_RESERVE_FACTOR: u64 = 2;
 
-/// A clustered merge concatenates the materialized inputs and gathers a
-/// sorted copy while the originals are still alive, so its transient peak
-/// holds one more copy of the payload than the unordered merge.
+/// A clustered merge row-encodes the key columns and gathers a sorted copy
+/// of the payload in bounded chunks while the materialized inputs are still
+/// alive, so its transient peak is roughly the unordered merge plus that
+/// sorted copy and the encoded keys. One factor above the unordered merge
+/// is deliberately conservative headroom: these factors meter compressed
+/// input bytes against decompressed in-memory transients.
 const CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR: u64 = 3;
 
 /// Stats for one superfile. The caller fills these in.
@@ -438,7 +441,8 @@ impl Supertable {
             .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
             .sum();
         // Multiply the input bytes to cover the merge buffer and overhead; a
-        // clustered merge holds one more transient copy for the sort gather.
+        // clustered merge additionally holds the sorted chunk copy and the
+        // row-encoded key columns while the inputs are still alive.
         let reserve_factor = if clustered {
             CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR
         } else {

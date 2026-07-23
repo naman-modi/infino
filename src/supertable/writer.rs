@@ -63,12 +63,16 @@ use std::{
 };
 
 use arrow::{
-    compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take},
+    buffer::OffsetBuffer,
+    compute::{SortOptions, concat_batches, interleave_record_batch, take},
     ipc::writer::StreamWriter,
+    row::{RowConverter, SortField},
 };
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
+    cast::AsArray,
 };
+use arrow_schema::DataType;
 use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::Utc;
@@ -314,6 +318,9 @@ fn maybe_fail_drain_for_test(
 const BUILD_SCRATCH_DENOM: usize = 2;
 
 // Scalar columns, held then serialized into the Parquet body: ~2.5x.
+// Covers the clustered path too: its chunked sort transiently holds one
+// sorted copy of the buffer plus the row-encoded key columns (see
+// `sort_buffer_by_cluster_key`), staying inside this envelope.
 const BUILD_SCALAR_NUM: usize = 5;
 
 // f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
@@ -522,19 +529,64 @@ pub(super) fn split_buffer_into_row_shards(
     shards
 }
 
+/// Ceiling on the variable-width payload any single i32-offset column
+/// (`Utf8` / `Binary` value bytes, `List` child elements) may
+/// accumulate in one sorted output chunk. Those arrays cap a column's
+/// value buffer at `i32::MAX` units per array; staying at half that
+/// leaves 2x headroom for the `interleave` gather below, so it can
+/// never hit Arrow's offset-overflow error, while a pathological
+/// multi-GiB column still splits into only a handful of chunks.
+const CLUSTER_SORT_CHUNK_MAX_COLUMN_VAR_UNITS: usize = i32::MAX as usize / 2;
+
+/// Row ceiling per sorted output chunk. Fixed-width columns have no
+/// offsets to overflow, so this cap exists only to bound per-chunk
+/// gather scratch (the interleave index list plus the widest
+/// fixed-width column: 4M rows is 64 MiB of Decimal128 `_id`), keeping
+/// chunk transients small relative to the payload itself.
+const CLUSTER_SORT_CHUNK_MAX_ROWS: usize = 4 * 1024 * 1024;
+
+/// The i32 offset buffer of `column` when its type stores
+/// variable-width data behind i32 offsets (`Utf8` / `Binary` value
+/// bytes, `List` child elements) — the arrays that overflow when too
+/// many rows gather into one output array. Fixed-width, i64-offset
+/// (`Large*`), and view types return `None`: they cannot overflow and
+/// go untracked. (Variable-width children nested inside a `List` are
+/// not tracked either; the chunk row cap is the backstop there.)
+fn i32_offset_units(column: &dyn Array) -> Option<&OffsetBuffer<i32>> {
+    match column.data_type() {
+        DataType::Utf8 => Some(column.as_string::<i32>().offsets()),
+        DataType::Binary => Some(column.as_binary::<i32>().offsets()),
+        DataType::List(_) => Some(column.as_list::<i32>().offsets()),
+        _ => None,
+    }
+}
+
 /// Sort the whole buffered commit by the table's clustering key,
-/// returning a single sorted [`BufferedBatch`]. Lexicographic on the
-/// key's column list, ascending, nulls last (Arrow's `lexsort`
-/// kernel over the concatenated key columns; the permutation is
-/// applied with `take`). Downstream, the contiguous row-shard split
-/// slices this one batch in order, so every superfile the commit
-/// produces is internally sorted AND the shards partition the key
-/// space contiguously across the commit.
+/// returning the sorted rows as a list of bounded chunks in global key
+/// order. Lexicographic on the key's column list, ascending, nulls
+/// last; equal keys keep buffer order. Downstream, the contiguous
+/// row-shard split walks the chunk list in order, so every superfile
+/// the commit produces is internally sorted AND the shards partition
+/// the key space contiguously across the commit.
 ///
-/// CPU-bound (concat + lexsort + gather) — callers run it on the
+/// The sort never concatenates the buffer into one giant batch: a
+/// large commit (or a fused clustered-compaction job) can hold more
+/// than 2 GiB of string data in a single column, which overflows the
+/// i32 value offsets of a concatenated `Utf8`/`Binary` array. Instead
+/// the KEY columns are row-encoded per batch (`arrow_row` orders
+/// byte-wise exactly like `lexsort` under the same per-field options),
+/// the (batch, row) coordinates are argsorted globally, and the output
+/// is gathered with `interleave` in chunks bounded by
+/// [`CLUSTER_SORT_CHUNK_MAX_ROWS`] and
+/// [`CLUSTER_SORT_CHUNK_MAX_COLUMN_VAR_UNITS`] so no i32-offset column
+/// can overflow.
+///
+/// CPU-bound (encode + argsort + gather) — callers run it on the
 /// writer rayon pool like the neighboring shard-split waves, never
-/// inline on tokio. Cost is one materialized copy of the commit's
-/// scalar + vector payload; the unclustered path never calls this.
+/// inline on tokio. Transient cost is the row-encoded key columns plus
+/// one sorted copy of the commit's scalar + vector payload, strictly
+/// below the old concat-then-gather peak (which held two extra scalar
+/// copies at once); the unclustered path never calls this.
 ///
 /// The clustered compaction merge runs its re-materialized input rows
 /// through this same function, so committed and merged superfiles
@@ -543,66 +595,181 @@ pub(super) fn sort_buffer_by_cluster_key(
     buffer: &[BufferedBatch],
     options: &SupertableOptions,
 ) -> Result<Vec<BufferedBatch>, BuildError> {
+    sort_buffer_by_cluster_key_chunked(
+        buffer,
+        options,
+        CLUSTER_SORT_CHUNK_MAX_ROWS,
+        CLUSTER_SORT_CHUNK_MAX_COLUMN_VAR_UNITS,
+    )
+}
+
+/// [`sort_buffer_by_cluster_key`] with explicit chunk caps so tests
+/// can force multi-chunk output on small fixtures. `chunk_max_rows`
+/// caps rows per output chunk; `chunk_max_column_var_units` caps the
+/// variable-width units any single i32-offset column accumulates in
+/// one chunk. A lone row wider than the unit cap still ships, as its
+/// own chunk — it fit in one input array, so it fits in one output
+/// array.
+fn sort_buffer_by_cluster_key_chunked(
+    buffer: &[BufferedBatch],
+    options: &SupertableOptions,
+    chunk_max_rows: usize,
+    chunk_max_column_var_units: usize,
+) -> Result<Vec<BufferedBatch>, BuildError> {
+    debug_assert!(chunk_max_rows > 0);
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
     if total_rows == 0 {
         return Ok(Vec::new());
     }
     let schema = buffer[0].scalar.schema();
-    let scalar_batches: Vec<&RecordBatch> = buffer.iter().map(|b| &b.scalar).collect();
-    let merged = concat_batches(&schema, scalar_batches)
-        .map_err(|e| BuildError::Store(format!("clustering sort: concat batches: {e}")))?;
 
-    // One SortColumn per key column, in declared order — the order IS
-    // the sort precedence. Nulls last so present values lead the file.
-    let sort_columns: Vec<SortColumn> = options
+    // Row-encode the KEY columns of every batch, in declared order —
+    // the order IS the sort precedence. Nulls last so present values
+    // lead the file; the row format compares byte-wise exactly like
+    // `lexsort` under the same per-field options.
+    let sort_fields: Vec<SortField> = options
         .cluster_by
         .iter()
         .map(|column| {
-            let values = merged
-                .column_by_name(column)
-                .ok_or_else(|| BuildError::ClusterKeyColumnMissing {
+            let field = schema.field_with_name(column).map_err(|_| {
+                BuildError::ClusterKeyColumnMissing {
                     column: column.clone(),
-                })?
-                .clone();
-            Ok(SortColumn {
-                values,
-                options: Some(SortOptions {
+                }
+            })?;
+            Ok(SortField::new_with_options(
+                field.data_type().clone(),
+                SortOptions {
                     descending: false,
                     nulls_first: false,
-                }),
-            })
+                },
+            ))
         })
         .collect::<Result<_, BuildError>>()?;
-    let indices = lexsort_to_indices(&sort_columns, None)
-        .map_err(|e| BuildError::Store(format!("clustering sort: lexsort: {e}")))?;
-
-    let sorted_columns: Vec<ArrayRef> = merged
-        .columns()
-        .iter()
-        .map(|col| {
-            take(col, &indices, None)
-                .map_err(|e| BuildError::Store(format!("clustering sort: take: {e}")))
-        })
-        .collect::<Result<_, _>>()?;
-    let sorted_scalar = RecordBatch::try_new(schema, sorted_columns)
-        .map_err(|e| BuildError::Store(format!("clustering sort: rebuild batch: {e}")))?;
-
-    // Vector payloads live outside the scalar batch as flat f32 runs;
-    // gather each row's dim-length slice through the zero-copy view.
-    let mut sorted_vectors = Vec::with_capacity(options.vector_columns.len());
-    for (col_idx, vc) in options.vector_columns.iter().enumerate() {
-        let view = VectorColumnView::over(buffer, col_idx, vc.dim);
-        let mut values = Vec::with_capacity(total_rows * vc.dim);
-        for &row in indices.values() {
-            values.extend_from_slice(view.row(row as usize)?);
-        }
-        sorted_vectors.push(Arc::new(Float32Array::from(values)));
+    let converter = RowConverter::new(sort_fields)
+        .map_err(|e| BuildError::Store(format!("clustering sort: row converter: {e}")))?;
+    let mut encoded_keys = Vec::with_capacity(buffer.len());
+    for batch in buffer {
+        let key_columns: Vec<ArrayRef> = options
+            .cluster_by
+            .iter()
+            .map(|column| {
+                batch.scalar.column_by_name(column).cloned().ok_or_else(|| {
+                    BuildError::ClusterKeyColumnMissing {
+                        column: column.clone(),
+                    }
+                })
+            })
+            .collect::<Result<_, BuildError>>()?;
+        let rows = converter
+            .convert_columns(&key_columns)
+            .map_err(|e| BuildError::Store(format!("clustering sort: encode keys: {e}")))?;
+        encoded_keys.push(rows);
     }
 
-    Ok(vec![BufferedBatch {
-        scalar: sorted_scalar,
-        vectors: sorted_vectors,
-    }])
+    // Global argsort of (batch, row) coordinates by encoded key bytes.
+    // Ties break on the coordinate itself, so equal keys keep buffer
+    // order (what a stable sort gives) and the output is deterministic.
+    let mut order: Vec<(u32, u32)> = Vec::with_capacity(total_rows);
+    for (batch_idx, keys) in encoded_keys.iter().enumerate() {
+        for row_idx in 0..keys.num_rows() {
+            order.push((batch_idx as u32, row_idx as u32));
+        }
+    }
+    order.sort_unstable_by(|a, b| {
+        encoded_keys[a.0 as usize]
+            .row(a.1 as usize)
+            .cmp(&encoded_keys[b.0 as usize].row(b.1 as usize))
+            .then_with(|| a.cmp(b))
+    });
+    drop(encoded_keys);
+
+    // Offset buffers of the overflow-prone columns, per batch, aligned
+    // with `var_column_indices`. Every batch shares the buffer schema,
+    // so the tracked set is decided once on the first batch.
+    let var_column_indices: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| i32_offset_units(buffer[0].scalar.column(i).as_ref()).is_some())
+        .collect();
+    let var_offsets: Vec<Vec<&OffsetBuffer<i32>>> = buffer
+        .iter()
+        .map(|batch| {
+            var_column_indices
+                .iter()
+                .map(|&i| {
+                    i32_offset_units(batch.scalar.column(i).as_ref()).ok_or_else(|| {
+                        BuildError::Store(
+                            "clustering sort: buffered batches disagree on column layout"
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<_, BuildError>>()
+        })
+        .collect::<Result<_, BuildError>>()?;
+    let row_var_units = |batch_idx: usize, row: usize, tracked: usize| -> usize {
+        let offsets = var_offsets[batch_idx][tracked];
+        (offsets[row + 1] - offsets[row]) as usize
+    };
+
+    // Gather the sorted output chunk by chunk. A chunk closes at the
+    // row cap, or earlier as soon as any i32-offset column would cross
+    // the per-chunk unit cap, so no gathered array can overflow.
+    let scalar_batches: Vec<&RecordBatch> = buffer.iter().map(|b| &b.scalar).collect();
+    let mut sorted = Vec::new();
+    let mut chunk_units = vec![0usize; var_column_indices.len()];
+    let mut chunk_start = 0usize;
+    while chunk_start < total_rows {
+        chunk_units.fill(0);
+        let mut end = chunk_start;
+        while end < total_rows && end - chunk_start < chunk_max_rows {
+            let (batch_idx, row_idx) = order[end];
+            let (batch_idx, row) = (batch_idx as usize, row_idx as usize);
+            let overflows = chunk_units.iter().enumerate().any(|(tracked, have)| {
+                have.checked_add(row_var_units(batch_idx, row, tracked))
+                    .is_none_or(|total| total > chunk_max_column_var_units)
+            });
+            if overflows && end > chunk_start {
+                break;
+            }
+            for (tracked, have) in chunk_units.iter_mut().enumerate() {
+                *have += row_var_units(batch_idx, row, tracked);
+            }
+            end += 1;
+            if overflows {
+                // A lone row wider than the cap ships as its own chunk.
+                break;
+            }
+        }
+
+        let chunk: Vec<(usize, usize)> = order[chunk_start..end]
+            .iter()
+            .map(|&(batch_idx, row_idx)| (batch_idx as usize, row_idx as usize))
+            .collect();
+        let sorted_scalar = interleave_record_batch(&scalar_batches, &chunk)
+            .map_err(|e| BuildError::Store(format!("clustering sort: interleave: {e}")))?;
+
+        // Vector payloads live outside the scalar batch as flat f32
+        // runs; gather each row's dim-length slice into this chunk's
+        // run, straight off the buffered batches' Arrow buffers.
+        let mut sorted_vectors = Vec::with_capacity(options.vector_columns.len());
+        for (col_idx, vc) in options.vector_columns.iter().enumerate() {
+            let mut values = Vec::with_capacity(chunk.len() * vc.dim);
+            for &(batch_idx, row_idx) in &chunk {
+                let flat: &[f32] = buffer[batch_idx].vectors[col_idx].values();
+                let start = row_idx * vc.dim;
+                let row = flat.get(start..start + vc.dim).ok_or_else(|| {
+                    BuildError::Store(format!("vector row {row_idx} out of buffered range"))
+                })?;
+                values.extend_from_slice(row);
+            }
+            sorted_vectors.push(Arc::new(Float32Array::from(values)));
+        }
+        sorted.push(BufferedBatch {
+            scalar: sorted_scalar,
+            vectors: sorted_vectors,
+        });
+        chunk_start = end;
+    }
+    Ok(sorted)
 }
 
 /// After a manifest swap that drops superfile references, schedule a deferred
