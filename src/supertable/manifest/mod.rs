@@ -423,6 +423,7 @@ impl ManifestSnapshot {
                 })
                 .collect(),
             partition_strategy: strategy,
+            cluster_by: options.cluster_by.clone(),
             vector_index_storage_prefix,
             global_vector_index: None,
             drained_ranges: Default::default(),
@@ -462,6 +463,20 @@ impl ManifestSnapshot {
         self.stamped_partition_strategy
             .as_ref()
             .or_else(|| self.list.as_ref().map(|l| &l.partition_strategy))
+    }
+
+    /// The table's clustering key: the ordered column list each
+    /// commit's superfiles are internally sorted by, or an empty
+    /// slice for an unclustered table. Reads the persisted list when
+    /// one is loaded (the durable declaration), else the creation
+    /// options (a fresh table before its first list lands). M1 only
+    /// records the declaration; the query layer starts consuming it
+    /// for range pruning in a later milestone.
+    pub fn cluster_by(&self) -> &[String] {
+        self.list
+            .as_ref()
+            .map(|l| l.cluster_by.as_slice())
+            .unwrap_or(self.superfile_list.options.cluster_by.as_slice())
     }
 
     /// [`CellRoutingParams`] from a `VectorCell` strategy, without cloning
@@ -1780,6 +1795,7 @@ impl ManifestSnapshot {
                 })
                 .collect(),
             partition_strategy: strategy,
+            cluster_by: opts.cluster_by.clone(),
             // Never stamp a sibling prefix onto a hidden VectorCell manifest:
             // the prefix is only ever resolved off the USER manifest to locate
             // the hidden index, and a hidden table claiming its own hidden
@@ -4289,6 +4305,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> Manifest {
             Manifest {
+                cluster_by: Vec::new(),
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
@@ -4593,6 +4610,7 @@ mod tests {
         use list::{Manifest, PartitionStrategy};
         let entry = part::PartId::new_v4();
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -4769,6 +4787,7 @@ mod tests {
         Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(Manifest {
+                cluster_by: Vec::new(),
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
@@ -4876,6 +4895,7 @@ mod tests {
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -5000,6 +5020,7 @@ mod tests {
             None => (None, None),
         };
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -5208,6 +5229,7 @@ mod tests {
             .await
             .expect("put routing part");
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -5466,6 +5488,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -5616,6 +5639,7 @@ mod tests {
         // (rewrite candidate under option-B); part_0 and part_1 are
         // frozen earlier parts.
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -5824,6 +5848,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -5924,6 +5949,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6051,6 +6077,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6168,6 +6195,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6301,6 +6329,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6444,6 +6473,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6601,6 +6631,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6820,6 +6851,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -6917,6 +6949,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -7030,6 +7063,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -7166,6 +7200,7 @@ mod tests {
             .expect("write part_a_latest");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -7297,6 +7332,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -7385,6 +7421,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -7491,6 +7528,7 @@ mod tests {
             .expect("write part_a_latest");
 
         let list = Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -7620,6 +7658,7 @@ mod tests {
             })
             .collect();
         Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),

@@ -292,6 +292,7 @@ mod tests {
 
     fn list_with(entries: Vec<ManifestPartEntry>) -> Manifest {
         Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),

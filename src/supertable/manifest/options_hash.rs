@@ -158,6 +158,21 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
         }
     }
 
+    // 6. cluster_by — appended as a tagged block ONLY when a key is
+    //    declared. An unclustered table's stream stays byte-identical
+    //    to hashes stamped before the clustering key existed, so
+    //    pre-clustering manifests keep verifying; a clustered table
+    //    hashes differently from its unclustered twin (the built
+    //    superfiles' row order differs, so the options identity must
+    //    too). Same shape as the fts_positions block above.
+    if !opts.cluster_by.is_empty() {
+        push_tag(&mut buf, b"cluster_by");
+        buf.extend_from_slice(&(opts.cluster_by.len() as u64).to_le_bytes());
+        for column in &opts.cluster_by {
+            push_str(&mut buf, column);
+        }
+    }
+
     let h = blake3::hash(&buf);
     ContentHash(*h.as_bytes())
 }
@@ -473,6 +488,64 @@ mod tests {
     /// identical by construction.
     const ALL_FALSE_GOLDEN_HEX: &str =
         "a89715d00cba061aed0b06910a2fde77a9b980c1f7a25c1d5eca901790c6f24a";
+
+    /// The clustering key hashes via a tagged block appended ONLY
+    /// when a key is declared — same compatibility contract as the
+    /// positions flag: unclustered tables keep their pre-clustering
+    /// hash (the golden in [`compute_options_hash_positions_flag`]
+    /// guards that), a declared key changes the hash, and the key's
+    /// column ORDER matters (it is the sort order).
+    #[test]
+    fn compute_options_hash_cluster_by() {
+        let schema_two = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("subtitle", DataType::LargeUtf8, false),
+        ]));
+        let opts = |key: Vec<String>| {
+            SupertableOptions::new(
+                schema_two.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(default_tokenizer()),
+            )
+            .expect("opts")
+            .with_cluster_by(key)
+            .expect("valid clustering key")
+        };
+        let h_none = compute_options_hash(&opts(vec![]), &time_range());
+        let h_one = compute_options_hash(&opts(vec!["title".into()]), &time_range());
+        let h_ab = compute_options_hash(
+            &opts(vec!["title".into(), "subtitle".into()]),
+            &time_range(),
+        );
+        let h_ba = compute_options_hash(
+            &opts(vec!["subtitle".into(), "title".into()]),
+            &time_range(),
+        );
+        assert_ne!(h_none.0, h_one.0, "declaring a key must change the hash");
+        assert_ne!(h_one.0, h_ab.0, "the key's column set must matter");
+        assert_ne!(h_ab.0, h_ba.0, "the key's column order must matter");
+
+        // No-key stream carries no cluster_by block, so it matches
+        // the plain fixture's hash exactly.
+        let h_plain = compute_options_hash(
+            &SupertableOptions::new(
+                schema_two.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(default_tokenizer()),
+            )
+            .expect("opts"),
+            &time_range(),
+        );
+        assert_eq!(h_none.0, h_plain.0);
+    }
 
     #[test]
     fn compute_options_hash_changes_with_vector_columns() {

@@ -256,6 +256,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                cluster_by: Vec::new(),
                 tombstone_seqs: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
@@ -325,6 +326,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                cluster_by: Vec::new(),
                 tombstone_seqs: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,

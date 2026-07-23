@@ -166,6 +166,7 @@ fn fresh_part(seed: u8) -> ManifestPart {
 
 fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
     Manifest {
+        cluster_by: Vec::new(),
         drained_ranges: Default::default(),
         global_vector_index: None,
         tombstone_seqs: Default::default(),

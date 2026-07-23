@@ -109,6 +109,13 @@ pub struct Manifest {
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
     /// for how the field is resolved.
     pub partition_strategy: PartitionStrategy,
+    /// Clustering key: ordered list of user-schema columns each
+    /// commit's superfiles are internally sorted by (lexicographic,
+    /// ascending, nulls last). Empty means the table is unclustered
+    /// and rows stay in append order. Declared at creation and
+    /// immutable; recorded here so readers and the query layer can
+    /// see the guarantee without the creation-time options.
+    pub cluster_by: Vec<String>,
     /// Object-storage prefix for the hidden vector-index sibling
     /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
     /// create when vector columns are configured; immutable.
@@ -1065,6 +1072,12 @@ struct ManifestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
+    /// Absent on manifests written before the clustering key existed
+    /// (and skipped for unclustered tables, keeping their JSON
+    /// byte-identical to pre-clustering output for content
+    /// addressing); both decode to the empty "unclustered" key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cluster_by: Vec<String>,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
     #[serde(default)]
@@ -1577,6 +1590,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             })
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
+        cluster_by: l.cluster_by.clone(),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         global_vector_index: l
             .global_vector_index
@@ -1637,6 +1651,7 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             })
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
+        cluster_by: d.cluster_by,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         global_vector_index: d
             .global_vector_index
@@ -2279,6 +2294,7 @@ mod tests {
 
     fn empty_list() -> Manifest {
         Manifest {
+            cluster_by: Vec::new(),
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -2422,6 +2438,7 @@ mod tests {
         assert_eq!(a.vector_columns, b.vector_columns);
         assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
         assert_eq!(a.partition_strategy, b.partition_strategy);
+        assert_eq!(a.cluster_by, b.cluster_by);
         assert_eq!(a.parts.len(), b.parts.len());
         for (a_e, b_e) in a.parts.iter().zip(b.parts.iter()) {
             assert_entries_equal(a_e, b_e);
@@ -2476,6 +2493,32 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
+    }
+
+    #[test]
+    fn cluster_by_roundtrip() {
+        let mut list = empty_list();
+        list.cluster_by = vec!["region".into(), "ts".into()];
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.cluster_by, list.cluster_by, "order must survive");
+    }
+
+    /// Manifests written before the clustering key existed carry no
+    /// `cluster_by` field; they must decode to the empty
+    /// (unclustered) key. And an unclustered list must not emit the
+    /// field at all, keeping its JSON byte-identical to
+    /// pre-clustering output (the content-addressing property).
+    #[test]
+    fn cluster_by_absent_decodes_as_unclustered() {
+        let bytes = encode(&empty_list()).expect("encode");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(
+            v.get("cluster_by").is_none(),
+            "unclustered list must not serialize the field"
+        );
+        let decoded = decode(&bytes).expect("decode");
+        assert!(decoded.cluster_by.is_empty());
     }
 
     /// An explicitly-persisted `slack = 0.0` must survive the round-trip:
