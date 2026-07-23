@@ -1050,63 +1050,10 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<SuperfileStats, BuildError> {
-        self.opts.check_mergeability(
-            reader.id_column(),
-            reader.schema(),
-            reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
-            reader
-                .vec()
-                .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
-        )?;
-        let record_batch = reader
-            .get_record_batch(deleted_docs_bitmap.clone())
-            .map_err(|_| BuildError::BatchReadError)?;
+        let (record_batch, vectors) =
+            merge_rows_from_reader(&self.opts, reader, deleted_docs_bitmap)?;
 
         let superfile_stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
-
-        let num_rows = record_batch.num_rows();
-        let mut vectors: Vec<Vec<f32>> = Vec::new();
-        if let Some(v) = reader.vec() {
-            let reader_columns: Vec<_> = v.vector_columns_config().collect();
-
-            // Validate that reader's vector indexes match builder's configuration
-            if reader_columns.len() != self.opts.vector_columns.len() {
-                return Err(BuildError::VectorDimMismatch {
-                    column: format!(
-                        "vector index count mismatch: expected {}, got {}",
-                        self.opts.vector_columns.len(),
-                        reader_columns.len()
-                    ),
-                    expected: self.opts.vector_columns.len(),
-                    actual: reader_columns.len(),
-                });
-            }
-
-            for (reader_col, builder_col) in reader_columns.iter().zip(&self.opts.vector_columns) {
-                if reader_col.name != builder_col.column || reader_col.dim != builder_col.dim {
-                    return Err(BuildError::VectorDimMismatch {
-                        column: reader_col.name.clone(),
-                        expected: builder_col.dim,
-                        actual: reader_col.dim,
-                    });
-                }
-
-                let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
-                let result = v
-                    .get_vectors_for_merge(&reader_col.name)
-                    .map_err(|_| BuildError::VectorReadError)?;
-                for (row_idx, single_row) in result.iter().enumerate() {
-                    // Skip deleted documents: only include rows not in the deleted_docs_bitmap
-                    if let Some(ref bitmap) = deleted_docs_bitmap
-                        && bitmap.contains(row_idx as u32)
-                    {
-                        continue;
-                    }
-                    this_col_vectors.extend_from_slice(single_row.as_slice());
-                }
-                vectors.push(this_col_vectors);
-            }
-        }
 
         let slices: Vec<&[f32]> = vectors.iter().map(|row| row.as_slice()).collect();
         self.add_batch(&record_batch, &slices)?;
@@ -1286,6 +1233,76 @@ impl SuperfileBuilder {
         output.flush().map_err(BuildError::Io)?;
         Ok(())
     }
+}
+
+/// Materialize one merge input: the reader's record batch with tombstoned
+/// rows dropped, plus each configured vector column's surviving rows as one
+/// flat f32 run (row-aligned with the batch). Validates the reader against
+/// `opts` exactly like [`SuperfileBuilder::add_batch_from_reader`], which is
+/// built on this — callers that must reorder rows across inputs before
+/// adding them (the clustered compaction merge) share the same
+/// materialization and validation.
+pub(crate) fn merge_rows_from_reader(
+    opts: &BuilderOptions,
+    reader: &SuperfileReader,
+    deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+) -> Result<(RecordBatch, Vec<Vec<f32>>), BuildError> {
+    opts.check_mergeability(
+        reader.id_column(),
+        reader.schema(),
+        reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+        reader
+            .vec()
+            .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+    )?;
+    let record_batch = reader
+        .get_record_batch(deleted_docs_bitmap.clone())
+        .map_err(|_| BuildError::BatchReadError)?;
+
+    let num_rows = record_batch.num_rows();
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    if let Some(v) = reader.vec() {
+        let reader_columns: Vec<_> = v.vector_columns_config().collect();
+
+        // Validate that reader's vector indexes match builder's configuration
+        if reader_columns.len() != opts.vector_columns.len() {
+            return Err(BuildError::VectorDimMismatch {
+                column: format!(
+                    "vector index count mismatch: expected {}, got {}",
+                    opts.vector_columns.len(),
+                    reader_columns.len()
+                ),
+                expected: opts.vector_columns.len(),
+                actual: reader_columns.len(),
+            });
+        }
+
+        for (reader_col, builder_col) in reader_columns.iter().zip(&opts.vector_columns) {
+            if reader_col.name != builder_col.column || reader_col.dim != builder_col.dim {
+                return Err(BuildError::VectorDimMismatch {
+                    column: reader_col.name.clone(),
+                    expected: builder_col.dim,
+                    actual: reader_col.dim,
+                });
+            }
+
+            let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
+            let result = v
+                .get_vectors_for_merge(&reader_col.name)
+                .map_err(|_| BuildError::VectorReadError)?;
+            for (row_idx, single_row) in result.iter().enumerate() {
+                // Skip deleted documents: only include rows not in the deleted_docs_bitmap
+                if let Some(ref bitmap) = deleted_docs_bitmap
+                    && bitmap.contains(row_idx as u32)
+                {
+                    continue;
+                }
+                this_col_vectors.extend_from_slice(single_row.as_slice());
+            }
+            vectors.push(this_col_vectors);
+        }
+    }
+    Ok((record_batch, vectors))
 }
 
 fn superfile_kvs(
