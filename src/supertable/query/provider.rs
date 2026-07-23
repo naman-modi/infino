@@ -34,6 +34,19 @@
 //! *conservative* optimizations — they may keep a non-matching
 //! superfile/row group, never drop a matching one.
 //!
+//! ## Clustered-scan ordering
+//!
+//! When the table declares a clustering key, [`scan`] additionally
+//! attaches each superfile's manifest statistics to its scan file and
+//! — only when the survivors' key ranges are provably disjoint —
+//! declares the writer's sort order (ascending, nulls last) on the
+//! scan, grouping files so every scan partition reads non-overlapping
+//! ranges in key order. DataFusion then runs a matching `GROUP BY` in
+//! sorted / partially-sorted input mode instead of hashing. The same
+//! conservatism applies: when order can't be proven (overlapping
+//! multi-commit ranges, missing key stats), the scan stays unordered —
+//! see `clustered_scan_ordering`.
+//!
 //! ## Why an in-memory object store
 //!
 //! The reader cache already holds warm superfiles as resident Parquet bytes
@@ -46,14 +59,15 @@
 use std::{
     cmp,
     collections::HashSet,
-    fmt,
+    fmt, mem,
     ops::Range,
+    slice,
     sync::{Arc, atomic},
     time::Instant,
 };
 
 use arrow_array::ArrayRef;
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -63,7 +77,7 @@ use datafusion::{
     datasource::{
         listing::PartitionedFile,
         physical_plan::{
-            FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
+            FileGroup, FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
             parquet::ParquetAccessPlan,
         },
         source::DataSourceExec,
@@ -72,7 +86,7 @@ use datafusion::{
     execution::object_store::ObjectStoreUrl,
     logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
     object_store::path::Path as ObjPath,
-    physical_expr::PhysicalExpr,
+    physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr, expressions::Column},
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
@@ -175,6 +189,17 @@ const PUSHDOWN_MIN_ROWS: u64 = 4096;
 /// `IN` aggregate ran 2.5× slower through the index path than the
 /// plain scan.
 const PUSHDOWN_MAX_DENSITY: f64 = 0.5;
+
+/// Sort options every clustering-key column is written with: the commit
+/// sort in the supertable writer is ascending with nulls last, and the
+/// scan-side ordering declaration must match that physical order
+/// exactly. Declaring an order the bytes don't have makes
+/// order-dependent operators (sorted aggregation, merges) silently
+/// wrong — a correctness bug, not a slowdown.
+const CLUSTER_KEY_SORT: SortOptions = SortOptions {
+    descending: false,
+    nulls_first: false,
+};
 
 /// A [`TableProvider`] over a pinned supertable snapshot.
 ///
@@ -607,6 +632,78 @@ impl SupertableProvider {
             column_statistics,
         }
     }
+
+    /// Clustered-scan ordering: per-file statistics plus, when provable
+    /// from the manifest, the scan's sort-order declaration.
+    ///
+    /// On a table with a clustering key this attaches each surviving
+    /// superfile's manifest statistics (row count, per-column min/max —
+    /// the same channel [`statistics_for`](Self::statistics_for) feeds
+    /// the table-level fold from) to its [`PartitionedFile`], then
+    /// decides whether the scan may declare the writer's sort order:
+    ///
+    ///   * **Declare** (`Some`): every survivor has a usable key range
+    ///     and the ranges chain without overlap — the files are
+    ///     regrouped into range-disjoint partitions read in key order
+    ///     (see [`ordered_scan_groups`]), and DataFusion can run a
+    ///     matching `GROUP BY` in sorted / partially-sorted input mode
+    ///     instead of hashing.
+    ///   * **Fall back** (`None`): key ranges overlap across files
+    ///     (multi-commit tables before an optimize), a file lacks key
+    ///     stats, or bounds aren't comparable. The scan stays exactly
+    ///     as unordered as today — a false ordering declaration would
+    ///     be a wrong-results bug, so the conditionality is the core
+    ///     correctness requirement, not an optimization detail.
+    ///
+    /// Unclustered tables return `None` before touching `files`, so the
+    /// default path emits byte-identical plans.
+    fn clustered_scan_ordering(
+        &self,
+        entries: &[Arc<SuperfileEntry>],
+        files: &mut [PartitionedFile],
+        target_partitions: usize,
+    ) -> Option<(Vec<FileGroup>, LexOrdering)> {
+        let key = self.manifest.cluster_by();
+        if key.is_empty() {
+            return None;
+        }
+
+        // Per-file statistics, attached regardless of whether the
+        // ordering below is declared: they are true single-superfile
+        // facts and DataFusion's own ordering validation re-checks the
+        // declaration against them per file group.
+        for (file, entry) in files.iter_mut().zip(entries) {
+            let mut stats = self.statistics_for(slice::from_ref(entry));
+            align_stats_to_schema(&mut stats, &self.schema);
+            file.statistics = Some(Arc::new(stats));
+        }
+
+        let ordering = self.cluster_key_ordering(key)?;
+        let ranges: Vec<ClusterKeyRange> = entries
+            .iter()
+            .map(|entry| cluster_key_range(entry, key))
+            .collect::<Option<_>>()?;
+        let groups = ordered_scan_groups(files, &ranges, target_partitions)?;
+        Some((groups, ordering))
+    }
+
+    /// The clustering key as a physical sort declaration over the scan
+    /// schema — one `ASC NULLS LAST` expression per key column, in key
+    /// order, matching the writer's commit sort exactly
+    /// ([`CLUSTER_KEY_SORT`]). `None` if a key column is missing from
+    /// the scan schema (defensive; creation-time validation pins the
+    /// key to schema columns).
+    fn cluster_key_ordering(&self, key: &[String]) -> Option<LexOrdering> {
+        let exprs = key
+            .iter()
+            .map(|name| {
+                let idx = self.schema.index_of(name).ok()?;
+                let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(name, idx));
+                Some(PhysicalSortExpr::new(expr, CLUSTER_KEY_SORT))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        LexOrdering::new(exprs)
+    }
 }
 
 /// Min/max of the supertable-injected `_id` column across `entries`,
@@ -689,6 +786,176 @@ fn scalar_min_max(
         };
     }
     acc
+}
+
+/// One superfile's clustering-key range, lifted from the manifest's
+/// per-column skip stats for the ordered-scan grouping decision.
+///
+/// Column-wise bounds are valid lexicographic row bounds: every row has
+/// each column inside its per-column `[min, max]`, so the tuple of
+/// minima compares `<=` every row and the tuple of maxima `>=` every
+/// non-null row. The bounds may be loose (not attained by any row),
+/// which only makes the disjointness test more conservative — a safe
+/// direction, since looseness can at worst force the unordered
+/// fallback, never a false ordering.
+struct ClusterKeyRange {
+    /// Column-wise minima, in key order. Valid even for files with
+    /// nulls in the key: nulls sort last, so the min over non-null
+    /// values still lower-bounds every row.
+    min: Vec<ScalarValue>,
+    /// Column-wise maxima, in key order. An upper bound on the
+    /// *non-null* rows only — see `may_have_nulls`.
+    max: Vec<ScalarValue>,
+    /// Whether any key column holds nulls (or its null count is
+    /// unknown). Under the writer's nulls-last order a null key sorts
+    /// after every value, i.e. beyond `max` — so a null-bearing file
+    /// is ordered only as the *last* file of its scan partition, and
+    /// [`ordered_scan_groups`] forces a partition break after it.
+    may_have_nulls: bool,
+}
+
+/// Extract `entry`'s clustering-key range from its manifest stats.
+/// `None` when any key column lacks min/max (no stat recorded, or an
+/// all-null column) — the caller then falls back to the unordered scan.
+fn cluster_key_range(entry: &SuperfileEntry, key: &[String]) -> Option<ClusterKeyRange> {
+    let mut min = Vec::with_capacity(key.len());
+    let mut max = Vec::with_capacity(key.len());
+    let mut may_have_nulls = false;
+    for column in key {
+        let agg = entry.scalar_stats.get(column)?;
+        let lo = ScalarValue::try_from_array(&agg.min, 0).ok()?;
+        let hi = ScalarValue::try_from_array(&agg.max, 0).ok()?;
+        if lo.is_null() || hi.is_null() {
+            return None;
+        }
+        may_have_nulls |= agg.null_count.is_none_or(|n| n > 0);
+        min.push(lo);
+        max.push(hi);
+    }
+    Some(ClusterKeyRange {
+        min,
+        max,
+        may_have_nulls,
+    })
+}
+
+/// Lexicographic comparison of two key-bound tuples, column by column
+/// in key order. `None` when a pair of scalars isn't comparable (e.g.
+/// mismatched stat types across superfiles) — callers treat that as
+/// "cannot prove ordered" and fall back.
+fn cmp_key_bounds(a: &[ScalarValue], b: &[ScalarValue]) -> Option<cmp::Ordering> {
+    for (x, y) in a.iter().zip(b) {
+        match x.partial_cmp(y)? {
+            cmp::Ordering::Equal => {}
+            decided => return Some(decided),
+        }
+    }
+    Some(cmp::Ordering::Equal)
+}
+
+/// Group `files` into scan partitions whose key ranges are disjoint and
+/// whose files are appended in key order, or `None` when that cannot be
+/// proven from the manifest ranges (the unordered fallback).
+///
+/// ```text
+///  files (any manifest order)          sorted by min, chained
+///  ┌──────┐┌──────┐┌──────┐┌──────┐    max ≤ next min at every seam
+///  │ 30-49││ 0-9  ││ 50-69││ 10-29│ →  [0-9][10-29][30-49][50-69]
+///  └──────┘└──────┘└──────┘└──────┘         │            │
+///                                     ┌─────┴────┐ ┌─────┴────┐
+///  target_partitions = 2         →    │ group 0  │ │ group 1  │
+///                                     │ 0-9,10-29│ │30-49,50-69│
+///                                     └──────────┘ └──────────┘
+/// ```
+///
+/// # How
+/// 1. Sort files by `(min, max)` bound. Any incomparable pair → `None`.
+/// 2. Verify the chain: each file's max must compare `<=` the next
+///    file's min (touching bounds are fine — a duplicate key value may
+///    legitimately span a shard boundary and the concatenation is still
+///    non-decreasing). Any overlap → `None`.
+/// 3. Slice the chain into up to `target_partitions` contiguous groups.
+///    A group break is forced *after* any file that may hold nulls in
+///    the key: its null rows sort past its recorded max, so no file may
+///    follow it within the same partition.
+///
+/// Each returned group is therefore a run of internally-sorted files
+/// whose ranges don't overlap, read in key order — exactly the shape
+/// under which a per-partition ordering declaration is truthful.
+fn ordered_scan_groups(
+    files: &[PartitionedFile],
+    ranges: &[ClusterKeyRange],
+    target_partitions: usize,
+) -> Option<Vec<FileGroup>> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    let mut comparable = true;
+    order.sort_by(|&a, &b| {
+        let decided = match cmp_key_bounds(&ranges[a].min, &ranges[b].min) {
+            Some(cmp::Ordering::Equal) => cmp_key_bounds(&ranges[a].max, &ranges[b].max),
+            decided => decided,
+        };
+        decided.unwrap_or_else(|| {
+            comparable = false;
+            cmp::Ordering::Equal
+        })
+    });
+    if !comparable {
+        return None;
+    }
+
+    // Chain check over the min-sorted order: any overlap disproves a
+    // global key order across files, so no partitioning of these files
+    // (other than trivial reshuffles) is declared ordered — fall back.
+    for pair in order.windows(2) {
+        if cmp_key_bounds(&ranges[pair[0]].max, &ranges[pair[1]].min)? == cmp::Ordering::Greater {
+            return None;
+        }
+    }
+
+    let n_groups = cmp::max(1, cmp::min(target_partitions, files.len()));
+    let per_group = files.len().div_ceil(n_groups);
+    let mut groups: Vec<FileGroup> = Vec::with_capacity(n_groups);
+    let mut current: Vec<PartitionedFile> = Vec::with_capacity(per_group);
+    for idx in order {
+        current.push(files[idx].clone());
+        if current.len() >= per_group || ranges[idx].may_have_nulls {
+            groups.push(FileGroup::new(mem::take(&mut current)));
+        }
+    }
+    if !current.is_empty() {
+        groups.push(FileGroup::new(current));
+    }
+    Some(groups)
+}
+
+/// Cast per-file min/max scalars to the scan schema's field types.
+///
+/// The manifest stores column stats in the column's stored Parquet type
+/// (e.g. `LargeUtf8`), but the scan schema views strings as `Utf8View`
+/// ([`view_string_schema`]). DataFusion's ordering validation rebuilds
+/// arrays from these scalars against the scan schema, so a mismatched
+/// type would reject — and silently strip — the ordering declaration.
+/// A scalar whose cast fails is left in place: DataFusion then
+/// conservatively drops the ordering rather than mis-declaring it.
+fn align_stats_to_schema(stats: &mut Statistics, schema: &Schema) {
+    for (column, field) in stats.column_statistics.iter_mut().zip(schema.fields()) {
+        align_scalar_to_type(&mut column.min_value, field.data_type());
+        align_scalar_to_type(&mut column.max_value, field.data_type());
+    }
+}
+
+/// Cast one min/max stat to `data_type`, preserving its precision tag.
+fn align_scalar_to_type(value: &mut Precision<ScalarValue>, data_type: &DataType) {
+    let cast =
+        |v: &ScalarValue| (v.data_type() != *data_type).then(|| v.cast_to(data_type).ok())?;
+    let aligned = match &*value {
+        Precision::Exact(v) => cast(v).map(Precision::Exact),
+        Precision::Inexact(v) => cast(v).map(Precision::Inexact),
+        Precision::Absent => None,
+    };
+    if let Some(aligned) = aligned {
+        *value = aligned;
+    }
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -935,14 +1202,37 @@ impl TableProvider for SupertableProvider {
             }
         };
 
+        // Clustered tables additionally get per-file statistics and,
+        // when the manifest proves the survivors' key ranges disjoint,
+        // an ordering declaration + range-disjoint file groups (see
+        // `clustered_scan_ordering`). Inert (`None`) on unclustered
+        // tables, so the default path below plans byte-identically.
+        let ordered_scan = self.clustered_scan_ordering(
+            &survivor_entries,
+            &mut files,
+            state.config().target_partitions(),
+        );
+
         let url = self.store_url.clone();
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
         let mut builder = FileScanConfigBuilder::new(url, Arc::new(source));
-        for file in files {
-            builder = builder.with_file(file);
-        }
+        builder = match ordered_scan {
+            // Ordered path: partitions hold range-disjoint files in key
+            // order, and the scan declares the writer's sort order.
+            Some((groups, ordering)) => builder
+                .with_file_groups(groups)
+                .with_output_ordering(vec![ordering]),
+            // Default path: one group per file, no ordering claim;
+            // DataFusion regroups to its target partitioning freely.
+            None => {
+                for file in files {
+                    builder = builder.with_file(file);
+                }
+                builder
+            }
+        };
         let config = builder
             .with_statistics(scan_stats)
             .with_projection_indices(projection.cloned())?
@@ -2451,5 +2741,185 @@ mod tests {
             dbg.contains("CachedMetadataReaderFactory") && dbg.contains("superfiles: 0"),
             "Debug missing fields: {dbg}"
         );
+    }
+
+    // ---- Clustered-scan ordered grouping ----------------------------
+
+    /// A single-column Int64 key range `[lo, hi]`.
+    fn range_i64(lo: i64, hi: i64, may_have_nulls: bool) -> ClusterKeyRange {
+        ClusterKeyRange {
+            min: vec![ScalarValue::Int64(Some(lo))],
+            max: vec![ScalarValue::Int64(Some(hi))],
+            may_have_nulls,
+        }
+    }
+
+    /// One placeholder `PartitionedFile` per range; the path encodes the
+    /// index so group membership is observable after the reshuffle.
+    fn files_for(ranges: &[ClusterKeyRange]) -> Vec<PartitionedFile> {
+        (0..ranges.len())
+            .map(|i| PartitionedFile::new(format!("f{i}"), 1))
+            .collect()
+    }
+
+    /// Group contents as file-path lists, for order assertions.
+    fn group_paths(groups: &[FileGroup]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|f| f.path().to_string()).collect())
+            .collect()
+    }
+
+    /// Disjoint ranges submitted out of key order come back sorted by
+    /// min and sliced into `target_partitions` contiguous groups, each
+    /// a chain of non-overlapping files in key order.
+    #[test]
+    fn ordered_groups_sort_and_slice_disjoint_chain() {
+        let ranges = vec![
+            range_i64(30, 49, false),
+            range_i64(0, 9, false),
+            range_i64(50, 69, false),
+            range_i64(10, 29, false),
+        ];
+        let groups =
+            ordered_scan_groups(&files_for(&ranges), &ranges, 2).expect("disjoint chain groups");
+        assert_eq!(
+            group_paths(&groups),
+            vec![vec!["f1", "f3"], vec!["f0", "f2"]],
+            "min-sorted chain sliced into contiguous halves"
+        );
+    }
+
+    /// Touching bounds (one file's max equals the next file's min) stay
+    /// groupable: a duplicate key value may span a shard boundary and
+    /// the concatenation is still non-decreasing.
+    #[test]
+    fn ordered_groups_allow_touching_bounds() {
+        let ranges = vec![range_i64(0, 10, false), range_i64(10, 20, false)];
+        let groups =
+            ordered_scan_groups(&files_for(&ranges), &ranges, 1).expect("touching bounds chain");
+        assert_eq!(group_paths(&groups), vec![vec!["f0", "f1"]]);
+    }
+
+    /// Overlapping ranges (interleaved multi-commit shape) disprove a
+    /// global key order — the ordered grouping must refuse, forcing the
+    /// unordered fallback. A false declaration here would be a
+    /// wrong-results bug.
+    #[test]
+    fn ordered_groups_refuse_overlapping_ranges() {
+        let ranges = vec![range_i64(0, 15, false), range_i64(10, 20, false)];
+        assert!(ordered_scan_groups(&files_for(&ranges), &ranges, 2).is_none());
+    }
+
+    /// A file that may hold nulls in the key sorts its null rows past
+    /// its recorded max, so nothing may follow it inside a partition:
+    /// the group breaks right after it even when the slice had room.
+    #[test]
+    fn ordered_groups_break_after_null_bearing_file() {
+        let ranges = vec![
+            range_i64(0, 9, true), // nulls → must terminate its group
+            range_i64(10, 19, false),
+            range_i64(20, 29, false),
+        ];
+        let groups =
+            ordered_scan_groups(&files_for(&ranges), &ranges, 1).expect("null break groups");
+        assert_eq!(
+            group_paths(&groups),
+            vec![vec!["f0"], vec!["f1", "f2"]],
+            "null-bearing file ends its group; the chain continues in a new one"
+        );
+    }
+
+    /// Incomparable bounds (mismatched stat types across superfiles)
+    /// cannot prove a chain — refuse rather than guess.
+    #[test]
+    fn ordered_groups_refuse_incomparable_bounds() {
+        let ranges = vec![
+            range_i64(0, 9, false),
+            ClusterKeyRange {
+                min: vec![ScalarValue::Utf8(Some("a".into()))],
+                max: vec![ScalarValue::Utf8(Some("z".into()))],
+                may_have_nulls: false,
+            },
+        ];
+        assert!(ordered_scan_groups(&files_for(&ranges), &ranges, 2).is_none());
+    }
+
+    /// Multi-column bounds compare lexicographically in key order; the
+    /// second column only decides ties on the first.
+    #[test]
+    fn key_bounds_compare_lexicographically() {
+        let a = vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(999))];
+        let b = vec![ScalarValue::Int64(Some(2)), ScalarValue::Int64(Some(0))];
+        assert_eq!(cmp_key_bounds(&a, &b), Some(cmp::Ordering::Less));
+        let c = vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(5))];
+        assert_eq!(cmp_key_bounds(&a, &c), Some(cmp::Ordering::Greater));
+        assert_eq!(cmp_key_bounds(&a, &a), Some(cmp::Ordering::Equal));
+    }
+
+    /// Key-range extraction: a missing per-column stat or an all-null
+    /// (null-bound) column yields `None` (fallback); an unknown null
+    /// count flags `may_have_nulls` conservatively.
+    #[test]
+    fn cluster_key_range_extraction_guards() {
+        let key = vec!["s".to_string()];
+        // `entry_minmax_only` records min/max but no null count.
+        let entry = entry_minmax_only("s", "alpha", "omega");
+        let range = cluster_key_range(&entry, &key).expect("min/max present");
+        assert!(
+            range.may_have_nulls,
+            "unknown null count must be treated as maybe-nulls"
+        );
+        assert!(
+            cluster_key_range(&entry, &["missing".to_string()]).is_none(),
+            "absent column stat → no usable range"
+        );
+        // An all-null column stores null min/max — unusable as a bound.
+        let null_arr: ArrayRef = Arc::new(LargeStringArray::from(vec![None::<&str>]));
+        let mut scalar_stats = HashMap::new();
+        scalar_stats.insert(
+            "s".to_string(),
+            ScalarStatsAgg::from_min_max(Arc::clone(&null_arr), null_arr),
+        );
+        let mut all_null = entry_minmax_only("s", "x", "x").as_ref().clone();
+        all_null.scalar_stats = scalar_stats;
+        assert!(cluster_key_range(&all_null, &key).is_none());
+    }
+
+    /// Min/max scalars are cast to the scan schema's (string-viewed)
+    /// field types so DataFusion's ordering validation can rebuild
+    /// arrays from them; precision tags survive the cast and absent
+    /// stats stay absent.
+    #[test]
+    fn align_stats_casts_minmax_to_scan_schema_types() {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("n", DataType::Int64, true),
+        ]);
+        let utf8 = |v: &str| ScalarValue::LargeUtf8(Some(v.to_string()));
+        let mut stats = Statistics {
+            num_rows: Precision::Exact(1),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    min_value: Precision::Exact(utf8("a")),
+                    max_value: Precision::Inexact(utf8("z")),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        align_stats_to_schema(&mut stats, &schema);
+        let s = &stats.column_statistics[0];
+        assert_eq!(
+            s.min_value,
+            Precision::Exact(ScalarValue::Utf8View(Some("a".into())))
+        );
+        assert_eq!(
+            s.max_value,
+            Precision::Inexact(ScalarValue::Utf8View(Some("z".into())))
+        );
+        let n = &stats.column_statistics[1];
+        assert_eq!(n.min_value, Precision::Absent, "absent stats stay absent");
     }
 }
