@@ -33,6 +33,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use infino::{
+    CompactionSettings, OptimizeOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
     supertable::{
         Supertable, SupertableOptions,
@@ -410,4 +411,203 @@ fn filters_and_limit_unchanged_under_ordered_path() {
         5,
         "LIMIT must admit exactly its bound"
     );
+}
+
+// ---- optimize: global clustering across commits ---------------------
+
+/// Commits per table in the optimize fixtures.
+const OPTIMIZE_COMMITS: usize = 3;
+/// Single-file commits in the multi-output optimize fixture.
+const MULTI_OUTPUT_COMMITS: usize = 12;
+/// Rows per commit in the multi-output fixture.
+const MULTI_OUTPUT_ROWS_PER_COMMIT: usize = 3200;
+/// Length of the incompressible key strings in the multi-output fixture.
+const MULTI_OUTPUT_KEY_LEN: usize = 128;
+
+/// Compaction sized for test superfiles: 1 MiB target, ~10 KiB fill floor.
+fn small_optimize_opts() -> OptimizeOptions {
+    OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        ..CompactionSettings::default()
+    })
+}
+
+fn local_storage(dir: &TempDir) -> Arc<dyn StorageProvider> {
+    Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"))
+}
+
+/// Optimize upgrades the fallback table to the ordered path: overlapping
+/// commits plan unordered; the compaction merge re-sorts ALL live rows by
+/// the key, so the surviving superfiles' ranges chain and the same query
+/// now scans with a declared ordering and aggregates in sorted input mode.
+#[test]
+fn optimize_upgrades_overlapping_commits_to_the_ordered_path() {
+    let dir = TempDir::new().expect("tempdir");
+    // Same key universe in every commit → ranges interleave pre-optimize.
+    let commits: Vec<Vec<Row>> = (0..OPTIMIZE_COMMITS).map(|_| explain_rows(0)).collect();
+    let clustered = table_with_commits(
+        options_with_key(&["category"], SHARD_THREADS).with_storage(local_storage(&dir)),
+        &commits,
+    );
+    let unclustered = table_with_commits(options_with_key(&[], SHARD_THREADS), &commits);
+
+    let sql = "SELECT category, SUM(val) FROM supertable GROUP BY category";
+    let plan = explain(&clustered, sql);
+    assert!(
+        !plan.contains("ordering_mode") && !plan.contains("output_ordering"),
+        "overlapping commits must plan unordered before optimize; plan was:\n{plan}"
+    );
+
+    clustered
+        .optimize(&small_optimize_opts())
+        .expect("optimize");
+
+    let plan = explain(&clustered, sql);
+    assert!(
+        plan.contains("output_ordering"),
+        "post-optimize scan must declare its sort order; plan was:\n{plan}"
+    );
+    assert!(
+        plan.contains("ordering_mode=Sorted"),
+        "post-optimize exact-key GROUP BY must aggregate sorted; plan was:\n{plan}"
+    );
+    let plan = explain(
+        &clustered,
+        "SELECT category, rank, SUM(val) FROM supertable GROUP BY category, rank",
+    );
+    assert!(
+        plan.contains("ordering_mode=PartiallySorted"),
+        "post-optimize prefix GROUP BY must aggregate partially sorted; plan was:\n{plan}"
+    );
+
+    assert_same_results(&clustered, &unclustered);
+}
+
+/// The optimize oracle under the messy shapes: duplicate keys, nulls in
+/// the key, multi-superfile commits. Results after the global re-sort are
+/// exactly the unclustered copy's.
+#[test]
+fn optimize_oracle_with_nulls_and_duplicates_matches_unclustered_copy() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..OPTIMIZE_COMMITS).map(oracle_rows).collect();
+    let clustered = table_with_commits(
+        options_with_key(&["category"], SHARD_THREADS).with_storage(local_storage(&dir)),
+        &commits,
+    );
+    let unclustered = table_with_commits(options_with_key(&[], SHARD_THREADS), &commits);
+
+    clustered
+        .optimize(&small_optimize_opts())
+        .expect("optimize");
+    assert_same_results(&clustered, &unclustered);
+}
+
+/// Tombstones and the optimize-time sort compose: the merged table holds
+/// only live rows, and the rewritten superfile still carries the ordering
+/// the scan declares.
+#[test]
+fn optimize_with_deletes_keeps_only_live_rows_on_the_ordered_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = table_with_commits(
+        options_with_key(&["category"], SHARD_THREADS).with_storage(local_storage(&dir)),
+        &[explain_rows(0), explain_rows(0)],
+    );
+
+    let mut w = st.writer().expect("writer");
+    let pending = w.delete(col("category").eq(lit("k03"))).expect("delete");
+    assert_eq!(pending.matched, 2, "one k03 row per commit");
+    w.commit().expect("commit delete");
+    drop(w);
+
+    let before = st.reader().n_superfiles();
+    st.optimize(&small_optimize_opts()).expect("optimize");
+    assert!(
+        st.reader().n_superfiles() < before,
+        "optimize must have merged the commits"
+    );
+
+    let sql = "SELECT category, COUNT(*), SUM(val) FROM supertable GROUP BY category";
+    let rows = sorted_rows(&st, sql);
+    assert_eq!(rows.len(), 15, "16 keys − 1 tombstoned key");
+    assert!(
+        rows.iter().all(|r| !r.starts_with("k03|")),
+        "tombstoned key must not survive the merge: {rows:?}"
+    );
+    let plan = explain(&st, sql);
+    assert!(
+        plan.contains("ordering_mode=Sorted"),
+        "merged live rows must still scan ordered; plan was:\n{plan}"
+    );
+}
+
+/// Seed scrambler for [`incompressible_key`] (the splitmix64 increment,
+/// a fixed-point-free odd multiplier that spreads consecutive seeds).
+const KEY_SEED_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Deterministic pseudo-random hex so parquet can't compress the key
+/// column much: the multi-output fixture needs file sizes near their raw
+/// size so optimize actually packs several target-sized outputs.
+fn incompressible_key(seed: u64) -> String {
+    // xorshift64 over the scrambled seed (forced odd so state is nonzero).
+    let mut x = seed.wrapping_mul(KEY_SEED_MULTIPLIER) | 1;
+    let mut out = String::with_capacity(MULTI_OUTPUT_KEY_LEN + 16);
+    while out.len() < MULTI_OUTPUT_KEY_LEN {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.push_str(&format!("{x:016x}"));
+    }
+    out.truncate(MULTI_OUTPUT_KEY_LEN);
+    out
+}
+
+/// When the merged rows exceed one target-sized superfile, optimize slices
+/// ONE globally sorted run into consecutive outputs — so even the
+/// multi-file result carries chained, non-overlapping key ranges and the
+/// ordered path fires. Independently sorted outputs would overlap and pin
+/// the plan to the unordered fallback.
+#[test]
+fn optimize_multiple_outputs_carry_disjoint_ranges() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..MULTI_OUTPUT_COMMITS)
+        .map(|commit| {
+            (0..MULTI_OUTPUT_ROWS_PER_COMMIT)
+                .map(|i| {
+                    let seed = (commit * MULTI_OUTPUT_ROWS_PER_COMMIT + i) as u64;
+                    (Some(incompressible_key(seed)), Some(i as i64), i as i64)
+                })
+                .collect()
+        })
+        .collect();
+    // One writer thread → one superfile per commit, ~0.4 MiB of raw key
+    // bytes each; a 1 MiB target forces several outputs.
+    let st = table_with_commits(
+        options_with_key(&["category"], 1).with_storage(local_storage(&dir)),
+        &commits,
+    );
+
+    let before = st.reader().n_superfiles();
+    assert_eq!(before, MULTI_OUTPUT_COMMITS);
+    st.optimize(&small_optimize_opts()).expect("optimize");
+    let after = st.reader().n_superfiles();
+    assert!(
+        (2..before).contains(&after),
+        "expected several merged outputs, got {after} superfiles"
+    );
+
+    // The ordered declaration only fires when EVERY surviving file's key
+    // range chains without overlap — the plan is the disjointness proof.
+    let plan = explain(
+        &st,
+        "SELECT category, SUM(val) FROM supertable GROUP BY category",
+    );
+    assert!(
+        plan.contains("output_ordering") && plan.contains("ordering_mode=Sorted"),
+        "multi-output optimize must keep the ordered path; plan was:\n{plan}"
+    );
+
+    let rows = sorted_rows(&st, "SELECT COUNT(*) FROM supertable");
+    let expected_rows = (MULTI_OUTPUT_COMMITS * MULTI_OUTPUT_ROWS_PER_COMMIT).to_string();
+    assert_eq!(rows, vec![expected_rows], "no rows lost across the split");
 }
