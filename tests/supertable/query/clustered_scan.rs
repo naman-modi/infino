@@ -611,3 +611,182 @@ fn optimize_multiple_outputs_carry_disjoint_ranges() {
     let expected_rows = (MULTI_OUTPUT_COMMITS * MULTI_OUTPUT_ROWS_PER_COMMIT).to_string();
     assert_eq!(rows, vec![expected_rows], "no rows lost across the split");
 }
+
+// ---- optimize past the compaction memory ceiling ---------------------
+
+/// Rows per commit in the streaming-optimize fixtures.
+const STREAMING_ROWS_PER_COMMIT: usize = 3200;
+/// Single-file commits in the streaming-optimize fixtures.
+const STREAMING_COMMITS: usize = 6;
+/// Distinct key values: far fewer than the row count, so every key
+/// repeats across rows AND commits, while the dictionary of
+/// incompressible 128-byte keys keeps each file's size well past what
+/// the 1 MiB ceiling admits for an in-memory sort.
+const STREAMING_DISTINCT_KEYS: u64 = 1600;
+/// One row in this many carries a null key.
+const STREAMING_NULL_STRIDE: usize = 97;
+
+/// Optimize options whose compaction memory ceiling (1 MiB) every
+/// fixture job exceeds — raw inputs total several MiB, so the clustered
+/// merge must take the streaming route (its in-memory reserve of three
+/// times the input bytes cannot fit), and with per-file reserves near
+/// the ceiling the fan-in admission also forces a multi-fold cascade.
+fn streaming_optimize_opts() -> OptimizeOptions {
+    OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        max_memory_mb: 1,
+        ..CompactionSettings::default()
+    })
+}
+
+/// One commit of the streaming fixture: duplicate incompressible keys,
+/// nulls in the key, unique measures, scrambled order. Every commit
+/// spans the same key universe, so pre-optimize ranges interleave.
+fn streaming_rows(commit: usize) -> Vec<Row> {
+    (0..STREAMING_ROWS_PER_COMMIT)
+        .map(|i| {
+            // Coprime stride visits every slot far from sorted order.
+            let slot = (i * 2011) % STREAMING_ROWS_PER_COMMIT;
+            let key = if slot.is_multiple_of(STREAMING_NULL_STRIDE) {
+                None
+            } else {
+                Some(incompressible_key(slot as u64 % STREAMING_DISTINCT_KEYS))
+            };
+            (
+                key,
+                Some((slot % 5) as i64),
+                (commit * STREAMING_ROWS_PER_COMMIT + slot) as i64,
+            )
+        })
+        .collect()
+}
+
+/// Optimize past the ceiling: the streaming merge produces globally
+/// ordered, range-disjoint outputs, so the same grouped queries that
+/// planned unordered before now scan with a declared ordering and
+/// aggregate in sorted input mode — and still return exactly what an
+/// unclustered copy of the same data returns, duplicates and null keys
+/// included.
+#[test]
+fn optimize_streams_over_ceiling_jobs_onto_the_ordered_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..STREAMING_COMMITS).map(streaming_rows).collect();
+    // One writer thread → one superfile per commit → six overlapping
+    // sorted runs for the streaming merge to combine.
+    let clustered = table_with_commits(
+        options_with_key(&["category"], 1).with_storage(local_storage(&dir)),
+        &commits,
+    );
+    let unclustered = table_with_commits(options_with_key(&[], 1), &commits);
+
+    let sql = "SELECT category, SUM(val) FROM supertable GROUP BY category";
+    let plan = explain(&clustered, sql);
+    assert!(
+        !plan.contains("ordering_mode") && !plan.contains("output_ordering"),
+        "overlapping commits must plan unordered before optimize; plan was:\n{plan}"
+    );
+
+    let before = clustered.reader().n_superfiles();
+    assert_eq!(before, STREAMING_COMMITS);
+    clustered
+        .optimize(&streaming_optimize_opts())
+        .expect("optimize past the compaction memory ceiling");
+    let after = clustered.reader().n_superfiles();
+    assert!(
+        (1..before).contains(&after),
+        "expected merged outputs, got {after} superfiles"
+    );
+
+    // The ordered declaration only fires when EVERY surviving file's
+    // key range chains without overlap — the plan is the proof that the
+    // streaming outputs are globally ordered and pairwise disjoint.
+    let plan = explain(&clustered, sql);
+    assert!(
+        plan.contains("output_ordering") && plan.contains("ordering_mode=Sorted"),
+        "streamed optimize must land on the ordered path; plan was:\n{plan}"
+    );
+
+    let rows = sorted_rows(&clustered, "SELECT COUNT(*) FROM supertable");
+    let expected_rows = (STREAMING_COMMITS * STREAMING_ROWS_PER_COMMIT).to_string();
+    assert_eq!(
+        rows,
+        vec![expected_rows],
+        "no rows lost through the cascade"
+    );
+    assert_same_results(&clustered, &unclustered);
+}
+
+/// Tombstones compose with the streaming merge: rows deleted before the
+/// over-ceiling optimize are absent from every output, and the
+/// survivors still scan on the ordered path.
+#[test]
+fn optimize_streaming_excludes_tombstones_on_the_ordered_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..STREAMING_COMMITS).map(streaming_rows).collect();
+    let st = table_with_commits(
+        options_with_key(&["category"], 1).with_storage(local_storage(&dir)),
+        &commits,
+    );
+
+    // Every commit carries this key once (slot 1 of the key universe).
+    let doomed = incompressible_key(1);
+    let mut w = st.writer().expect("writer");
+    let pending = w
+        .delete(col("category").eq(lit(doomed.as_str())))
+        .expect("delete");
+    assert!(
+        pending.matched as usize >= STREAMING_COMMITS,
+        "the doomed key must appear in every commit"
+    );
+    w.commit().expect("commit delete");
+    drop(w);
+
+    st.optimize(&streaming_optimize_opts())
+        .expect("optimize past the compaction memory ceiling");
+
+    let sql = "SELECT category, COUNT(*), SUM(val) FROM supertable GROUP BY category";
+    let rows = sorted_rows(&st, sql);
+    assert!(
+        rows.iter().all(|r| !r.starts_with(&format!("{doomed}|"))),
+        "tombstoned key must not survive the streaming merge"
+    );
+    let plan = explain(&st, sql);
+    assert!(
+        plan.contains("ordering_mode=Sorted"),
+        "survivors must still scan ordered; plan was:\n{plan}"
+    );
+}
+
+/// The tiny ceiling never bends the unclustered path: optimize still
+/// merges (concatenation order, no sort), the plan stays exactly as
+/// unordered as before, and no rows are lost — the streaming route is a
+/// clustered-table concern only.
+#[test]
+fn optimize_with_tiny_ceiling_leaves_unclustered_path_unchanged() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..STREAMING_COMMITS).map(streaming_rows).collect();
+    let st = table_with_commits(
+        options_with_key(&[], 1).with_storage(local_storage(&dir)),
+        &commits,
+    );
+
+    let before = st.reader().n_superfiles();
+    assert_eq!(before, STREAMING_COMMITS);
+    st.optimize(&streaming_optimize_opts())
+        .expect("unclustered optimize under the tiny ceiling");
+    assert!(
+        st.reader().n_superfiles() < before,
+        "unclustered optimize must still merge superfiles"
+    );
+
+    let sql = "SELECT category, SUM(val) FROM supertable GROUP BY category";
+    let plan = explain(&st, sql);
+    assert!(
+        !plan.contains("ordering_mode") && !plan.contains("output_ordering"),
+        "unclustered plans must stay unordered after optimize; plan was:\n{plan}"
+    );
+    let rows = sorted_rows(&st, "SELECT COUNT(*) FROM supertable");
+    let expected_rows = (STREAMING_COMMITS * STREAMING_ROWS_PER_COMMIT).to_string();
+    assert_eq!(rows, vec![expected_rows], "no rows lost by the merge");
+}
