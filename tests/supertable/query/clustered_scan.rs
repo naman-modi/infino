@@ -24,7 +24,11 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -756,6 +760,184 @@ fn optimize_streaming_excludes_tombstones_on_the_ordered_path() {
         plan.contains("ordering_mode=Sorted"),
         "survivors must still scan ordered; plan was:\n{plan}"
     );
+}
+
+// ---- optimize: convergence at commit scale ---------------------------
+
+/// Single-file commits in the convergence fixture: enough that the one
+/// coalesced merge job spans many more inputs than one streaming pass
+/// admits, like a bulk load's per-commit superfile trail.
+const CONVERGENCE_COMMITS: usize = 64;
+/// Rows per commit in the convergence fixture.
+const CONVERGENCE_ROWS_PER_COMMIT: usize = 800;
+/// The field shape's ceiling-to-target ratio (256 MiB target,
+/// 256+2048 MiB ceiling), scaled to the 1 MiB test target.
+const CONVERGENCE_MAX_MEMORY_MB: u64 = 9;
+
+/// The field OptimizeOptions shape at test scale: 1 MiB target (256 MiB
+/// in the field), 1% fill floor, ceiling 9x the target (2304/256).
+fn convergence_optimize_opts() -> OptimizeOptions {
+    OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        max_memory_mb: CONVERGENCE_MAX_MEMORY_MB,
+        ..CompactionSettings::default()
+    })
+}
+
+/// One commit of the convergence fixture: every commit spans the same
+/// key universe (ranges fully interleave), keys are incompressible so
+/// file sizes track raw size, measures are globally unique.
+fn convergence_rows(commit: usize) -> Vec<Row> {
+    (0..CONVERGENCE_ROWS_PER_COMMIT)
+        .map(|i| {
+            let slot = (i * 389) % CONVERGENCE_ROWS_PER_COMMIT; // coprime scramble
+            (
+                Some(incompressible_key(slot as u64)),
+                Some((slot % 7) as i64),
+                (commit * CONVERGENCE_ROWS_PER_COMMIT + slot) as i64,
+            )
+        })
+        .collect()
+}
+
+/// A bulk load's per-commit superfile trail must converge in ONE
+/// optimize call: every small clustered file merged into a handful of
+/// target-sized outputs whose key ranges chain without overlap, so the
+/// ordered scan fires. Non-convergence (many small files left, plan
+/// unordered) is the field failure this test pins.
+#[test]
+fn optimize_converges_many_small_commits_in_one_call() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..CONVERGENCE_COMMITS).map(convergence_rows).collect();
+    let clustered = table_with_commits(
+        options_with_key(&["category"], 1).with_storage(local_storage(&dir)),
+        &commits,
+    );
+    let unclustered = table_with_commits(options_with_key(&[], 1), &commits);
+
+    let before = clustered.reader().n_superfiles();
+    assert_eq!(before, CONVERGENCE_COMMITS);
+
+    clustered
+        .optimize(&convergence_optimize_opts())
+        .expect("one optimize call");
+
+    // Convergence: nothing mergeable is left behind. The merged rows
+    // total a few MiB against a 1 MiB target, so the surviving file
+    // count must be a small multiple of the target count, not the
+    // commit count.
+    let after = clustered.reader().n_superfiles();
+    eprintln!("CONVERGENCE_EVIDENCE: before={before} after={after}");
+    let max_converged = CONVERGENCE_COMMITS / 4;
+    assert!(
+        after <= max_converged,
+        "one optimize call must converge {before} small files, got {after} \
+         (> {max_converged})"
+    );
+
+    // Disjointness proof: the ordered declaration only fires when EVERY
+    // surviving file's key range chains without overlap.
+    let sql = "SELECT category, SUM(val) FROM supertable GROUP BY category";
+    let plan = explain(&clustered, sql);
+    assert!(
+        plan.contains("output_ordering") && plan.contains("ordering_mode=Sorted"),
+        "converged table must scan on the ordered path; plan was:\n{plan}"
+    );
+
+    let rows = sorted_rows(&clustered, "SELECT COUNT(*) FROM supertable");
+    let expected_rows = (CONVERGENCE_COMMITS * CONVERGENCE_ROWS_PER_COMMIT).to_string();
+    assert_eq!(rows, vec![expected_rows], "no rows lost by the merge");
+    assert_same_results(&clustered, &unclustered);
+}
+
+/// Rows per commit in the big-commit breakdown shape — same total rows
+/// as the convergence fixture packed into far fewer commits, so the
+/// per-commit sort works on a field-like larger buffer.
+const BREAKDOWN_BIG_COMMIT_ROWS: usize = 6400;
+/// Commits in the big-commit breakdown shape.
+const BREAKDOWN_BIG_COMMITS: usize = 8;
+
+/// Load the given commits into a fresh table and return the total
+/// append+commit wall time.
+fn timed_load(st: &Supertable, commits: &[Vec<Row>]) -> Duration {
+    let started = Instant::now();
+    let mut w = st.writer().expect("writer");
+    for rows in commits {
+        w.append(&batch_rows(rows)).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    started.elapsed()
+}
+
+/// One breakdown shape: load the same data clustered and unclustered,
+/// optimize the clustered table, print the timings, and check no rows
+/// were lost.
+fn run_load_breakdown(label: &str, n_commits: usize, rows_per_commit: usize) {
+    let commits: Vec<Vec<Row>> = (0..n_commits)
+        .map(|commit| {
+            (0..rows_per_commit)
+                .map(|i| {
+                    let slot = (i * 389) % rows_per_commit; // coprime scramble
+                    (
+                        Some(incompressible_key(slot as u64)),
+                        Some((slot % 7) as i64),
+                        (commit * rows_per_commit + slot) as i64,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+
+    let dir = TempDir::new().expect("tempdir");
+    let clustered =
+        Supertable::create(options_with_key(&["category"], 1).with_storage(local_storage(&dir)))
+            .expect("create clustered");
+    let clustered_load = timed_load(&clustered, &commits);
+
+    let unclustered_dir = TempDir::new().expect("tempdir");
+    let unclustered =
+        Supertable::create(options_with_key(&[], 1).with_storage(local_storage(&unclustered_dir)))
+            .expect("create unclustered");
+    let unclustered_load = timed_load(&unclustered, &commits);
+
+    let started = Instant::now();
+    clustered
+        .optimize(&convergence_optimize_opts())
+        .expect("optimize");
+    let optimize_elapsed = started.elapsed();
+
+    eprintln!(
+        "LOAD_BREAKDOWN[{label}]: commits={n_commits} rows_per_commit={rows_per_commit} \
+         clustered_load={clustered_load:?} unclustered_load={unclustered_load:?} \
+         per_commit_clustering_overhead={:?} optimize={optimize_elapsed:?}",
+        clustered_load
+            .saturating_sub(unclustered_load)
+            .div_f64(n_commits as f64),
+    );
+
+    let rows = sorted_rows(&clustered, "SELECT COUNT(*) FROM supertable");
+    let expected_rows = (n_commits * rows_per_commit).to_string();
+    assert_eq!(rows, vec![expected_rows], "no rows lost across the load");
+}
+
+/// Diagnostic breakdown of where a clustered bulk load's time goes at
+/// commit scale: total commit wall time on a clustered table vs an
+/// unclustered copy of the same data (the delta is the per-commit
+/// clustering sort and its stats), plus the one-call optimize cost —
+/// measured at two commit shapes (many small commits, few big ones) so
+/// the sort cost's scaling with commit size is visible. Timings are
+/// printed as evidence (run with `--nocapture`), never asserted — only
+/// the row-count invariant is.
+#[test]
+fn load_time_breakdown_clustered_vs_unclustered_commits() {
+    run_load_breakdown(
+        "many-small",
+        CONVERGENCE_COMMITS,
+        CONVERGENCE_ROWS_PER_COMMIT,
+    );
+    run_load_breakdown("few-big", BREAKDOWN_BIG_COMMITS, BREAKDOWN_BIG_COMMIT_ROWS);
 }
 
 /// The tiny ceiling never bends the unclustered path: optimize still
