@@ -376,6 +376,14 @@ pub struct SupertableOptions {
     /// the persisted manifest list — config changes after
     /// creation have no effect.
     pub partition_strategy: Option<PartitionStrategy>,
+    /// Clustering key: ordered list of user-schema columns each
+    /// commit physically sorts its rows by before building
+    /// superfiles (lexicographic on the list, ascending, nulls
+    /// last). Empty (the default) keeps rows in append order.
+    /// Declared at creation via [`Self::with_cluster_by`] and
+    /// recorded in the manifest list so it survives reopen; the
+    /// key is immutable for the table's lifetime.
+    pub cluster_by: Vec<String>,
     pub(crate) vector_layout: VectorLayout,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
@@ -638,6 +646,7 @@ impl SupertableOptions {
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
+            cluster_by: Vec::new(),
             vector_layout: VectorLayout::Ivf,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
@@ -820,6 +829,42 @@ impl SupertableOptions {
     pub fn with_partition_strategy(mut self, strategy: PartitionStrategy) -> Self {
         self.partition_strategy = Some(strategy);
         self
+    }
+
+    /// Declare the clustering key: an ordered list of user-schema
+    /// columns each commit physically sorts its rows by before
+    /// building superfiles (lexicographic on the list, ascending,
+    /// nulls last). See [`Self::cluster_by`].
+    ///
+    /// Every named column must exist in the user schema and carry a
+    /// sortable scalar type: vector (`FixedSizeList`) and other
+    /// nested columns are rejected with a typed error, as is a
+    /// column named twice. An empty list means no clustering.
+    pub fn with_cluster_by(mut self, columns: Vec<String>) -> Result<Self, BuildError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for column in &columns {
+            if !seen.insert(column.as_str()) {
+                return Err(BuildError::ClusterKeyDuplicateColumn(column.clone()));
+            }
+            let idx =
+                self.schema
+                    .index_of(column)
+                    .map_err(|_| BuildError::ClusterKeyColumnMissing {
+                        column: column.clone(),
+                    })?;
+            let data_type = self.schema.field(idx).data_type();
+            // Nested types (FixedSizeList vectors, structs, lists)
+            // have no total order the sort kernels can apply; every
+            // non-nested Arrow type is lexsort-comparable.
+            if data_type.is_nested() {
+                return Err(BuildError::ClusterKeyColumnNotSortable {
+                    column: column.clone(),
+                    actual: format!("{data_type:?}"),
+                });
+            }
+        }
+        self.cluster_by = columns;
+        Ok(self)
     }
 
     /// Override the soft cap on superfiles per manifest part.
@@ -1159,6 +1204,7 @@ impl fmt::Debug for SupertableOptions {
             .field("n_fts_columns", &self.fts_columns.len())
             .field("n_vector_columns", &self.vector_columns.len())
             .field("has_tokenizer", &self.tokenizer.is_some())
+            .field("cluster_by", &self.cluster_by)
             .finish()
     }
 }
@@ -1502,6 +1548,93 @@ mod tests {
             .expect("valid options");
         let err = opts.with_id_column("title").expect_err("collision");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "title"));
+    }
+
+    // ---- with_cluster_by ------------------------------------------------
+
+    /// Two sortable scalar columns plus one vector column, for the
+    /// clustering-key validation cases.
+    fn schema_for_cluster_by() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("rating", DataType::Int64, true),
+            Field::new("emb", fixed_list_f32(16), false),
+        ]))
+    }
+
+    fn cluster_by_opts() -> SupertableOptions {
+        SupertableOptions::new(
+            schema_for_cluster_by(),
+            vec![fc("title")],
+            vec![vc("emb", 16)],
+            Some(tok()),
+        )
+        .expect("valid options")
+    }
+
+    #[test]
+    fn with_cluster_by_accepts_sortable_scalar_columns() {
+        let opts = cluster_by_opts()
+            .with_cluster_by(vec!["rating".into(), "title".into()])
+            .expect("sortable scalar columns accepted");
+        assert_eq!(opts.cluster_by, vec!["rating", "title"]);
+    }
+
+    #[test]
+    fn with_cluster_by_empty_list_means_no_clustering() {
+        let opts = cluster_by_opts()
+            .with_cluster_by(Vec::new())
+            .expect("empty key accepted");
+        assert!(opts.cluster_by.is_empty());
+    }
+
+    #[test]
+    fn with_cluster_by_unknown_column_rejected() {
+        let err = cluster_by_opts()
+            .with_cluster_by(vec!["absent".into()])
+            .expect_err("unknown column");
+        assert!(matches!(
+            err,
+            BuildError::ClusterKeyColumnMissing { column } if column == "absent"
+        ));
+    }
+
+    #[test]
+    fn with_cluster_by_vector_column_rejected() {
+        // `emb` is FixedSizeList<Float32, 16> — nested, no total
+        // order, must be rejected with the typed error.
+        let err = cluster_by_opts()
+            .with_cluster_by(vec!["emb".into()])
+            .expect_err("vector column");
+        assert!(matches!(
+            err,
+            BuildError::ClusterKeyColumnNotSortable { column, .. } if column == "emb"
+        ));
+    }
+
+    #[test]
+    fn with_cluster_by_id_column_rejected_as_missing() {
+        // The injected id column is not part of the user schema, so
+        // naming it surfaces the missing-column error (rows already
+        // arrive in id order — clustering by it is meaningless).
+        let err = cluster_by_opts()
+            .with_cluster_by(vec!["_id".into()])
+            .expect_err("id column");
+        assert!(matches!(
+            err,
+            BuildError::ClusterKeyColumnMissing { column } if column == "_id"
+        ));
+    }
+
+    #[test]
+    fn with_cluster_by_duplicate_column_rejected() {
+        let err = cluster_by_opts()
+            .with_cluster_by(vec!["rating".into(), "rating".into()])
+            .expect_err("duplicate column");
+        assert!(matches!(
+            err,
+            BuildError::ClusterKeyDuplicateColumn(column) if column == "rating"
+        ));
     }
 
     #[test]

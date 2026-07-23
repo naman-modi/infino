@@ -83,6 +83,18 @@ pub enum BuildError {
     #[error("logical name {0:?} duplicated across fts_columns and vector_columns")]
     DuplicateLogicalName(String),
 
+    #[error("clustering key column {column:?} not found in schema")]
+    ClusterKeyColumnMissing { column: String },
+
+    #[error(
+        "clustering key column {column:?} must be a sortable scalar type; \
+         found {actual} (vector and other nested columns cannot order rows)"
+    )]
+    ClusterKeyColumnNotSortable { column: String, actual: String },
+
+    #[error("clustering key names column {0:?} more than once")]
+    ClusterKeyDuplicateColumn(String),
+
     #[error("user column name {0:?} contains reserved \\x1F separator")]
     ReservedSeparatorInColumnName(String),
 
