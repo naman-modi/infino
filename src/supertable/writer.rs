@@ -63,7 +63,7 @@ use std::{
 };
 
 use arrow::{
-    compute::{concat_batches, take},
+    compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take},
     ipc::writer::StreamWriter,
 };
 use arrow_array::{
@@ -520,6 +520,85 @@ fn split_buffer_into_row_shards(
     }
     shards.retain(|s| !s.is_empty());
     shards
+}
+
+/// Sort the whole buffered commit by the table's clustering key,
+/// returning a single sorted [`BufferedBatch`]. Lexicographic on the
+/// key's column list, ascending, nulls last (Arrow's `lexsort`
+/// kernel over the concatenated key columns; the permutation is
+/// applied with `take`). Downstream, the contiguous row-shard split
+/// slices this one batch in order, so every superfile the commit
+/// produces is internally sorted AND the shards partition the key
+/// space contiguously across the commit.
+///
+/// CPU-bound (concat + lexsort + gather) — callers run it on the
+/// writer rayon pool like the neighboring shard-split waves, never
+/// inline on tokio. Cost is one materialized copy of the commit's
+/// scalar + vector payload; the unclustered path never calls this.
+fn sort_buffer_by_cluster_key(
+    buffer: &[BufferedBatch],
+    options: &SupertableOptions,
+) -> Result<Vec<BufferedBatch>, BuildError> {
+    let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
+    if total_rows == 0 {
+        return Ok(Vec::new());
+    }
+    let schema = buffer[0].scalar.schema();
+    let scalar_batches: Vec<&RecordBatch> = buffer.iter().map(|b| &b.scalar).collect();
+    let merged = concat_batches(&schema, scalar_batches)
+        .map_err(|e| BuildError::Store(format!("clustering sort: concat batches: {e}")))?;
+
+    // One SortColumn per key column, in declared order — the order IS
+    // the sort precedence. Nulls last so present values lead the file.
+    let sort_columns: Vec<SortColumn> = options
+        .cluster_by
+        .iter()
+        .map(|column| {
+            let values = merged
+                .column_by_name(column)
+                .ok_or_else(|| BuildError::ClusterKeyColumnMissing {
+                    column: column.clone(),
+                })?
+                .clone();
+            Ok(SortColumn {
+                values,
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            })
+        })
+        .collect::<Result<_, BuildError>>()?;
+    let indices = lexsort_to_indices(&sort_columns, None)
+        .map_err(|e| BuildError::Store(format!("clustering sort: lexsort: {e}")))?;
+
+    let sorted_columns: Vec<ArrayRef> = merged
+        .columns()
+        .iter()
+        .map(|col| {
+            take(col, &indices, None)
+                .map_err(|e| BuildError::Store(format!("clustering sort: take: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let sorted_scalar = RecordBatch::try_new(schema, sorted_columns)
+        .map_err(|e| BuildError::Store(format!("clustering sort: rebuild batch: {e}")))?;
+
+    // Vector payloads live outside the scalar batch as flat f32 runs;
+    // gather each row's dim-length slice through the zero-copy view.
+    let mut sorted_vectors = Vec::with_capacity(options.vector_columns.len());
+    for (col_idx, vc) in options.vector_columns.iter().enumerate() {
+        let view = VectorColumnView::over(buffer, col_idx, vc.dim);
+        let mut values = Vec::with_capacity(total_rows * vc.dim);
+        for &row in indices.values() {
+            values.extend_from_slice(view.row(row as usize)?);
+        }
+        sorted_vectors.push(Arc::new(Float32Array::from(values)));
+    }
+
+    Ok(vec![BufferedBatch {
+        scalar: sorted_scalar,
+        vectors: sorted_vectors,
+    }])
 }
 
 /// After a manifest swap that drops superfile references, schedule a deferred
@@ -1546,6 +1625,25 @@ impl SupertableWriter {
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
     /// taken. On `Err`, the caller restores `buffer` onto the writer.
     fn commit_appends_with_taken_buffer(&self, buffer: &[BufferedBatch]) -> Result<(), BuildError> {
+        // Clustering key: physically order the whole commit by the key
+        // BEFORE anything splits it into shards, so each superfile
+        // built below is internally sorted and the contiguous shard
+        // split preserves the global commit order across shards. The
+        // sort is a CPU wave — run it on the writer rayon pool like
+        // the shard builds, not on the calling thread's context. An
+        // unclustered table takes the untouched `buffer` reference,
+        // so the default path is byte-for-byte unchanged.
+        let clustered_buffer;
+        let buffer: &[BufferedBatch] = if self.inner.options.cluster_by.is_empty() {
+            buffer
+        } else {
+            let options = &self.inner.options;
+            clustered_buffer = options
+                .writer_pool
+                .install(|| sort_buffer_by_cluster_key(buffer, options))?;
+            &clustered_buffer
+        };
+
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
