@@ -249,6 +249,7 @@ impl Connection {
                     fts_cfg,
                     vec_cfg,
                     tokenizer,
+                    indexes.cluster_by_columns().to_vec(),
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -296,6 +297,7 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns().to_vec(),
                     vectors,
+                    cluster_by: indexes.cluster_by_columns().to_vec(),
                     created_at_unix: now_unix(),
                 };
 
@@ -317,6 +319,7 @@ impl Connection {
                     fts_cfg,
                     vec_cfg,
                     tokenizer,
+                    indexes.cluster_by_columns().to_vec(),
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -420,7 +423,7 @@ impl Connection {
                 // lower it through the *same* path `create_table` used, so
                 // the defaults it applies (rotation seed, rerank codec) are
                 // identical and the table's options-hash check passes.
-                let mut spec = IndexSpec::new();
+                let mut spec = IndexSpec::new().cluster_by(entry.cluster_by.clone());
                 for column in &entry.fts {
                     spec = spec.fts(column.clone());
                 }
@@ -453,6 +456,7 @@ impl Connection {
                     fts_cfg,
                     vec_cfg,
                     tokenizer,
+                    spec.cluster_by_columns().to_vec(),
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -698,16 +702,20 @@ impl Connection {
 }
 
 /// Build `SupertableOptions` from a schema + lowered configs, attaching
-/// `storage` when present (absent → in-memory table).
+/// `storage` when present (absent → in-memory table). `cluster_by` is
+/// validated here against the schema (unknown column, unsortable
+/// type), so a bad key errors at creation, not at first commit.
 fn build_options(
     schema: SchemaRef,
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    cluster_by: Vec<String>,
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
-    let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
+    let mut opts =
+        SupertableOptions::new(schema, fts, vectors, tokenizer)?.with_cluster_by(cluster_by)?;
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -1441,6 +1449,115 @@ mod tests {
         assert!(
             conn.create_table("_hidden", schema_id_title(), IndexSpec::new())
                 .is_err()
+        );
+    }
+
+    // ---- cluster_by on table creation ---------------------------------
+
+    /// Schema for the clustering-key cases: two sortable scalars plus
+    /// a FixedSizeList column (the shape vector columns use).
+    fn schema_title_rating_emb() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("rating", DataType::Int64, true),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
+                false,
+            ),
+        ]))
+    }
+
+    #[test]
+    fn create_table_cluster_by_unknown_column_rejected() {
+        let conn = connect("memory://").expect("connect");
+        let err = conn
+            .create_table(
+                "docs",
+                schema_id_title(),
+                IndexSpec::new().fts("title").cluster_by(["absent"]),
+            )
+            .expect_err("unknown clustering column must fail at create");
+        assert!(
+            err.to_string().contains("absent"),
+            "error names the offending column: {err}"
+        );
+        // The failed create must not register the name.
+        assert!(conn.list_tables().expect("list").is_empty());
+    }
+
+    #[test]
+    fn create_table_cluster_by_vector_column_rejected() {
+        let conn = connect("memory://").expect("connect");
+        let err = conn
+            .create_table(
+                "docs",
+                schema_title_rating_emb(),
+                IndexSpec::new()
+                    .fts("title")
+                    .vector("emb", 16, 4, Metric::Cosine)
+                    .cluster_by(["emb"]),
+            )
+            .expect_err("vector clustering column must fail at create");
+        assert!(
+            err.to_string().contains("sortable"),
+            "error explains the type constraint: {err}"
+        );
+    }
+
+    #[test]
+    fn create_table_cluster_by_scalar_columns_accepted() {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table(
+                "docs",
+                schema_title_rating_emb(),
+                IndexSpec::new()
+                    .fts("title")
+                    .vector("emb", 16, 4, Metric::Cosine)
+                    .cluster_by(["rating", "title"]),
+            )
+            .expect("scalar clustering key accepted");
+        assert_eq!(table.options().cluster_by, vec!["rating", "title"]);
+    }
+
+    #[test]
+    fn cluster_by_survives_catalog_reopen() {
+        // The declaration is recorded on the catalog record, so a fresh
+        // connection (program restart) reconstructs options with the
+        // same key and the manifest options-hash check passes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema_id_title(),
+                    IndexSpec::new().fts("title").cluster_by(["title"]),
+                )
+                .expect("create");
+            table
+                .append(&build_title_batch(&["zulu", "alpha"]))
+                .expect("append");
+        }
+
+        let conn = connect(&uri).expect("reconnect");
+        let docs = conn.open_table("docs").expect("open");
+        assert_eq!(
+            docs.options().cluster_by,
+            vec!["title"],
+            "reopen must reconstruct the clustering key"
+        );
+        // The reopened handle still serves reads.
+        assert_eq!(
+            n_rows(
+                &docs
+                    .bm25_search("title", "alpha", TOP_K, BoolMode::Or, None)
+                    .expect("search")
+            ),
+            1
         );
     }
 

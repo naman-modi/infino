@@ -42,6 +42,7 @@ struct VectorIndex {
 pub struct IndexSpec {
     fts: Vec<String>,
     vectors: Vec<VectorIndex>,
+    cluster_by: Vec<String>,
 }
 
 impl IndexSpec {
@@ -78,9 +79,32 @@ impl IndexSpec {
         self
     }
 
+    /// Declare the table's clustering key: an ordered list of column
+    /// names each commit physically sorts its rows by before writing
+    /// (lexicographic on the list, ascending, nulls last). Rows with
+    /// nearby key values land next to each other on disk, which is
+    /// what range queries on the key want. Every named column must
+    /// exist in the schema as a sortable scalar type — vector
+    /// columns are rejected at `create_table`. The key is fixed at
+    /// creation for the table's lifetime.
+    pub fn cluster_by<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cluster_by = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// FTS column names, in declaration order.
     pub(crate) fn fts_columns(&self) -> &[String] {
         &self.fts
+    }
+
+    /// Clustering-key column names, in sort-precedence order.
+    /// Empty means the table is unclustered.
+    pub(crate) fn cluster_by_columns(&self) -> &[String] {
+        &self.cluster_by
     }
 
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the

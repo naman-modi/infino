@@ -56,6 +56,11 @@ pub(crate) struct TableEntry {
     pub(crate) fts: Vec<String>,
     /// Vector-indexed columns.
     pub(crate) vectors: Vec<VectorEntry>,
+    /// Clustering-key column names, in sort-precedence order. Empty
+    /// (and absent on records written before the key existed) means
+    /// the table is unclustered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cluster_by: Vec<String>,
     /// Creation time, seconds since the Unix epoch.
     pub(crate) created_at_unix: u64,
 }
@@ -173,6 +178,7 @@ mod tests {
                 n_cent: 4,
                 metric: "cosine".into(),
             }],
+            cluster_by: vec!["n".into()],
             created_at_unix: 0,
         }
     }
@@ -223,6 +229,7 @@ mod tests {
         assert_eq!(entry.location, "docs");
         assert_eq!(entry.fts, vec!["title".to_string()]);
         assert_eq!(entry.vectors.len(), 1);
+        assert_eq!(entry.cluster_by, vec!["n".to_string()]);
         let schema = schema_from_ipc(&entry.schema_ipc).expect("decode schema");
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "title");
