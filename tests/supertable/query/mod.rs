@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub mod brute_force_oracle;
+mod clustered_scan;
 mod covered_agg;
 pub mod fanout_concurrency;
 pub mod fanout_floor;
