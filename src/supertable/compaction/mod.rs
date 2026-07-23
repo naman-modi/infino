@@ -8,6 +8,8 @@
 //! Compaction is single-level — a target-sized superfile is never
 //! re-compacted.
 
+mod streaming;
+
 use std::{
     collections::{BTreeMap, HashMap},
     mem,
@@ -27,7 +29,7 @@ use futures::{
 };
 use roaring::RoaringBitmap;
 use tokio::{sync::oneshot, time};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -43,6 +45,7 @@ use crate::{
     supertable::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, SupertableOptions,
         build::fanout_shards_in_pool_scope,
+        compaction::streaming::streaming_clustered_merge,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
@@ -82,6 +85,33 @@ const MERGE_MEMORY_RESERVE_FACTOR: u64 = 2;
 /// is deliberately conservative headroom: these factors meter compressed
 /// input bytes against decompressed in-memory transients.
 const CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR: u64 = 3;
+
+/// The engagement threshold for the streaming clustered merge: the
+/// in-memory route reserves [`CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR`]
+/// times the raw input bytes, so once that reserve would cross the
+/// compaction memory ceiling the job routes through the streaming
+/// k-way merge, which bounds its decoded working set to the ceiling
+/// itself. Below the threshold the in-memory sort stays — it is one
+/// pass with no per-batch bookkeeping and its transients already fit.
+fn clustered_merge_needs_streaming(input_bytes: u64, max_memory_bytes: u64) -> bool {
+    input_bytes.saturating_mul(CLUSTERED_MERGE_MEMORY_RESERVE_FACTOR) > max_memory_bytes
+}
+
+/// Whether a clustered table can take the streaming merge at all:
+/// durable storage must be attached (outputs upload as they are cut),
+/// and no vector column may use an sq8-family rerank codec — those
+/// merges byte-splice their vector blobs in row order and cannot
+/// re-sort, so they keep today's in-memory fallback. Cell-partitioned
+/// vector tables are excluded separately at both call sites (their
+/// manifests carry the `VectorCell` strategy), matching the reader-set
+/// multi-cell fallback in [`Supertable::merge_superfiles`].
+fn clustered_streaming_available(options: &SupertableOptions) -> bool {
+    options.storage.is_some()
+        && !options
+            .vector_columns
+            .iter()
+            .any(|vc| vc.rerank_codec.is_sq8_residual_family())
+}
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,17 +408,31 @@ impl Supertable {
             }
             None => vec![stats],
         };
-        // Clustered tables fuse same-partition sibling jobs (bounded by the
-        // same memory ceiling a single job respects) so one global sort can
-        // slice them into range-disjoint outputs; each fused job then asks
-        // the merge for enough outputs to stay near the target size.
+        // Clustered tables fuse same-partition sibling jobs so one global
+        // order can slice them into range-disjoint outputs; each fused job
+        // then asks the merge for enough outputs to stay near the target
+        // size. When the streaming merge is available a fused job may
+        // exceed the in-memory ceiling — the merge streams it under that
+        // ceiling instead of degrading to overlapping per-job sorts.
+        // Without it (no storage, sq8 vectors) fusion keeps the ceiling as
+        // its cap, exactly the pre-streaming behavior.
         let clustered = !inner.options.cluster_by.is_empty();
         let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
         let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
+        let cell_partitioned = matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        );
+        let fusion_cap_bytes = if !cell_partitioned && clustered_streaming_available(&inner.options)
+        {
+            u64::MAX
+        } else {
+            max_memory_bytes
+        };
         for stats in &stat_groups {
             let mut jobs = select(stats, cfg);
             if clustered {
-                jobs = coalesce_clustered_jobs(jobs, stats, max_memory_bytes);
+                jobs = coalesce_clustered_jobs(jobs, stats, fusion_cap_bytes);
             }
             for job in jobs {
                 let n_outputs = if clustered {
@@ -397,7 +441,7 @@ impl Supertable {
                     1
                 };
                 table
-                    .run_compaction_job(job, n_outputs, stale_seal_timeout)
+                    .run_compaction_job(job, n_outputs, stale_seal_timeout, max_memory_bytes)
                     .await?;
                 table
                     .refresh()
@@ -420,11 +464,18 @@ impl Supertable {
     /// nulls-last order every commit is written in) and splits the one
     /// sorted run into up to `n_outputs` contiguous chunks, so consecutive
     /// outputs carry non-overlapping key ranges and the ordered scan path
-    /// can fire across them.
+    /// can fire across them. A clustered job whose in-memory sort would
+    /// exceed `max_memory_bytes` (see [`clustered_merge_needs_streaming`])
+    /// takes the streaming k-way merge instead — same order, same output
+    /// shape, decoded working set bounded by the ceiling. `compaction_id`
+    /// seeds the streaming outputs' deterministic ids; the in-memory
+    /// routes ignore it.
     pub(crate) async fn merge_superfiles(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
         n_outputs: usize,
+        compaction_id: Uuid,
+        max_memory_bytes: u64,
     ) -> Result<Vec<PreparedSuperfile>, BuildError> {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
@@ -433,13 +484,27 @@ impl Supertable {
         let tombstone_cache = self.inner().tombstone_cache.clone();
         let clustered = !self.inner().options.cluster_by.is_empty();
 
-        // This reserves budget for the whole input size since merge still
-        // loads it all at once. Real fix is streaming the merge and pooling
-        // buffers instead of a flat reservation; picking that up later.
+        // The in-memory routes reserve budget for the whole input size
+        // since they load it all at once; the streaming clustered route
+        // reserves the compaction ceiling instead — that is the bound its
+        // merge pool enforces on decoded transients.
         let input_bytes: u64 = superfiles
             .iter()
             .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
             .sum();
+        // Cell-partitioned vector tables never reach the row-materializing
+        // clustered branch below (their reader sets are multi-cell), so
+        // they must not route to streaming either — the two decisions are
+        // kept in lockstep here so the reservation always matches the
+        // route actually taken.
+        let cell_partitioned = matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        );
+        let streaming = clustered
+            && !cell_partitioned
+            && clustered_streaming_available(&self.inner().options)
+            && clustered_merge_needs_streaming(input_bytes, max_memory_bytes);
         // Multiply the input bytes to cover the merge buffer and overhead; a
         // clustered merge additionally holds the sorted chunk copy and the
         // row-encoded key columns while the inputs are still alive.
@@ -448,7 +513,11 @@ impl Supertable {
         } else {
             MERGE_MEMORY_RESERVE_FACTOR
         };
-        let estimated_bytes = input_bytes.saturating_mul(reserve_factor) as usize;
+        let estimated_bytes = if streaming {
+            max_memory_bytes
+        } else {
+            input_bytes.saturating_mul(reserve_factor)
+        } as usize;
         let _memory_reservation = manifest
             .options
             .connection_memory_budget
@@ -505,6 +574,26 @@ impl Supertable {
         // ranges simply keep overlapping and the scan stays on its unordered
         // fallback for those tables.
         if clustered && !multi_cell && sq8_merge != Some(true) {
+            if streaming {
+                let report = streaming_clustered_merge(
+                    self.inner(),
+                    readers_with_tombstones,
+                    n_outputs,
+                    compaction_id,
+                    max_memory_bytes,
+                )
+                .await?;
+                debug!(
+                    inputs = superfiles.len(),
+                    outputs = report.prepared.len(),
+                    cascade_folds = report.cascade_folds,
+                    "compact: streaming clustered merge"
+                );
+                if report.prepared.is_empty() {
+                    return Err(BuildError::NoDocsToBuild);
+                }
+                return Ok(report.prepared);
+            }
             let shard_outputs = clustered_merge_shards(
                 Arc::clone(&self.inner().options),
                 readers_with_tombstones,
@@ -553,12 +642,15 @@ impl Supertable {
     /// the merged output(s) into the manifest. `n_outputs` only matters for
     /// clustered tables, where it caps how many contiguous key-range chunks
     /// the merged rows split into (see [`Supertable::merge_superfiles`]);
-    /// pass 1 everywhere else.
+    /// pass 1 everywhere else. `max_memory_bytes` is the compaction memory
+    /// ceiling that decides between the in-memory and streaming clustered
+    /// merges.
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
         n_outputs: usize,
         stale_seal_timeout: std::time::Duration,
+        max_memory_bytes: u64,
     ) -> Result<(), CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -620,7 +712,10 @@ impl Supertable {
             });
         }
 
-        let merged_segments = match self.merge_superfiles(&inputs, n_outputs).await {
+        let merged_segments = match self
+            .merge_superfiles(&inputs, n_outputs, compaction_id, max_memory_bytes)
+            .await
+        {
             Ok(segments) => segments,
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
@@ -650,6 +745,7 @@ impl Supertable {
                 bytes_for_store,
                 bytes_for_storage,
                 bytes_for_cache,
+                storage_prewritten,
             } = segment;
             let merged_entry = Arc::new(SuperfileEntry {
                 birth_version,
@@ -665,8 +761,14 @@ impl Supertable {
             }
             pending_cache_inserts.extend(bytes_for_cache);
             new_entries.push(merged_entry);
-            pending_storage_writes
-                .push(bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?);
+            if storage_prewritten {
+                // Streaming clustered outputs are already durable at their
+                // deterministic keys; the commit only swaps the manifest.
+                debug_assert!(bytes_for_storage.is_none());
+            } else {
+                pending_storage_writes
+                    .push(bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?);
+            }
         }
 
         for attempt in 0..max_retries {
@@ -776,13 +878,16 @@ fn clustered_output_count(estimated_live_bytes: u64, target_bytes: u64) -> usize
 /// siblings into one job makes the merge sort ALL their rows in a single
 /// run and slice it into contiguous chunks — pairwise-disjoint outputs.
 ///
-/// Fusion is capped by the same `max_memory_bytes` ceiling a single job's
-/// raw input bytes already respect, so a partition too big to sort in one
-/// bounded pass degrades to per-job merges (each still internally sorted,
-/// ranges possibly overlapping). Selection is untouched: exactly the
-/// superfiles `select` picked get merged, only the job boundaries move.
-/// Relies on `select` emitting same-partition jobs consecutively (it packs
-/// partitions in `BTreeMap` order).
+/// Fusion is capped at `max_memory_bytes` of raw input per fused job.
+/// When the streaming clustered merge can serve the table the caller
+/// lifts the cap (`u64::MAX`) — an over-ceiling fused job streams under
+/// the ceiling instead of being split. Without the streaming route the
+/// cap stays at the compaction memory ceiling, so a partition too big to
+/// sort in one bounded pass degrades to per-job merges (each still
+/// internally sorted, ranges possibly overlapping). Selection is
+/// untouched: exactly the superfiles `select` picked get merged, only
+/// the job boundaries move. Relies on `select` emitting same-partition
+/// jobs consecutively (it packs partitions in `BTreeMap` order).
 fn coalesce_clustered_jobs(
     jobs: Vec<CompactionJob>,
     superfiles: &[SuperfileStats],
@@ -988,7 +1093,8 @@ async fn seal_with_bounded_retry(
 mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
-    use arrow_array::LargeStringArray;
+    use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
     use tokio::task;
@@ -998,16 +1104,29 @@ mod tests {
         BoolMode, Supertable,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
+        superfile::vector::rerank_codec::RerankCodec,
         supertable::{
+            compaction::streaming::StreamingMergeReport,
             error::CompactionError,
             manifest::list::ScalarStatsAgg,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
-        test_helpers::{build_title_batch, default_supertable_options},
+        test_helpers::{
+            build_title_batch, decimal128_ids, default_supertable_options, default_vector_config,
+        },
     };
 
     const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
         std::time::Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// A ceiling no test fixture ever exceeds: merges stay on the
+    /// in-memory routes (`clustered_merge_needs_streaming` is false).
+    const IN_MEMORY_MERGE_CEILING: u64 = u64::MAX;
+
+    /// A ceiling every fixture exceeds: clustered merges take the
+    /// streaming route with the minimum fan-in, so cascades engage
+    /// whenever a job has more than two inputs.
+    const STREAMING_MERGE_CEILING: u64 = 1;
 
     fn mib(n: u64) -> u64 {
         n * MIB
@@ -1243,7 +1362,7 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job, 1, DEFAULT_STALE_SEAL_TIMEOUT)
+            .run_compaction_job(job, 1, DEFAULT_STALE_SEAL_TIMEOUT, IN_MEMORY_MERGE_CEILING)
             .await
             .expect_err("must error on unknown input");
         assert!(
@@ -1326,7 +1445,7 @@ mod tests {
             estimated_output_bytes: 1,
         };
         let err = st
-            .run_compaction_job(job, 1, DEFAULT_STALE_SEAL_TIMEOUT)
+            .run_compaction_job(job, 1, DEFAULT_STALE_SEAL_TIMEOUT, IN_MEMORY_MERGE_CEILING)
             .await
             .expect_err("must conflict on entry_b");
         assert!(matches!(err, CompactionError::SidecarConflict { .. }));
@@ -1576,7 +1695,7 @@ mod tests {
 
         // Merge the superfiles - should succeed
         let _merged_superfile = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("merge_superfiles should succeed")
             .pop()
@@ -1632,7 +1751,7 @@ mod tests {
 
         // Merge should succeed and preserve scalar stats
         let merged_superfile = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("merge_superfiles should succeed")
             .pop()
@@ -1714,7 +1833,7 @@ mod tests {
 
         // Merging 3 superfiles should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("merge_superfiles should succeed")
             .pop()
@@ -1791,7 +1910,10 @@ mod tests {
         let reader = st.reader();
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
 
-        match st.merge_superfiles(&superfiles, 1).await {
+        match st
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
+            .await
+        {
             Err(BuildError::MemoryBudgetExceeded(_)) => {}
             Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
             Ok(_) => panic!("merge must be refused over budget"),
@@ -1828,7 +1950,7 @@ mod tests {
 
         // Merging a single superfile should succeed
         let merged_superfile = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("merge_superfiles should succeed")
             .pop()
@@ -1884,25 +2006,28 @@ mod tests {
 
     // ---- clustered merges --------------------------------------------
 
-    /// Storage-backed table clustered by `title`.
-    fn make_clustered_st(dir: &TempDir) -> Supertable {
+    /// Storage-backed table clustered by `title`, plus its storage so
+    /// streaming tests can read back eagerly-uploaded outputs.
+    fn make_clustered_st_with_storage(dir: &TempDir) -> (Supertable, Arc<dyn StorageProvider>) {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        Supertable::create(
+        let st = Supertable::create(
             default_supertable_options()
                 .with_cluster_by(vec!["title".to_string()])
                 .expect("title is a sortable clustering key")
                 .with_storage(Arc::clone(&storage)),
         )
-        .expect("create clustered supertable")
+        .expect("create clustered supertable");
+        (st, storage)
     }
 
-    /// The `title` values of one prepared merge output, in file row order.
-    fn titles_of(prepared: &PreparedSuperfile) -> Vec<String> {
-        let reader = prepared
-            .open_reader()
-            .expect("merged superfile has bytes")
-            .expect("open merged superfile");
+    /// Storage-backed table clustered by `title`.
+    fn make_clustered_st(dir: &TempDir) -> Supertable {
+        make_clustered_st_with_storage(dir).0
+    }
+
+    /// The `title` values of an open superfile, in file row order.
+    fn titles_from_reader(reader: &SuperfileReader) -> Vec<String> {
         let batch = reader.get_record_batch(None).expect("decode rows");
         let titles = batch
             .column_by_name("title")
@@ -1913,6 +2038,28 @@ mod tests {
         (0..batch.num_rows())
             .map(|i| titles.value(i).to_string())
             .collect()
+    }
+
+    /// The `title` values of one prepared merge output, in file row order.
+    fn titles_of(prepared: &PreparedSuperfile) -> Vec<String> {
+        let reader = prepared
+            .open_reader()
+            .expect("merged superfile has bytes")
+            .expect("open merged superfile");
+        titles_from_reader(&reader)
+    }
+
+    /// Open one streaming merge output from storage: the streaming route
+    /// uploads eagerly and returns entries without bytes.
+    async fn open_streamed_output(
+        storage: &Arc<dyn StorageProvider>,
+        prepared: &PreparedSuperfile,
+    ) -> SuperfileReader {
+        let (bytes, _) = storage
+            .get(&prepared.entry.uri.storage_path())
+            .await
+            .expect("streaming output must be durable before commit");
+        SuperfileReader::open(bytes).expect("open streamed output")
     }
 
     /// `(min, max)` of a title stats entry.
@@ -1947,7 +2094,7 @@ mod tests {
 
         let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
         let merged = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("clustered merge")
             .pop()
@@ -1981,7 +2128,7 @@ mod tests {
 
         let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
         let merged = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("clustered merge")
             .pop()
@@ -2013,7 +2160,7 @@ mod tests {
 
         let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
         let merged = st
-            .merge_superfiles(&superfiles, 2)
+            .merge_superfiles(&superfiles, 2, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("clustered merge");
         assert_eq!(merged.len(), 2, "two target-sized outputs requested");
@@ -2047,7 +2194,7 @@ mod tests {
 
         let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
         let merged = st
-            .merge_superfiles(&superfiles, 1)
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
             .await
             .expect("merge")
             .pop()
@@ -2084,7 +2231,7 @@ mod tests {
             inputs,
             estimated_output_bytes: 1,
         };
-        st.run_compaction_job(job, 2, DEFAULT_STALE_SEAL_TIMEOUT)
+        st.run_compaction_job(job, 2, DEFAULT_STALE_SEAL_TIMEOUT, IN_MEMORY_MERGE_CEILING)
             .await
             .expect("clustered job");
 
@@ -2100,6 +2247,420 @@ mod tests {
             bounds[0].1 <= bounds[1].0,
             "published outputs must carry disjoint key ranges: {bounds:?}"
         );
+    }
+
+    // ---- streaming clustered merges -----------------------------------
+
+    /// Vector fixture dimensionality (`default_vector_config` shape).
+    const DIM: usize = 16;
+
+    /// Open every manifest superfile the way a compaction job would, with
+    /// no tombstones — direct-call input for `streaming_clustered_merge`.
+    async fn open_job_readers(
+        st: &Supertable,
+    ) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
+        let manifest = st.inner().manifest.load_full();
+        let store = manifest.options.store.clone();
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let mut readers = Vec::new();
+        for entry in manifest.get_all_superfiles().iter() {
+            let reader =
+                open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
+                    .await
+                    .expect("open compaction input");
+            readers.push((reader, None));
+        }
+        readers
+    }
+
+    /// Past the ceiling the clustered merge streams: outputs come back
+    /// `storage_prewritten` (already durable, no bytes attached), rows
+    /// arrive in global key order, and the recomputed statistics span
+    /// exactly the sorted output — the same contract as the in-memory
+    /// route.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_merge_engages_past_ceiling_and_sorts_by_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let (st, storage) = make_clustered_st_with_storage(&dir);
+        commit_titles(&st, &["delta doc", "alpha doc"]);
+        commit_titles(&st, &["charlie doc", "bravo doc"]);
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), STREAMING_MERGE_CEILING)
+            .await
+            .expect("streaming clustered merge")
+            .pop()
+            .expect("exactly one merged superfile");
+
+        assert!(
+            merged.storage_prewritten,
+            "past the ceiling the merge must take the streaming route"
+        );
+        assert!(
+            merged.bytes_for_storage.is_none() && merged.bytes_for_store.is_none(),
+            "streaming outputs release their bytes after the eager upload"
+        );
+        let reader = open_streamed_output(&storage, &merged).await;
+        assert_eq!(
+            titles_from_reader(&reader),
+            vec!["alpha doc", "bravo doc", "charlie doc", "delta doc"],
+            "merged rows must be in clustering-key order"
+        );
+        let (min, max) =
+            title_stat_bounds(merged.entry.scalar_stats.get("title").expect("title stats"));
+        assert_eq!((min.as_str(), max.as_str()), ("alpha doc", "delta doc"));
+    }
+
+    /// Below the ceiling the in-memory route is untouched: outputs carry
+    /// their bytes for the commit to write, exactly as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clustered_merge_below_ceiling_keeps_the_in_memory_route() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_clustered_st(&dir);
+        commit_titles(&st, &["delta doc", "alpha doc"]);
+        commit_titles(&st, &["charlie doc", "bravo doc"]);
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), IN_MEMORY_MERGE_CEILING)
+            .await
+            .expect("in-memory clustered merge")
+            .pop()
+            .expect("exactly one merged superfile");
+        assert!(!merged.storage_prewritten);
+        assert!(merged.bytes_for_storage.is_some());
+    }
+
+    /// An unclustered table never streams, whatever the ceiling: same
+    /// route, same concatenation row order, bytes attached for commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unclustered_merge_ignores_the_streaming_ceiling() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["zulu doc", "alpha doc"]);
+        commit_titles(&st, &["mike doc", "bravo doc"]);
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), STREAMING_MERGE_CEILING)
+            .await
+            .expect("unclustered merge")
+            .pop()
+            .expect("exactly one merged superfile");
+        assert!(!merged.storage_prewritten);
+        assert_eq!(
+            titles_of(&merged),
+            vec!["zulu doc", "alpha doc", "mike doc", "bravo doc"],
+            "unclustered merge must preserve append/manifest order"
+        );
+    }
+
+    /// Tombstones are excluded through the streaming merge and the
+    /// survivors stay globally sorted, with stats spanning only them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_merge_excludes_tombstones_and_stays_sorted() {
+        let dir = TempDir::new().expect("tempdir");
+        let (st, storage) = make_clustered_st_with_storage(&dir);
+        commit_titles(&st, &["delta doc", "alpha doc"]);
+        commit_titles(&st, &["charlie doc", "bravo doc"]);
+        {
+            let mut w = st.writer().expect("writer");
+            let pending = w.delete(col("title").eq(lit("delta doc"))).expect("delete");
+            assert_eq!(pending.matched, 1);
+            w.commit().expect("commit delete");
+        }
+
+        let superfiles = st.reader().manifest().get_all_superfiles().to_vec();
+        let merged = st
+            .merge_superfiles(&superfiles, 1, Uuid::new_v4(), STREAMING_MERGE_CEILING)
+            .await
+            .expect("streaming clustered merge")
+            .pop()
+            .expect("exactly one merged superfile");
+        assert!(merged.storage_prewritten);
+        let reader = open_streamed_output(&storage, &merged).await;
+        assert_eq!(
+            titles_from_reader(&reader),
+            vec!["alpha doc", "bravo doc", "charlie doc"],
+            "only live rows, in key order"
+        );
+        let (min, max) =
+            title_stat_bounds(merged.entry.scalar_stats.get("title").expect("title stats"));
+        assert_eq!(
+            (min.as_str(), max.as_str()),
+            ("alpha doc", "charlie doc"),
+            "stats must reflect the tombstone-filtered sorted output"
+        );
+    }
+
+    /// A four-run job under the minimum fan-in cascades — at least two
+    /// folds before the final pass — and the outputs are still one
+    /// globally sorted stream sliced into chained-disjoint chunks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_cascade_at_min_fan_in_stays_globally_ordered() {
+        let dir = TempDir::new().expect("tempdir");
+        let (st, storage) = make_clustered_st_with_storage(&dir);
+        commit_titles(&st, &["golf doc", "alpha doc"]);
+        commit_titles(&st, &["hotel doc", "bravo doc"]);
+        commit_titles(&st, &["echo doc", "charlie doc"]);
+        commit_titles(&st, &["foxtrot doc", "delta doc"]);
+
+        let readers = open_job_readers(&st).await;
+        assert_eq!(readers.len(), 4);
+        let report = streaming_clustered_merge(
+            st.inner(),
+            readers,
+            2,
+            Uuid::new_v4(),
+            STREAMING_MERGE_CEILING,
+        )
+        .await
+        .expect("cascading streaming merge");
+
+        assert!(
+            report.cascade_folds >= 2,
+            "4 runs at fan-in 2 need at least two folds, got {}",
+            report.cascade_folds
+        );
+        assert_eq!(report.prepared.len(), 2, "two target-sized outputs");
+        let first = open_streamed_output(&storage, &report.prepared[0]).await;
+        let second = open_streamed_output(&storage, &report.prepared[1]).await;
+        assert_eq!(
+            titles_from_reader(&first),
+            vec!["alpha doc", "bravo doc", "charlie doc", "delta doc"]
+        );
+        assert_eq!(
+            titles_from_reader(&second),
+            vec!["echo doc", "foxtrot doc", "golf doc", "hotel doc"]
+        );
+        let (_, first_max) = title_stat_bounds(
+            report.prepared[0]
+                .entry
+                .scalar_stats
+                .get("title")
+                .expect("stats"),
+        );
+        let (second_min, _) = title_stat_bounds(
+            report.prepared[1]
+                .entry
+                .scalar_stats
+                .get("title")
+                .expect("stats"),
+        );
+        assert!(
+            first_max <= second_min,
+            "consecutive outputs must not overlap: {first_max:?} vs {second_min:?}"
+        );
+    }
+
+    /// Output identity is a pure function of the compaction id and the
+    /// output index: the same job identity re-run lands the same
+    /// superfile ids and URIs (its uploads overwrite-or-match instead of
+    /// accumulating orphans), and distinct indexes never collide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_outputs_have_deterministic_idempotent_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let (st, _storage) = make_clustered_st_with_storage(&dir);
+        commit_titles(&st, &["golf doc", "alpha doc"]);
+        commit_titles(&st, &["hotel doc", "bravo doc"]);
+
+        let compaction_id = Uuid::new_v4();
+        let first_run = streaming_clustered_merge(
+            st.inner(),
+            open_job_readers(&st).await,
+            2,
+            compaction_id,
+            STREAMING_MERGE_CEILING,
+        )
+        .await
+        .expect("first streaming run");
+        let second_run = streaming_clustered_merge(
+            st.inner(),
+            open_job_readers(&st).await,
+            2,
+            compaction_id,
+            STREAMING_MERGE_CEILING,
+        )
+        .await
+        .expect("same-identity re-run must overwrite partials safely");
+
+        let identity = |run: &StreamingMergeReport| -> Vec<(Uuid, SuperfileUri)> {
+            run.prepared
+                .iter()
+                .map(|p| (p.entry.superfile_id, p.entry.uri))
+                .collect()
+        };
+        let first_ids = identity(&first_run);
+        let second_ids = identity(&second_run);
+        assert_eq!(first_ids, second_ids, "identity must be deterministic");
+        let distinct: HashSet<_> = first_ids.iter().collect();
+        assert_eq!(distinct.len(), first_ids.len(), "indexes must not collide");
+        assert_eq!(
+            first_run
+                .prepared
+                .iter()
+                .map(|p| p.entry.n_docs)
+                .sum::<u64>(),
+            4
+        );
+    }
+
+    /// Vector payloads ride the streaming merge row-aligned: after the
+    /// k-way merge interleaves rows across sorted inputs (and cuts them
+    /// back into superfiles), each row's one-hot embedding still sits
+    /// next to its own scalar values — the property vector recall rests
+    /// on. Inputs are plain-IVF superfiles built on the table's own
+    /// builder options: cell-partitioned vector tables keep the
+    /// multi-cell fallback on the table route, so this drives the
+    /// streaming machinery directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_merge_keeps_vectors_row_aligned() {
+        // Global category list; category `i`'s embedding is one-hot at
+        // dim `i`, so the expected post-merge vector for sorted row `i`
+        // is exactly one-hot(i).
+        let categories = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        // The user schema declares the vector column as a FixedSizeList
+        // field (creation-time validation requires it); the scalar
+        // parquet schema drops it and the builder carries the payload.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(schema, vec![], vec![default_vector_config("emb", 0)], None)
+                .expect("valid options")
+                .with_cluster_by(vec!["category".into()])
+                .expect("valid clustering key")
+                .with_storage(Arc::clone(&storage)),
+        )
+        .expect("create clustered vector supertable");
+
+        // One key-sorted input superfile per call, on the table's own
+        // builder options; `rows` are global category indexes and double
+        // as the one-hot dim and the row id.
+        let build_input = |rows: &[usize]| -> Arc<SuperfileReader> {
+            let options = &st.inner().options;
+            let mut builder =
+                SuperfileBuilder::new(options.builder_options()).expect("input builder");
+            let cats: Vec<&str> = rows.iter().map(|&i| categories[i]).collect();
+            let mut flat = vec![0.0f32; rows.len() * DIM];
+            for (chunk, &i) in flat.chunks_mut(DIM).zip(rows) {
+                chunk[i] = 1.0;
+            }
+            let batch = RecordBatch::try_new(
+                options.scalar_schema(),
+                vec![
+                    Arc::new(decimal128_ids(rows.iter().map(|&i| i as u64))) as ArrayRef,
+                    Arc::new(LargeStringArray::from(cats)),
+                ],
+            )
+            .expect("input batch");
+            builder.add_batch(&batch, &[&flat]).expect("add batch");
+            let bytes = Bytes::from(builder.finish().expect("finish input"));
+            Arc::new(SuperfileReader::open(bytes).expect("open input"))
+        };
+        // Sorted within each input, interleaved across them, so the
+        // merge really permutes rows between the two runs.
+        let readers = vec![
+            (build_input(&[0, 2, 4, 6]), None),
+            (build_input(&[1, 3, 5, 7]), None),
+        ];
+
+        let report = streaming_clustered_merge(
+            st.inner(),
+            readers,
+            1,
+            Uuid::new_v4(),
+            STREAMING_MERGE_CEILING,
+        )
+        .await
+        .expect("streaming clustered merge");
+        let total_rows: u64 = report.prepared.iter().map(|p| p.entry.n_docs).sum();
+        assert_eq!(total_rows, categories.len() as u64);
+        let merged = report
+            .prepared
+            .first()
+            .expect("at least one merged superfile");
+        assert!(merged.storage_prewritten);
+
+        let reader = open_streamed_output(&storage, merged).await;
+        let batch = reader.get_record_batch(None).expect("decode rows");
+        let cats = batch
+            .column_by_name("category")
+            .expect("category column")
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("category is LargeUtf8");
+        let vectors = reader
+            .vec()
+            .expect("vector section survives the merge")
+            .get_vectors_fp32("emb")
+            .expect("decode merged vectors");
+        assert_eq!(batch.num_rows(), categories.len());
+        assert_eq!(vectors.len(), categories.len());
+        for (row, expected) in categories.iter().enumerate() {
+            assert_eq!(cats.value(row), *expected, "rows must be key-sorted");
+            let mut want = vec![0.0f32; DIM];
+            want[row] = 1.0;
+            assert_eq!(
+                vectors[row], want,
+                "row {row}'s vector must stay aligned with its scalar row"
+            );
+        }
+    }
+
+    /// Route predicates: the threshold engages strictly past the ceiling,
+    /// and availability requires storage plus a non-sq8 vector surface.
+    #[test]
+    fn streaming_route_predicates() {
+        assert!(!clustered_merge_needs_streaming(10, 30));
+        assert!(clustered_merge_needs_streaming(11, 30));
+        assert!(
+            !clustered_merge_needs_streaming(u64::MAX, u64::MAX),
+            "saturating reserve never exceeds an unbounded ceiling"
+        );
+
+        let no_storage = default_supertable_options();
+        assert!(!clustered_streaming_available(&no_storage));
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let with_storage = default_supertable_options().with_storage(Arc::clone(&storage));
+        assert!(clustered_streaming_available(&with_storage));
+
+        // sq8-family rerank codecs byte-splice their merges: no streaming.
+        let mut sq8 = default_vector_config("emb", 0);
+        sq8.rerank_codec = RerankCodec::Sq8Residual;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let sq8_options = SupertableOptions::new(schema, vec![], vec![sq8], None)
+            .expect("valid sq8 options")
+            .with_storage(storage);
+        assert!(!clustered_streaming_available(&sq8_options));
     }
 
     // ---- coalesce_clustered_jobs / clustered_output_count ------------

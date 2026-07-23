@@ -33,8 +33,8 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-            RowSelector,
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+            ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
         },
         async_reader::MetadataFetch,
         parquet_to_arrow_schema,
@@ -625,6 +625,33 @@ impl SuperfileReader {
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch, ReadError> {
+        let reader = self.live_batch_reader(deleted_docs_bitmap, None)?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let record_batch = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+        Ok(record_batch)
+    }
+
+    /// Batch-iterator form of [`get_record_batch`]: the same
+    /// tombstone-filtered decode, yielded as bounded record batches in
+    /// ascending file row order instead of one concatenated batch, so a
+    /// consumer can stream a superfile's live rows without holding them
+    /// all decoded at once. `batch_size` caps the rows per yielded batch
+    /// (`None` keeps the parquet reader's default); a batch never spans a
+    /// row-group boundary, so its decoded size is also bounded by
+    /// [`max_row_group_uncompressed_bytes`].
+    ///
+    /// [`get_record_batch`]: SuperfileReader::get_record_batch
+    /// [`max_row_group_uncompressed_bytes`]: SuperfileReader::max_row_group_uncompressed_bytes
+    pub(crate) fn live_batch_reader(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        batch_size: Option<usize>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -654,17 +681,32 @@ impl SuperfileReader {
                 builder = builder.with_row_selection(selection);
             }
         }
-        let reader = builder
+        if let Some(batch_size) = batch_size {
+            builder = builder.with_batch_size(batch_size);
+        }
+        builder
             .build()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let read_schema = reader.schema();
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let record_batch = concat_batches(&read_schema, &batches)
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+            .map_err(|e| ReadError::Columnar(e.to_string()))
+    }
 
-        Ok(record_batch)
+    /// Upper bound on the decoded payload of any single batch a
+    /// [`live_batch_reader`] can yield: parquet batches never span row
+    /// groups, so no batch decodes more scalar bytes than the largest
+    /// row group's uncompressed size.
+    ///
+    /// [`live_batch_reader`]: SuperfileReader::live_batch_reader
+    pub(crate) fn max_row_group_uncompressed_bytes(&self) -> Result<u64, ReadError> {
+        let arrow_meta = self
+            .arrow_meta
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?;
+        Ok(arrow_meta
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| rg.total_byte_size().max(0) as u64)
+            .max()
+            .unwrap_or(0))
     }
 
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of

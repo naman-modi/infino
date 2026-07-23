@@ -1235,18 +1235,15 @@ impl SuperfileBuilder {
     }
 }
 
-/// Materialize one merge input: the reader's record batch with tombstoned
-/// rows dropped, plus each configured vector column's surviving rows as one
-/// flat f32 run (row-aligned with the batch). Validates the reader against
-/// `opts` exactly like [`SuperfileBuilder::add_batch_from_reader`], which is
-/// built on this — callers that must reorder rows across inputs before
-/// adding them (the clustered compaction merge) share the same
-/// materialization and validation.
-pub(crate) fn merge_rows_from_reader(
+/// Validate one merge input against the builder options: same id
+/// column, schema, FTS columns, and vector column names/dims. Shared
+/// by the materializing merge ([`merge_rows_from_reader`]) and the
+/// streaming clustered merge, so both routes accept exactly the same
+/// inputs.
+pub(crate) fn check_merge_input(
     opts: &BuilderOptions,
     reader: &SuperfileReader,
-    deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
-) -> Result<(RecordBatch, Vec<Vec<f32>>), BuildError> {
+) -> Result<(), BuildError> {
     opts.check_mergeability(
         reader.id_column(),
         reader.schema(),
@@ -1255,12 +1252,6 @@ pub(crate) fn merge_rows_from_reader(
             .vec()
             .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
     )?;
-    let record_batch = reader
-        .get_record_batch(deleted_docs_bitmap.clone())
-        .map_err(|_| BuildError::BatchReadError)?;
-
-    let num_rows = record_batch.num_rows();
-    let mut vectors: Vec<Vec<f32>> = Vec::new();
     if let Some(v) = reader.vec() {
         let reader_columns: Vec<_> = v.vector_columns_config().collect();
 
@@ -1276,7 +1267,6 @@ pub(crate) fn merge_rows_from_reader(
                 actual: reader_columns.len(),
             });
         }
-
         for (reader_col, builder_col) in reader_columns.iter().zip(&opts.vector_columns) {
             if reader_col.name != builder_col.column || reader_col.dim != builder_col.dim {
                 return Err(BuildError::VectorDimMismatch {
@@ -1285,7 +1275,33 @@ pub(crate) fn merge_rows_from_reader(
                     actual: reader_col.dim,
                 });
             }
+        }
+    }
+    Ok(())
+}
 
+/// Materialize one merge input: the reader's record batch with tombstoned
+/// rows dropped, plus each configured vector column's surviving rows as one
+/// flat f32 run (row-aligned with the batch). Validates the reader against
+/// `opts` exactly like [`SuperfileBuilder::add_batch_from_reader`], which is
+/// built on this — callers that must reorder rows across inputs before
+/// adding them (the clustered compaction merge) share the same
+/// materialization and validation.
+pub(crate) fn merge_rows_from_reader(
+    opts: &BuilderOptions,
+    reader: &SuperfileReader,
+    deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+) -> Result<(RecordBatch, Vec<Vec<f32>>), BuildError> {
+    check_merge_input(opts, reader)?;
+    let record_batch = reader
+        .get_record_batch(deleted_docs_bitmap.clone())
+        .map_err(|_| BuildError::BatchReadError)?;
+
+    let num_rows = record_batch.num_rows();
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    if let Some(v) = reader.vec() {
+        let reader_columns: Vec<_> = v.vector_columns_config().collect();
+        for (reader_col, builder_col) in reader_columns.iter().zip(&opts.vector_columns) {
             let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
             let result = v
                 .get_vectors_for_merge(&reader_col.name)

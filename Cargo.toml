@@ -146,7 +146,10 @@ serde_json = "1"
 # and XXH3 is significantly faster than SipHash on the miss path
 # where hash cost dominates.
 arc-swap = "1"
-uuid = { version = "1", features = ["v4"] }
+# `v5` (name-based, SHA-1 via the vendored `sha1_smol`) derives the
+# streaming clustered merge's deterministic output ids from the
+# compaction id + output index.
+uuid = { version = "1", features = ["v4", "v5"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 num_cpus = "1"
 

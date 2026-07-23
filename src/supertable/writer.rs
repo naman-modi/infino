@@ -2062,6 +2062,13 @@ impl ShardOutput {
             scalar_stats,
         }
     }
+
+    /// The shard's serialized superfile bytes. The streaming clustered
+    /// merge reopens intermediate cascade outputs from these bytes
+    /// without going through the publish path.
+    pub(crate) fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
 }
 
 /// Reserve the build's estimated transient heap:
@@ -2526,6 +2533,12 @@ pub(crate) struct PreparedSuperfile {
     pub(crate) bytes_for_store: Option<(SuperfileUri, Bytes)>,
     pub(crate) bytes_for_storage: Option<(SuperfileUri, Bytes)>,
     pub(crate) bytes_for_cache: Option<(SuperfileUri, Bytes)>,
+    /// `true` when the producing merge already uploaded the bytes to
+    /// durable storage (the streaming clustered merge publishes each
+    /// output as it is cut, then drops the bytes). The compaction
+    /// commit skips its own storage write for such entries; every
+    /// other producer leaves this `false`.
+    pub(crate) storage_prewritten: bool,
 }
 
 impl PreparedSuperfile {
@@ -2704,6 +2717,7 @@ pub(super) fn prepare_superfile_with_uri(
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
         bytes_for_storage: bytes_for_storage.map(|b| (uri, b)),
         bytes_for_cache: bytes_for_cache.map(|b| (uri, b)),
+        storage_prewritten: false,
     }))
 }
 
@@ -2815,6 +2829,7 @@ fn prepare_user_superfile_batch_in_scope(
                         bytes_for_store: p.bytes_for_store,
                         bytes_for_storage: p.bytes_for_storage,
                         bytes_for_cache: p.bytes_for_cache,
+                        storage_prewritten: p.storage_prewritten,
                     }),
                 )
             }
@@ -5027,6 +5042,7 @@ fn build_prepared_from_packed_cells(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+        storage_prewritten: prepared.storage_prewritten,
     })
 }
 
@@ -5132,6 +5148,7 @@ fn build_prepared_from_spilled_cells(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+        storage_prewritten: prepared.storage_prewritten,
     })
 }
 
@@ -6225,7 +6242,7 @@ pub async fn write_superfile_list(
     .await
 }
 
-async fn put_new_superfile_bytes(
+pub(super) async fn put_new_superfile_bytes(
     storage: &Arc<dyn StorageProvider>,
     multipart_threshold: u64,
     uri: SuperfileUri,

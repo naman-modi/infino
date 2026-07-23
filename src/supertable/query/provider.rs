@@ -195,8 +195,10 @@ const PUSHDOWN_MAX_DENSITY: f64 = 0.5;
 /// scan-side ordering declaration must match that physical order
 /// exactly. Declaring an order the bytes don't have makes
 /// order-dependent operators (sorted aggregation, merges) silently
-/// wrong — a correctness bug, not a slowdown.
-const CLUSTER_KEY_SORT: SortOptions = SortOptions {
+/// wrong — a correctness bug, not a slowdown. The compaction layer's
+/// streaming clustered merge shares this constant so merge-time and
+/// scan-time ordering can never drift apart.
+pub(crate) const CLUSTER_KEY_SORT: SortOptions = SortOptions {
     descending: false,
     nulls_first: false,
 };
