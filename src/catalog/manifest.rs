@@ -56,6 +56,10 @@ pub(crate) struct TableEntry {
     pub(crate) fts: Vec<String>,
     /// Vector-indexed columns.
     pub(crate) vectors: Vec<VectorEntry>,
+    /// Columns with a per-superfile grouped-COUNT(*) rollup. Defaulted so
+    /// catalogs written before rollups existed deserialize cleanly.
+    #[serde(default)]
+    pub(crate) rollup_count_by: Vec<String>,
     /// Creation time, seconds since the Unix epoch.
     pub(crate) created_at_unix: u64,
 }
@@ -173,6 +177,7 @@ mod tests {
                 n_cent: 4,
                 metric: "cosine".into(),
             }],
+            rollup_count_by: Vec::new(),
             created_at_unix: 0,
         }
     }

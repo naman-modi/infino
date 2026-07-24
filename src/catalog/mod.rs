@@ -245,6 +245,7 @@ impl Connection {
                     fts_cfg,
                     vec_cfg,
                     tokenizer,
+                    indexes.rollup_count_columns(),
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -292,6 +293,7 @@ impl Connection {
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns().to_vec(),
                     vectors,
+                    rollup_count_by: indexes.rollup_count_columns().to_vec(),
                     created_at_unix: now_unix(),
                 };
 
@@ -313,6 +315,7 @@ impl Connection {
                     fts_cfg,
                     vec_cfg,
                     tokenizer,
+                    indexes.rollup_count_columns(),
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -429,6 +432,9 @@ impl Connection {
                             .map_err(|e| e.with_context("open_table", Some(name)))?,
                     );
                 }
+                for column in &entry.rollup_count_by {
+                    spec = spec.rollup_count_by(column.clone());
+                }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
                 let tokenizer = table_tokenizer(&spec);
 
@@ -449,6 +455,7 @@ impl Connection {
                     fts_cfg,
                     vec_cfg,
                     tokenizer,
+                    &entry.rollup_count_by,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -700,10 +707,14 @@ fn build_options(
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    rollup_count_by: &[String],
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
     let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
+    if !rollup_count_by.is_empty() {
+        opts = opts.with_rollup_count_by(rollup_count_by.iter().cloned());
+    }
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }

@@ -47,12 +47,13 @@
 
 use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
-use arrow_array::ArrayRef;
-use arrow_schema::DataType;
+use arrow::compute::cast as cast_array;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::{
     catalog::TableProvider,
     common::{ScalarValue, tree_node::Transformed},
-    datasource::{DefaultTableSource, provider_as_source},
+    datasource::{DefaultTableSource, MemTable, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
@@ -135,6 +136,13 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
     if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg)? {
+        return Ok(Some(rewritten));
+    }
+    // High-cardinality sibling of the value-counts path: when the manifest
+    // has no capped value counts for the key but every superfile carries a
+    // grouped-count rollup blob (primed before planning), answer from the
+    // merged blobs instead of scanning the base rows.
+    if let Some(rewritten) = rewrite_grouped_count_from_rollup(agg)? {
         return Ok(Some(rewritten));
     }
     if !agg.group_expr.is_empty() {
@@ -411,6 +419,90 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
             .project(aliases)?
             .alias(scan.table_name.clone())?
             .build()?,
+    ))
+}
+
+/// The high-cardinality grouped-COUNT(*) rewrite: identical output shape
+/// to [`rewrite_grouped_count_from_value_counts`], but sourced from the
+/// per-superfile rollup blobs (merged into one `GroupedCount` by the
+/// provider's pre-planning prime pass) instead of the manifest's capped
+/// value counts. Fires only for `GROUP BY key, COUNT(*)` over an
+/// unfiltered, unrestricted, complete, clean snapshot whose `key` has no
+/// nulls in any superfile and a primed rollup for every superfile.
+/// Declines (→ base scan, always correct) on any unmet precondition.
+fn rewrite_grouped_count_from_rollup(aggregate: &Aggregate) -> DfResult<Option<LogicalPlan>> {
+    let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
+        return Ok(None);
+    };
+    let Some(kinds) = parse_aggregates(&aggregate.aggr_expr) else {
+        return Ok(None);
+    };
+    if !matches!(kinds.as_slice(), [AggKind::CountStar]) {
+        return Ok(None);
+    }
+    let Some(scan) = peel_unfiltered_scan(aggregate.input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(provider) = provider_of(scan) else {
+        return Ok(None);
+    };
+    if provider.is_segment_restricted() {
+        return Ok(None);
+    }
+    let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+        return Ok(None);
+    };
+    // The rollup blob counts only non-null rows; a group key with nulls
+    // would need a NULL-key group the blob can't supply. Require every
+    // superfile clean (no tombstones skew the counts) and null-free on the
+    // key — the same soundness gate the value-counts path uses.
+    if !superfiles.iter().all(|entry| {
+        provider.entry_is_clean(entry)
+            && entry
+                .scalar_stats
+                .get(&group_column.name)
+                .is_some_and(|stats| stats.null_count == Some(0))
+    }) {
+        return Ok(None);
+    }
+
+    let Some(merged) = provider.merged_rollup(&group_column.name) else {
+        return Ok(None);
+    };
+    if merged.is_empty() {
+        return Ok(None);
+    }
+    // The merged partial is ALREADY the final grouped COUNT(*), so answer
+    // from a scan of those pre-grouped rows rather than re-aggregating the
+    // base table. Back it with an in-memory table, NOT a Values relation: a
+    // high-cardinality key is millions of rows, which as literal expressions
+    // would explode the logical plan (planning time + memory). The parent
+    // ORDER BY / LIMIT rides on top of the scan unchanged.
+    let Some(batch) = merged.to_record_batch(&group_column.name) else {
+        return Ok(None);
+    };
+    // Cast (key, __rollup_count) to the aggregate's output column types so
+    // the scan's schema matches what the parent plan expects.
+    let target: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if batch.num_columns() != target.fields().len() {
+        return Ok(None);
+    }
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
+    for (index, field) in target.fields().iter().enumerate() {
+        columns.push(
+            cast_array(batch.column(index), field.data_type()).map_err(DataFusionError::from)?,
+        );
+    }
+    let out_batch =
+        RecordBatch::try_new(Arc::clone(&target), columns).map_err(DataFusionError::from)?;
+    let table = MemTable::try_new(target, vec![vec![out_batch]])?;
+    Ok(Some(
+        LogicalPlanBuilder::scan(
+            scan.table_name.clone(),
+            provider_as_source(Arc::new(table)),
+            None,
+        )?
+        .build()?,
     ))
 }
 

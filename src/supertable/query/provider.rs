@@ -111,6 +111,7 @@ use crate::{
             candidate::CandidatePlan,
             df_object_store::SuperfileObjectStore,
             prune::{PruneLeaf, select_superfiles},
+            rollup::GroupedCount,
             skip::{ScalarOp, ScalarPredicate},
             superfile_reader::superfile_reader,
         },
@@ -224,6 +225,14 @@ pub(crate) struct SupertableProvider {
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
+    /// Uncapped table-level grouped-COUNT(*) rollups, merged from each
+    /// superfile's embedded rollup blob. Populated asynchronously by
+    /// [`prime_rollup`](Self::prime_rollup) before planning (blob reads
+    /// are I/O) and read synchronously by the aggregate rewrite via
+    /// [`merged_rollup`](Self::merged_rollup). A cached `None` means the
+    /// rollup can't answer (a superfile lacks the blob) — the rewrite
+    /// then declines and the base scan runs.
+    rollup_counts: Arc<DashMap<String, Option<Arc<GroupedCount>>>>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -293,6 +302,7 @@ impl SupertableProvider {
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_metas: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
+            rollup_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -313,6 +323,7 @@ impl SupertableProvider {
         restricted.scan_store = Arc::clone(&self.scan_store);
         restricted.scan_metas = Arc::clone(&self.scan_metas);
         restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
+        restricted.rollup_counts = Arc::clone(&self.rollup_counts);
         restricted
     }
 
@@ -363,6 +374,46 @@ impl SupertableProvider {
         self.scalar_value_counts
             .insert(column.to_string(), merged.clone());
         merged
+    }
+
+    /// Merge every complete superfile's embedded grouped-COUNT(*) rollup
+    /// for `column` into one table-level partial, caching the result for
+    /// the sync rewrite to read via [`merged_rollup`](Self::merged_rollup).
+    ///
+    /// Reads blobs (I/O), so it runs before planning. Caches `None` — the
+    /// rewrite then declines to the scan — when `column` isn't the
+    /// declared rollup key, the flat view isn't complete, or ANY superfile
+    /// lacks (or fails to decode) the rollup blob. Cleanliness and null
+    /// handling are the rewrite's job; this only assembles the counts.
+    pub(crate) async fn prime_rollup(&self, column: &str) {
+        if self.rollup_counts.contains_key(column) {
+            return;
+        }
+        let merged = self.compute_rollup(column).await;
+        self.rollup_counts.insert(column.to_string(), merged);
+    }
+
+    async fn compute_rollup(&self, column: &str) -> Option<Arc<GroupedCount>> {
+        if self.manifest.options.single_rollup_count_column() != Some(column) {
+            return None;
+        }
+        let superfiles = self.manifest.complete_flat_superfiles()?;
+        let mut parts: Vec<GroupedCount> = Vec::with_capacity(superfiles.len());
+        for entry in superfiles {
+            let prepared = self.prepared_scan_file(entry).await.ok()?;
+            // A clean, complete superfile with a declared rollup key always
+            // carries the blob; a missing/corrupt one disqualifies the whole
+            // rollup path (partial counts would be wrong).
+            parts.push(prepared.reader.grouped_count(column)?);
+        }
+        GroupedCount::merge(parts).map(Arc::new)
+    }
+
+    /// The primed table-level rollup for `column`, or `None` when it was
+    /// never primed or can't answer. Sync: read from the cache the
+    /// [`prime_rollup`](Self::prime_rollup) pass filled before planning.
+    pub(crate) fn merged_rollup(&self, column: &str) -> Option<Arc<GroupedCount>> {
+        self.rollup_counts.get(column)?.value().clone()
     }
 
     /// Lower scalar predicates to prune leaves. Each predicate yields a

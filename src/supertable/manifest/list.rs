@@ -472,87 +472,7 @@ pub(crate) struct ScalarValueCounts {
 
 impl ScalarValueCounts {
     fn from_column(column: &ArrayRef) -> Option<Self> {
-        if !exact_value_counts_type(column.data_type()) {
-            return None;
-        }
-        match column.data_type() {
-            DataType::Int64 => {
-                let array = column.as_any().downcast_ref::<Int64Array>()?;
-                return Self::from_int64(array);
-            }
-            DataType::Utf8 => {
-                let array = column.as_any().downcast_ref::<StringArray>()?;
-                return Self::from_strings(
-                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
-                    ScalarValue::Utf8,
-                );
-            }
-            DataType::LargeUtf8 => {
-                let array = column.as_any().downcast_ref::<LargeStringArray>()?;
-                return Self::from_strings(
-                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
-                    ScalarValue::LargeUtf8,
-                );
-            }
-            _ => {}
-        }
-        let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
-        for row in 0..column.len() {
-            if column.is_null(row) {
-                continue;
-            }
-            let value = ScalarValue::try_from_array(column, row).ok()?;
-            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
-            let count = counts.entry(value).or_default();
-            *count = count.checked_add(1)?;
-        }
-        Self::from_entries(counts.into_iter().collect())
-    }
-
-    fn from_int64(column: &Int64Array) -> Option<Self> {
-        let mut counts: HashMap<i64, u64> = HashMap::new();
-        for row in 0..column.len() {
-            if column.is_null(row) {
-                continue;
-            }
-            let value = column.value(row);
-            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
-            let count = counts.entry(value).or_default();
-            *count = count.checked_add(1)?;
-        }
-        Self::from_entries(
-            counts
-                .into_iter()
-                .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
-                .collect(),
-        )
-    }
-
-    fn from_strings<'a>(
-        values: impl IntoIterator<Item = Option<&'a str>>,
-        wrap: fn(Option<String>) -> ScalarValue,
-    ) -> Option<Self> {
-        let mut counts: HashMap<String, u64> = HashMap::new();
-        for value in values.into_iter().flatten() {
-            if let Some(count) = counts.get_mut(value) {
-                *count = count.checked_add(1)?;
-                continue;
-            }
-            if counts.len() >= MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
-            counts.insert(value.to_string(), 1);
-        }
-        Self::from_entries(
-            counts
-                .into_iter()
-                .map(|(value, count)| (wrap(Some(value)), count))
-                .collect(),
-        )
+        Self::from_entries(count_values_by(column, Some(MAX_EXACT_VALUE_COUNTS))?)
     }
 
     pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
@@ -597,6 +517,103 @@ impl ScalarValueCounts {
     pub(crate) fn entries(&self) -> &[(ScalarValue, u64)] {
         &self.entries
     }
+}
+
+/// Exact per-value counts over the non-null rows of `column`, or `None`
+/// when the column type is unsupported or (with `cap = Some(n)`) more than
+/// `n` distinct values appear. The single counting authority: the capped
+/// manifest stat [`ScalarValueCounts`] passes `Some(MAX_EXACT_VALUE_COUNTS)`,
+/// and the uncapped rollup partial (`query::rollup::GroupedCount`) passes
+/// `None`. Entries are unsorted; callers order them.
+pub(crate) fn count_values_by(
+    column: &ArrayRef,
+    cap: Option<usize>,
+) -> Option<Vec<(ScalarValue, u64)>> {
+    if !exact_value_counts_type(column.data_type()) {
+        return None;
+    }
+    // A fresh distinct value is admissible only while strictly under the cap.
+    let room_for_new = |seen: usize| cap.is_none_or(|limit| seen < limit);
+    match column.data_type() {
+        DataType::Int64 => {
+            let array = column.as_any().downcast_ref::<Int64Array>()?;
+            let mut counts: HashMap<i64, u64> = HashMap::new();
+            for row in 0..array.len() {
+                if array.is_null(row) {
+                    continue;
+                }
+                let value = array.value(row);
+                if !counts.contains_key(&value) && !room_for_new(counts.len()) {
+                    return None;
+                }
+                let count = counts.entry(value).or_default();
+                *count = count.checked_add(1)?;
+            }
+            Some(
+                counts
+                    .into_iter()
+                    .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
+                    .collect(),
+            )
+        }
+        DataType::Utf8 => {
+            let array = column.as_any().downcast_ref::<StringArray>()?;
+            count_strings(
+                (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
+                ScalarValue::Utf8,
+                cap,
+            )
+        }
+        DataType::LargeUtf8 => {
+            let array = column.as_any().downcast_ref::<LargeStringArray>()?;
+            count_strings(
+                (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
+                ScalarValue::LargeUtf8,
+                cap,
+            )
+        }
+        _ => {
+            let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
+            for row in 0..column.len() {
+                if column.is_null(row) {
+                    continue;
+                }
+                let value = ScalarValue::try_from_array(column, row).ok()?;
+                if !counts.contains_key(&value) && !room_for_new(counts.len()) {
+                    return None;
+                }
+                let count = counts.entry(value).or_default();
+                *count = count.checked_add(1)?;
+            }
+            Some(counts.into_iter().collect())
+        }
+    }
+}
+
+/// Shared string-column path for [`count_values_by`]: interns each non-null
+/// value once, then wraps into the matching `ScalarValue` variant.
+fn count_strings<'a>(
+    values: impl IntoIterator<Item = Option<&'a str>>,
+    wrap: fn(Option<String>) -> ScalarValue,
+    cap: Option<usize>,
+) -> Option<Vec<(ScalarValue, u64)>> {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for value in values.into_iter().flatten() {
+        if let Some(count) = counts.get_mut(value) {
+            *count = count.checked_add(1)?;
+            continue;
+        }
+        if cap.is_some_and(|limit| counts.len() >= limit) {
+            return None;
+        }
+        counts.insert(value.to_string(), 1);
+    }
+    Some(
+        counts
+            .into_iter()
+            .map(|(value, count)| (wrap(Some(value)), count))
+            .collect(),
+    )
 }
 
 fn exact_value_counts_type(data_type: &DataType) -> bool {

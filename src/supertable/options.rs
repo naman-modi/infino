@@ -501,6 +501,14 @@ pub struct SupertableOptions {
     /// Per-table override for the **hidden** vector-index grid's cell
     /// count. `None` → `vector.hidden_cell_count` from the YAML config.
     pub hidden_cell_count: Option<usize>,
+    /// Scalar columns to persist a per-superfile grouped-COUNT(*) rollup
+    /// for. Each committed superfile embeds a `(value, count)` rollup blob
+    /// for the declared column, letting an unfiltered
+    /// `GROUP BY col, COUNT(*)` be answered from the pre-aggregated blobs
+    /// instead of a full base scan. M1 supports exactly one column: a
+    /// declaration of more than one is treated as none (see
+    /// [`Self::single_rollup_count_column`]). Empty = no rollup.
+    pub rollup_count_by: Vec<String>,
 }
 
 impl SupertableOptions {
@@ -652,6 +660,7 @@ impl SupertableOptions {
             summary_centroids_from_superfiles: false,
             user_cell_count: None,
             hidden_cell_count: None,
+            rollup_count_by: Vec::new(),
         })
     }
 
@@ -912,6 +921,30 @@ impl SupertableOptions {
         self.user_cell_count = Some(user);
         self.hidden_cell_count = Some(hidden);
         self
+    }
+
+    /// Declare the scalar columns to persist a per-superfile
+    /// grouped-COUNT(*) rollup for. See [`Self::rollup_count_by`]. M1
+    /// honors exactly one column; a longer list disables the rollup
+    /// (the query path then falls back to a full scan, still correct).
+    pub fn with_rollup_count_by<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.rollup_count_by = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The single declared rollup key column, or `None` when zero or
+    /// (M1 limitation) more than one column is declared. This is the
+    /// column the writer builds a rollup blob for and the query rewrite
+    /// reads back.
+    pub(crate) fn single_rollup_count_column(&self) -> Option<&str> {
+        match self.rollup_count_by.as_slice() {
+            [only] => Some(only.as_str()),
+            _ => None,
+        }
     }
 
     /// Build the `SuperfileReader::open_with` options that

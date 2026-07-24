@@ -60,7 +60,7 @@ use crate::{
             reader::{self as vector_reader, VectorReader},
         },
     },
-    supertable::query::provider::tombstone_access_plan,
+    supertable::query::{provider::tombstone_access_plan, rollup::GroupedCount},
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
@@ -137,6 +137,16 @@ pub struct SuperfileReader {
     n_docs: u64,
     fts: Option<FtsReader>,
     vec: Option<VectorReader>,
+    /// Raw grouped-COUNT(*) rollup blob bytes when present
+    /// (`inf.grc.*` keys), else `None`. Decoded on demand by
+    /// [`grouped_count`](Self::grouped_count). The blob is small (one
+    /// `(value, count)` row per distinct key), so both open paths hold
+    /// it resident rather than range-fetching per query.
+    groupcount: Option<Bytes>,
+    /// The single declared rollup key column the `groupcount` blob counts
+    /// by, parsed from `inf.grc.columns`. `grouped_count` returns the blob
+    /// only when the requested column matches this.
+    groupcount_column: Option<String>,
 }
 
 struct LazyMetadataFetch {
@@ -339,6 +349,29 @@ impl SuperfileReader {
 
         let (vec, fts) = futures::try_join!(vec_fut, fts_fut)?;
 
+        // Optional grouped-COUNT(*) rollup blob. Small (one row per distinct
+        // key), so fetch it eagerly into memory on lazy open too — the
+        // query rewrite that consumes it is off the latency-critical path.
+        let (groupcount, groupcount_column) = if all_present(&kv_map, kv::GROUPCOUNT_KEYS) {
+            let off = parse_u64(&kv_map, kv::GROUPCOUNT_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::GROUPCOUNT_LENGTH)?;
+            let blob = if len == 0 {
+                Bytes::new()
+            } else {
+                source.range(off, len).await.map_err(|e| {
+                    ReadError::Footer(footer::FooterError::LazySource(e.to_string()))
+                })?
+            };
+            let column = groupcount_column_from_kv(&kv_map);
+            (Some(blob), column)
+        } else if any_present(&kv_map, kv::GROUPCOUNT_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.grc.* keys present".into(),
+            ));
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             bytes: None,
             arrow_meta: None,
@@ -350,6 +383,8 @@ impl SuperfileReader {
             n_docs,
             fts,
             vec,
+            groupcount,
+            groupcount_column,
         })
     }
 
@@ -451,6 +486,21 @@ impl SuperfileReader {
             None
         };
 
+        // 6. Optional grouped-COUNT(*) rollup blob (small; sliced resident).
+        let (groupcount, groupcount_column) = if all_present(&kv_map, kv::GROUPCOUNT_KEYS) {
+            let off = parse_u64(&kv_map, kv::GROUPCOUNT_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::GROUPCOUNT_LENGTH)?;
+            let blob = slice_or_err(&bytes, off, len, "groupcount")?;
+            let column = groupcount_column_from_kv(&kv_map);
+            (Some(blob), column)
+        } else if any_present(&kv_map, kv::GROUPCOUNT_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.grc.* keys present".into(),
+            ));
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             bytes: Some(bytes),
             parquet_meta: Arc::clone(arrow_meta.metadata()),
@@ -462,6 +512,8 @@ impl SuperfileReader {
             n_docs,
             fts,
             vec,
+            groupcount,
+            groupcount_column,
         })
     }
 
@@ -549,6 +601,20 @@ impl SuperfileReader {
     /// Underlying vector reader. `None` if this superfile has no vector index.
     pub fn vec(&self) -> Option<&VectorReader> {
         self.vec.as_ref()
+    }
+
+    /// Decode this superfile's grouped-COUNT(*) rollup for `column`, when
+    /// an embedded rollup blob is present AND its recorded key column
+    /// matches `column`. `None` when there is no rollup blob, the blob
+    /// counts by a different column, or the blob fails to decode (a
+    /// corrupt / truncated blob or CRC mismatch is surfaced as `None`, so
+    /// a caller falls back to a full scan rather than trusting bad bytes).
+    pub(crate) fn grouped_count(&self, column: &str) -> Option<GroupedCount> {
+        let blob = self.groupcount.as_ref()?;
+        if self.groupcount_column.as_deref() != Some(column) {
+            return None;
+        }
+        GroupedCount::from_blob_bytes(blob)
     }
 
     /// Pass-through to the raw Parquet bytes — the superfile is a
@@ -1497,6 +1563,15 @@ fn any_present(map: &footer::KvMap, keys: &[&str]) -> bool {
     keys.iter().any(|k| map.contains_key(*k))
 }
 
+/// Parse the single rollup key-column name out of the `inf.grc.columns`
+/// KV, whose value is a JSON string (mirrors `inf.fts.columns`). Absent
+/// or malformed JSON yields `None`, which disables rollup matching for
+/// this superfile without failing the open.
+fn groupcount_column_from_kv(map: &footer::KvMap) -> Option<String> {
+    let raw = map.get(kv::GROUPCOUNT_COLUMNS)?;
+    serde_json::from_str::<String>(raw).ok()
+}
+
 fn parse_u64(map: &footer::KvMap, key: &'static str) -> Result<u64, ReadError> {
     map.get(key)
         .ok_or(ReadError::MissingKv(key))?
@@ -1828,7 +1903,7 @@ mod tests {
             .expect("build RecordBatch");
         let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, 1024, &[])
             .expect("encode parquet body");
-        let parts = splice_index_blobs(body, &[], &[], &[]).expect("splice index blobs");
+        let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice index blobs");
         let err = SuperfileReader::open(Bytes::from(parts.bytes)).expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
     }
@@ -2370,7 +2445,7 @@ mod tests {
             .expect("build RecordBatch");
         let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, ROW_GROUP_SIZE, &[])
             .expect("encode parquet body");
-        let parts = splice_index_blobs(body, &[], &[], extra_kv).expect("splice index blobs");
+        let parts = splice_index_blobs(body, &[], &[], &[], extra_kv).expect("splice index blobs");
         Bytes::from(parts.bytes)
     }
 

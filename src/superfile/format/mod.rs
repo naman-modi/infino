@@ -412,6 +412,19 @@ pub mod kv {
     /// `inf.vec.layout = multi_cell_ivf`.
     pub const VEC_CELLS: &str = "inf.vec.cells";
 
+    /// Present iff a grouped-COUNT(*) rollup blob is embedded: byte
+    /// offset of the rollup blob.
+    pub const GROUPCOUNT_OFFSET: &str = "inf.grc.offset";
+
+    /// Present iff a grouped-COUNT(*) rollup blob is embedded: byte
+    /// length of the rollup blob.
+    pub const GROUPCOUNT_LENGTH: &str = "inf.grc.length";
+
+    /// Present iff a grouped-COUNT(*) rollup blob is embedded: JSON
+    /// string naming the single declared rollup key column the blob
+    /// counts by.
+    pub const GROUPCOUNT_COLUMNS: &str = "inf.grc.columns";
+
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
 
@@ -423,6 +436,12 @@ pub mod kv {
 
     /// All vector-related keys (presence is all-or-none).
     pub const VEC_KEYS: &[&str] = &[VEC_OFFSET, VEC_LENGTH, VEC_COLUMNS];
+
+    /// Grouped-count rollup offset + length keys (presence is
+    /// all-or-none). Mirrors [`FTS_KEYS`]; the column-name key
+    /// [`GROUPCOUNT_COLUMNS`] is written alongside but validated
+    /// separately, exactly as `FTS_COLUMNS` is for FTS.
+    pub const GROUPCOUNT_KEYS: &[&str] = &[GROUPCOUNT_OFFSET, GROUPCOUNT_LENGTH];
 
     /// All known keys (for diagnostics only).
     pub const ALL: &[&str] = &[
@@ -439,6 +458,9 @@ pub mod kv {
         VEC_COLUMNS,
         VEC_LAYOUT,
         VEC_CELLS,
+        GROUPCOUNT_OFFSET,
+        GROUPCOUNT_LENGTH,
+        GROUPCOUNT_COLUMNS,
     ];
 }
 

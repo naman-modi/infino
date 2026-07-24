@@ -261,6 +261,20 @@ impl SupertableReader {
                     df
                 }
             };
+            // Grouped-COUNT(*) rollup: when the table declares a rollup key
+            // and this plan groups by it, merge the per-superfile rollup
+            // blobs into the provider's cache *before* physical planning, so
+            // the (synchronous) aggregate rewrite can answer from the blobs
+            // instead of scanning base rows. Reading blobs is I/O, hence the
+            // pre-planning async prime; the rewrite itself stays sync. A
+            // failure to prime just leaves the rewrite declining to the scan.
+            if let Some(column) = cache_reader.options().single_rollup_count_column()
+                && plan_groups_by(df.logical_plan(), column)
+                && let Ok(tp) = ctx.table_provider(TABLE_NAME).await
+                && let Some(provider) = tp.as_ref().downcast_ref::<SupertableProvider>()
+            {
+                provider.prime_rollup(column).await;
+            }
             df.collect().await.map_err(exec_query_error)
         };
 
@@ -418,6 +432,24 @@ impl Supertable {
             .map_err(|e| QueryError::Plan(e.to_string()))?;
         Ok(reader)
     }
+}
+
+/// Does `plan` (anywhere in its tree) contain an `Aggregate` that groups
+/// by exactly `column`? Used to decide whether to prime the grouped-count
+/// rollup before planning. A false positive only wastes the prime; a
+/// false negative just leaves the rewrite declining to the base scan.
+fn plan_groups_by(plan: &LogicalPlan, column: &str) -> bool {
+    if let LogicalPlan::Aggregate(aggregate) = plan
+        && aggregate
+            .group_expr
+            .iter()
+            .any(|expr| matches!(expr, Expr::Column(c) if c.name == column))
+    {
+        return true;
+    }
+    plan.inputs()
+        .iter()
+        .any(|input| plan_groups_by(input, column))
 }
 
 /// Drain `_id`-only batches into a `Vec<i128>`. The supertable's
@@ -869,6 +901,146 @@ mod tests {
                 ("rust".to_string(), 3),
             ]
         );
+    }
+
+    fn pretty_explain(batches: &[RecordBatch]) -> String {
+        let mut out = String::new();
+        for batch in batches {
+            for col in batch.columns() {
+                if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+                    for i in 0..a.len() {
+                        out.push_str(a.value(i));
+                        out.push('\n');
+                    }
+                } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..a.len() {
+                        out.push_str(a.value(i));
+                        out.push('\n');
+                    }
+                } else if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
+                    for i in 0..a.len() {
+                        out.push_str(a.value(i));
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Extract `(category, count)` rows from a GROUP BY result, accepting
+    /// any of the string array types DataFusion may hand back.
+    fn extract_cat_counts(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let cat_col = batch.column(0);
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64");
+            let extract = |i: usize| -> String {
+                if let Some(a) = cat_col.as_any().downcast_ref::<LargeStringArray>() {
+                    a.value(i).to_string()
+                } else if let Some(a) = cat_col.as_any().downcast_ref::<StringArray>() {
+                    a.value(i).to_string()
+                } else if let Some(a) = cat_col.as_any().downcast_ref::<StringViewArray>() {
+                    a.value(i).to_string()
+                } else {
+                    panic!("unexpected category column type: {:?}", cat_col.data_type())
+                }
+            };
+            for i in 0..cat_col.len() {
+                out.push((extract(i), counts.value(i)));
+            }
+        }
+        out
+    }
+
+    /// Ingest `cats` (one row per entry, `title = "t"`) across two commits
+    /// on `options`, so the table ends with two superfiles. Every category
+    /// then appears twice total (once per commit).
+    fn seed_two_commits(options: SupertableOptions, cats: &[&str]) -> Supertable {
+        let titles = vec!["t"; cats.len()];
+        let st = Supertable::create(options).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(0, cats, &titles))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_cat_batch(0, cats, &titles))
+            .expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    /// A declared grouped-count rollup answers a high-cardinality
+    /// `GROUP BY category, COUNT(*)` (over the per-superfile rollup blobs,
+    /// merged across superfiles) identically to a plain base-scan
+    /// aggregate on the same data with no rollup declared. >256 distinct
+    /// keys keeps the manifest value-counts fast path out of play, so this
+    /// exercises the blob path specifically.
+    #[test]
+    fn query_sql_group_by_rollup_matches_scan_high_cardinality() {
+        let owned: Vec<String> = (0..HIGH_CARDINALITY_ROWS)
+            .map(|i| format!("cat-{i:05}"))
+            .collect();
+        let cats: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+        let sql =
+            "SELECT category, COUNT(*) AS n FROM supertable GROUP BY category ORDER BY category";
+        let run = |st: &Supertable| -> Vec<(String, i64)> {
+            extract_cat_counts(&st.reader().query_sql(sql).expect("group-by query"))
+        };
+
+        let with_rollup = seed_two_commits(
+            options_id_cat_title().with_rollup_count_by(["category"]),
+            &cats,
+        );
+        let without_rollup = seed_two_commits(options_id_cat_title(), &cats);
+
+        let got_with = run(&with_rollup);
+        let got_without = run(&without_rollup);
+
+        // Rollup path result equals the base-scan path result exactly.
+        assert_eq!(got_with, got_without);
+
+        // Confirm the rollup rewrite actually fires: the WITH plan answers
+        // from the pre-grouped in-memory rollup (a MemTable scan, shown as
+        // `DataSourceExec` with `partition_sizes=`), with NO Parquet body
+        // scan and NO `AggregateExec` (the grouping was precomputed in the
+        // blobs and merged, not recomputed). The WITHOUT plan does a real
+        // aggregate over a Parquet scan. This guards Layer 5 against
+        // silently regressing to the (still-correct) base-scan path, and
+        // pins the scalable emission (a scan, NOT a millions-of-rows Values
+        // relation).
+        let explain_with = pretty_explain(
+            &with_rollup
+                .reader()
+                .query_sql(&format!("EXPLAIN {sql}"))
+                .expect("explain with"),
+        );
+        assert!(
+            explain_with.contains("partition_sizes=")
+                && !explain_with.contains("file_type=parquet")
+                && !explain_with.contains("AggregateExec"),
+            "rollup query should answer from the pre-grouped in-memory rollup \
+             (MemTable scan, no Parquet scan, no AggregateExec):\n{explain_with}"
+        );
+        let explain_without = pretty_explain(
+            &without_rollup
+                .reader()
+                .query_sql(&format!("EXPLAIN {sql}"))
+                .expect("explain without"),
+        );
+        assert!(
+            explain_without.contains("file_type=parquet"),
+            "no-rollup query should scan Parquet:\n{explain_without}"
+        );
+
+        // And both equal the hand oracle: each category appears twice
+        // (once per commit), in category order.
+        let oracle: Vec<(String, i64)> = owned.iter().map(|c| (c.clone(), 2)).collect();
+        assert_eq!(got_with, oracle);
     }
 
     // ---- Utf8View scan ----------------------------------------------------

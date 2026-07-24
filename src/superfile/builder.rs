@@ -464,6 +464,14 @@ pub struct SuperfileBuilder {
     /// Running local doc-id counter, increments with every row in
     /// every `add_batch`.
     next_local_doc_id: u32,
+    /// Optional pre-serialized grouped-COUNT(*) rollup blob and the JSON
+    /// naming its single key column, set by the supertable writer via
+    /// [`Self::set_rollup_count_blob`] before `finish`. When present and
+    /// non-empty, `finish` splices it as the superfile's rollup blob and
+    /// records `inf.grc.columns`. The bytes are opaque here — the
+    /// supertable layer owns the `(value, count)` encoding — so the
+    /// single-file format stays independent of the table layer.
+    rollup_blob: Option<(String, Vec<u8>)>,
 }
 
 impl SuperfileBuilder {
@@ -579,7 +587,20 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell: None,
             next_local_doc_id: 0,
+            rollup_blob: None,
         })
+    }
+
+    /// Attach a pre-serialized grouped-COUNT(*) rollup blob and the JSON
+    /// naming its single key column. Called by the supertable writer once,
+    /// before `finish`, when the table declares a rollup key. An empty
+    /// `blob` is treated as no rollup. See [`Self::rollup_blob`].
+    pub(crate) fn set_rollup_count_blob(&mut self, columns_json: String, blob: Vec<u8>) {
+        if blob.is_empty() {
+            self.rollup_blob = None;
+        } else {
+            self.rollup_blob = Some((columns_json, blob));
+        }
     }
 
     /// Override the FTS builder's in-RAM spill threshold (forwarded
@@ -1155,7 +1176,19 @@ impl SuperfileBuilder {
         let cell_ids: Option<Vec<u32>> = prebuilt_multi_cell
             .as_ref()
             .map(|cells| cells.iter().map(|(id, _)| *id).collect());
-        let kvs = superfile_kvs(&self.opts, n_docs, cell_ids.as_deref())?;
+        let mut kvs = superfile_kvs(&self.opts, n_docs, cell_ids.as_deref())?;
+
+        // Optional grouped-COUNT(*) rollup blob (supertable-supplied,
+        // opaque bytes). When present, record the key column it counts by
+        // so the reader can match a query's GROUP BY column to it.
+        let rollup_blob = self.rollup_blob.take();
+        let grc_blob: &[u8] = match &rollup_blob {
+            Some((columns_json, blob)) => {
+                kvs.push((kv::GROUPCOUNT_COLUMNS.into(), columns_json.clone()));
+                blob.as_slice()
+            }
+            None => &[],
+        };
 
         // A superfile has three independent build outputs: the scalar /
         // relational Parquet body (the SQL-queryable columns), the FTS
@@ -1209,7 +1242,7 @@ impl SuperfileBuilder {
             (body, fts_blob, vec_blob)
         };
 
-        let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
+        let parts = splice_index_blobs(body, &fts_blob, &vec_blob, grc_blob, &kvs)?;
         Ok(parts.bytes)
     }
 
@@ -1280,6 +1313,9 @@ impl SuperfileBuilder {
             0,
             BufReader::new(vector_file),
             vector_length,
+            // Compaction/drain path emits no rollup blob for M1.
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            0,
             &kvs,
             &mut output,
         )?;
@@ -1592,6 +1628,7 @@ mod tests {
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
+    use datafusion::common::ScalarValue;
     use roaring::RoaringBitmap;
 
     use super::*;
@@ -1602,6 +1639,7 @@ mod tests {
             fts::reader::BoolMode,
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
+        supertable::query::rollup::GroupedCount,
         test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
     };
 
@@ -1809,6 +1847,64 @@ mod tests {
         assert_eq!(b.next_local_doc_id, 2);
         b.add_batch(&batch, &[]).expect("add_batch");
         assert_eq!(b.next_local_doc_id, 4);
+    }
+
+    /// A superfile built with a grouped-count rollup blob attached
+    /// round-trips: `grouped_count(col)` on the reopened reader returns the
+    /// exact `(value, count)` pairs the oracle produced, and only for the
+    /// blob's own key column.
+    #[test]
+    fn grouped_count_rollup_roundtrips_through_superfile() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let ids = decimal128_ids(vec![10u64, 11, 12, 13]);
+        // Repeated `title` values so the rollup has real per-key counts.
+        let title = LargeStringArray::from(vec!["a", "b", "a", "a"]);
+        let body = LargeStringArray::from(vec!["w", "x", "y", "z"]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(title), Arc::new(body)])
+                .expect("build RecordBatch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+
+        // Compute + attach the rollup blob for `title` (mirrors the writer).
+        let oracle = GroupedCount::from_column(batch.column(1)).expect("grouped count");
+        let blob = oracle.to_blob_bytes("title").expect("blob");
+        let columns_json = serde_json::to_string("title").expect("json");
+        b.set_rollup_count_blob(columns_json, blob);
+
+        let bytes = b.finish().expect("finish builder");
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open reader");
+
+        let got = reader.grouped_count("title").expect("rollup present");
+        assert_eq!(got, oracle);
+        assert_eq!(
+            got.entries(),
+            &[
+                (ScalarValue::LargeUtf8(Some("a".into())), 3),
+                (ScalarValue::LargeUtf8(Some("b".into())), 1),
+            ]
+        );
+        // The blob only answers for its declared key column.
+        assert!(reader.grouped_count("body").is_none());
+    }
+
+    /// A superfile built WITHOUT a rollup blob carries no `inf.grc.*`
+    /// keys, opens cleanly, and `grouped_count` returns `None`.
+    #[test]
+    fn superfile_without_rollup_has_no_grouped_count() {
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+
+        let kvs = read_kv_metadata(&bytes).expect("read kv");
+        assert!(!kvs.contains_key(kv::GROUPCOUNT_OFFSET));
+        assert!(!kvs.contains_key(kv::GROUPCOUNT_LENGTH));
+        assert!(!kvs.contains_key(kv::GROUPCOUNT_COLUMNS));
+
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open reader");
+        assert!(reader.grouped_count("title").is_none());
     }
 
     #[test]

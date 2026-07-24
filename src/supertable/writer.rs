@@ -163,7 +163,9 @@ use crate::{
             options_hash,
             part::{self as part_mod, PartId},
         },
-        query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
+        query::{
+            dispatch::open_reader, rollup::GroupedCount, vector::stable_ids_by_local_for_routing,
+        },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state,
         slow_vector_state::{CentroidSection, fetch_centroid_section},
@@ -1888,6 +1890,18 @@ fn build_one_shard_with_layout(
     let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
     let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_batches);
 
+    // Grouped-COUNT(*) rollup blob for the declared rollup key column.
+    // Built here (supertable layer, alongside `GroupedCount`) over the
+    // shard's scalar batches — the same rows `finish` writes — and handed
+    // to the builder as opaque bytes. All-or-nothing: a column the counter
+    // can't type or that's missing from a batch yields no blob, so the
+    // query path falls back to a full scan.
+    if let Some(column) = options.single_rollup_count_column()
+        && let Some((columns_json, blob)) = rollup_count_blob(column, &scalar_batches)
+    {
+        builder.set_rollup_count_blob(columns_json, blob);
+    }
+
     let bytes = Bytes::from(builder.finish()?);
 
     let (id_min, id_max) = if n_docs == 0 {
@@ -1903,6 +1917,25 @@ fn build_one_shard_with_layout(
         id_max,
         scalar_stats,
     })
+}
+
+/// Build the grouped-COUNT(*) rollup blob for `column` over a shard's
+/// scalar batches: merge each batch's per-value non-null count and
+/// serialize to the self-framed blob bytes, returning `(columns_json,
+/// blob)`. Returns `None` (no blob emitted) when the column is absent
+/// from a batch, its type isn't countable, or the merge/encode fails —
+/// the whole shard then carries no rollup rather than a partial one, so
+/// the reader/query path stays sound (it falls back to a full scan).
+fn rollup_count_blob(column: &str, scalar_batches: &[&RecordBatch]) -> Option<(String, Vec<u8>)> {
+    let mut parts: Vec<GroupedCount> = Vec::with_capacity(scalar_batches.len());
+    for batch in scalar_batches {
+        let idx = batch.schema().index_of(column).ok()?;
+        parts.push(GroupedCount::from_column(batch.column(idx))?);
+    }
+    let merged = GroupedCount::merge(parts)?;
+    let blob = merged.to_blob_bytes(column)?;
+    let columns_json = serde_json::to_string(column).ok()?;
+    Some((columns_json, blob))
 }
 
 /// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`

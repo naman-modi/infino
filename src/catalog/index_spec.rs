@@ -42,6 +42,7 @@ struct VectorIndex {
 pub struct IndexSpec {
     fts: Vec<String>,
     vectors: Vec<VectorIndex>,
+    rollup_count_by: Vec<String>,
 }
 
 impl IndexSpec {
@@ -78,9 +79,26 @@ impl IndexSpec {
         self
     }
 
+    /// Declare a scalar column to persist a per-superfile
+    /// grouped-COUNT(*) rollup for. An unfiltered
+    /// `GROUP BY column, COUNT(*)` over the table is then answered from
+    /// the pre-aggregated rollup blobs instead of a full scan. The
+    /// column must exist in the schema. Currently one rollup column is
+    /// supported; declaring more disables the optimization (queries stay
+    /// correct via the scan path).
+    pub fn rollup_count_by(mut self, column: impl Into<String>) -> Self {
+        self.rollup_count_by.push(column.into());
+        self
+    }
+
     /// FTS column names, in declaration order.
     pub(crate) fn fts_columns(&self) -> &[String] {
         &self.fts
+    }
+
+    /// Declared rollup key columns, in declaration order.
+    pub(crate) fn rollup_count_columns(&self) -> &[String] {
+        &self.rollup_count_by
     }
 
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the
