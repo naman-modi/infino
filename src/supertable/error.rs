@@ -362,6 +362,10 @@ impl From<CompactionError> for OptimizeError {
             CompactionError::Commit(s) => OptimizeError::Commit(s),
             CompactionError::Refresh(s) => OptimizeError::Refresh(s),
             CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
+            // Rendered into the commit-failure variant rather than widening
+            // the public error surface: the stall is a commit-progress
+            // failure, and the message carries the full diagnosis.
+            e @ CompactionError::ConvergenceStalled { .. } => OptimizeError::Commit(e.to_string()),
         }
     }
 }
@@ -414,6 +418,24 @@ pub(crate) enum CompactionError {
     /// Another compaction is already running on this supertable handle.
     #[error("compaction already in progress on this supertable handle")]
     AlreadyCompacting,
+
+    /// A clustered compaction round ran merge jobs without shrinking the
+    /// superfile count. Every job merges at least two inputs into at most
+    /// half as many outputs, so a completed round must strictly reduce the
+    /// count; one that does not would re-select the same files forever, and
+    /// the convergence loop stops loudly instead of spinning. (A concurrent
+    /// writer committing new superfiles mid-optimize can also trip this
+    /// gate — rerun optimize once ingest quiesces.)
+    #[error(
+        "clustered compaction stalled in round {round}: {jobs_run} merge job(s) ran but the \
+         superfile count did not decrease ({files_before} before, {files_after} after)"
+    )]
+    ConvergenceStalled {
+        round: usize,
+        jobs_run: usize,
+        files_before: usize,
+        files_after: usize,
+    },
 }
 
 /// Errors raised by [`crate::supertable::Supertable::gc`].

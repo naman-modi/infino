@@ -18,7 +18,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -101,6 +104,12 @@ pub(super) struct SupertableInner {
     /// writes. Cross-process coordination happens at the sidecar-seal
     /// level.
     pub(super) compaction_outstanding: AtomicBool,
+    /// Selection→merge rounds the most recent compaction call on this
+    /// handle executed (rounds that ran at least one merge job; 0 =
+    /// never compacted, or nothing was mergeable). Diagnostic only:
+    /// written once per compaction call, read by tests proving the
+    /// clustered convergence loop actually iterated.
+    pub(super) last_compaction_rounds: AtomicUsize,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, mints
     /// `batch.num_rows()` ids, and unlocks. The
@@ -548,6 +557,16 @@ impl Supertable {
     test_visible! {
     fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
+    }
+    }
+
+    test_visible! {
+    /// Selection→merge rounds the most recent compaction call on this
+    /// handle executed (0 = never compacted, or nothing was mergeable).
+    /// Exposed only to tests proving the clustered convergence loop
+    /// iterated past a single round.
+    fn last_compaction_rounds(&self) -> usize {
+        self.inner.last_compaction_rounds.load(Ordering::Relaxed)
     }
     }
 
@@ -1325,6 +1344,7 @@ async fn build_handle(
         manifest: ArcSwap::new(manifest),
         writer_outstanding: AtomicBool::new(false),
         compaction_outstanding: AtomicBool::new(false),
+        last_compaction_rounds: AtomicUsize::new(0),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),

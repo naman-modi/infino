@@ -6,7 +6,10 @@
 //! no I/O. `supertable::compact` gathers the
 //! stats, calls [`select`], then merges each [`CompactionJob`].
 //! Compaction is single-level — a target-sized superfile is never
-//! re-compacted.
+//! re-compacted. On clustered tables one call repeats that
+//! selection→merge round until nothing mergeable remains (see
+//! [`Supertable::compact_one_table`]); still-small round outputs
+//! re-enter selection while target-sized ones stay excluded.
 
 mod streaming;
 
@@ -72,6 +75,16 @@ impl Drop for CompactionSlot<'_> {
 }
 
 const MIB: u64 = 1024 * 1024;
+
+/// Runaway backstop on the clustered convergence loop: the most
+/// selection→merge rounds one compaction call may run. Each round must
+/// strictly shrink the superfile count (enforced by the stall gate in
+/// [`Supertable::compact_one_table`]), and every job at least halves
+/// its inputs, so real convergence needs on the order of log2(files)
+/// rounds — this bound is orders of magnitude above any table a single
+/// call meets, and exists only so an unforeseen selection bug degrades
+/// to a bounded, warned stop instead of an unbounded loop.
+const MAX_CLUSTERED_COMPACTION_ROUNDS: usize = 256;
 
 /// How many multiples of the raw input size an unordered merge reserves from
 /// the connection budget: the merge still materializes every input at once,
@@ -275,7 +288,10 @@ impl Supertable {
     /// Gathers per-superfile stats from the current manifest snapshot,
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
-    /// during the merge window.
+    /// during the merge window. On a clustered table that
+    /// selection→merge round repeats until no job is selected (see
+    /// [`Supertable::compact_one_table`]); unclustered tables run
+    /// exactly one round.
     pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
         bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
     }
@@ -334,6 +350,77 @@ impl Supertable {
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
         }
 
+        // A clustered table iterates selection→merge rounds to convergence.
+        // One round packs small files into bounded jobs and runs them all,
+        // but a round's clustered outputs are cut by a row count derived
+        // from the inputs' byte size — and the global key sort makes the
+        // merged bytes compress far below that estimate, so a round's
+        // outputs can land well under the target and need further merging
+        // a single round can never give them. The loop only adds rounds:
+        // each one is exactly the single-call body (fresh manifest
+        // snapshot, fresh sidecar state, per-job seal→merge→commit→refresh
+        // under the same per-round memory ceilings), committed inputs
+        // leave the manifest so a later round cannot re-select them, and
+        // their sealed sidecars become the same gc-swept orphans a single
+        // call leaves today. Unclustered tables keep the exact
+        // single-round behavior: their one-output merges have no
+        // cross-round convergence target.
+        let clustered = !inner.options.cluster_by.is_empty();
+        let max_rounds = if clustered {
+            MAX_CLUSTERED_COMPACTION_ROUNDS
+        } else {
+            1
+        };
+        let mut rounds = 0usize;
+        for _ in 0..max_rounds {
+            let files_before = inner.manifest.load().get_all_superfiles().len();
+            let jobs_run = Self::compact_selection_round(table, cfg).await?;
+            if jobs_run == 0 {
+                break;
+            }
+            rounds += 1;
+            if !clustered {
+                break;
+            }
+            // Strict progress gate: every job merges >= 2 inputs into at
+            // most half as many outputs, so a completed round must shrink
+            // the superfile count; one that does not would re-select the
+            // same files forever. Stop loudly instead of spinning.
+            let files_after = inner.manifest.load().get_all_superfiles().len();
+            if files_after >= files_before {
+                return Err(CompactionError::ConvergenceStalled {
+                    round: rounds,
+                    jobs_run,
+                    files_before,
+                    files_after,
+                });
+            }
+        }
+        if clustered && rounds == MAX_CLUSTERED_COMPACTION_ROUNDS {
+            warn!(
+                rounds,
+                "compact: clustered convergence loop hit its round backstop; \
+                 files may remain mergeable"
+            );
+        }
+        inner
+            .last_compaction_rounds
+            .store(rounds, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// One selection→merge round: gather per-superfile stats from the
+    /// current manifest snapshot, select and (for clustered tables) fuse
+    /// jobs, then seal + merge + commit each one. Returns how many jobs it
+    /// executed — zero is the caller's convergence signal. This is the
+    /// whole body of a pre-loop compaction call; the convergence loop in
+    /// [`Supertable::compact_one_table`] repeats it verbatim.
+    async fn compact_selection_round(
+        table: &Supertable,
+        cfg: &CompactionSettings,
+    ) -> Result<usize, CompactionError> {
+        let inner = table.inner();
         let manifest = inner.manifest.load_full();
 
         // Prefetch sidecars using the cache to batch storage GETs.
@@ -429,6 +516,7 @@ impl Supertable {
         } else {
             max_memory_bytes
         };
+        let mut jobs_run = 0usize;
         for stats in &stat_groups {
             let mut jobs = select(stats, cfg);
             if clustered {
@@ -447,10 +535,11 @@ impl Supertable {
                     .refresh()
                     .await
                     .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+                jobs_run += 1;
             }
         }
 
-        Ok(())
+        Ok(jobs_run)
     }
 
     /// Merges the given superfiles.
@@ -1107,7 +1196,7 @@ mod tests {
         superfile::vector::rerank_codec::RerankCodec,
         supertable::{
             compaction::streaming::StreamingMergeReport,
-            error::CompactionError,
+            error::{CompactionError, OptimizeError},
             manifest::list::ScalarStatsAgg,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
@@ -1237,6 +1326,44 @@ mod tests {
         assert!(!jobs[0].inputs.contains(&big.superfile_id));
     }
 
+    /// Cross-round selection invariant behind the clustered convergence
+    /// loop: a round's at-target outputs are excluded outright, and
+    /// under-target outputs that cannot pack together under the target
+    /// yield no further job — so successive rounds strictly shrink the
+    /// small-file population and the loop's zero-job convergence signal
+    /// fires instead of re-merging finished outputs forever.
+    #[test]
+    fn round_outputs_shrink_the_small_file_population_to_termination() {
+        let cfg = default_cfg(); // 1 GiB target, 80% floor
+        // Round 1: twelve 200 MiB fragments pack into two 5-input jobs
+        // (two fragments left below the fill floor).
+        let fragments: Vec<_> = (0..12).map(|i| seg(i, 200, 1000, 0)).collect();
+        let jobs = select(&fragments, &cfg);
+        assert_eq!(jobs.len(), 2);
+        // Round 2 sees what round 1 leaves: one ~target output per job
+        // plus the two unpacked leftovers. An exactly-at-target output
+        // is excluded by the size filter; a just-under-target output is
+        // a candidate but cannot pair with anything under the target
+        // cap; the leftover pair stays below the fill floor.
+        let round_2 = vec![
+            seg(100, 1024, 5000, 0), // at target: excluded
+            seg(101, 1000, 5000, 0), // under target: unpairable
+            seg(10, 200, 1000, 0),
+            seg(11, 200, 1000, 0),
+        ];
+        let jobs = select(&round_2, &cfg);
+        assert!(
+            jobs.is_empty(),
+            "round 2 must select nothing — the loop's convergence signal; got {jobs:?}"
+        );
+        // Halved outputs (an over-estimated cut) DO re-merge: two 512 MiB
+        // round outputs pack to exactly one target — round 2 progress.
+        let halved = vec![seg(200, 512, 2500, 0), seg(201, 512, 2500, 0)];
+        let jobs = select(&halved, &cfg);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inputs.len(), 2);
+    }
+
     #[test]
     fn output_estimate_uses_live_bytes() {
         // 5 × 400 MiB raw, half deleted → 200 MiB live each.
@@ -1344,6 +1471,28 @@ mod tests {
         // Reset to default after emit attempt.
         assert_eq!(p.inputs.len(), 0);
         assert_eq!(p.live_bytes, 0);
+    }
+
+    /// The stall gate's error carries the full diagnosis and surfaces on
+    /// the public optimize error as a commit failure (rendered message,
+    /// no new public variant).
+    #[test]
+    fn convergence_stall_renders_and_maps_to_commit() {
+        let e = CompactionError::ConvergenceStalled {
+            round: 3,
+            jobs_run: 2,
+            files_before: 10,
+            files_after: 10,
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("round 3") && msg.contains("10 before, 10 after"),
+            "{msg}"
+        );
+        match OptimizeError::from(e) {
+            OptimizeError::Commit(s) => assert!(s.contains("stalled"), "{s}"),
+            other => panic!("stall must surface as OptimizeError::Commit, got {other:?}"),
+        }
     }
 
     // ---- run_compaction_job error arms ------------------------------

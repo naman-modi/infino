@@ -14,7 +14,10 @@ impl Supertable {
     /// Merge small or underfilled superfiles into larger ones, then run a
     /// best-effort gc sweep (orphaned superfiles/manifests + dead tombstone
     /// sidecars) and a best-effort WAL sweep (completed mutation state and
-    /// arrow sidecars). Pass [`OptimizeOptions::default`] for engine
+    /// arrow sidecars). On a clustered table the merge phase iterates
+    /// selection→merge rounds until nothing mergeable remains, so one call
+    /// converges an arbitrarily fragmented table; unclustered tables run a
+    /// single round. Pass [`OptimizeOptions::default`] for engine
     /// defaults. Requires durable storage.
     #[doc(alias = "compact")]
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
