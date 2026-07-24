@@ -851,6 +851,90 @@ fn optimize_converges_many_small_commits_in_one_call() {
     assert_same_results(&clustered, &unclustered);
 }
 
+/// Single-file commits in the multi-round fixture: enough small files
+/// past one selection round's reach that one call must iterate.
+const MULTI_ROUND_COMMITS: usize = 200;
+/// Rows per commit in the multi-round fixture.
+const MULTI_ROUND_ROWS_PER_COMMIT: usize = 800;
+/// Distinct keys, each repeating in every commit. A round's clustered
+/// outputs are cut by a row count derived from the inputs' byte size,
+/// but the global sort clumps these duplicates so the merged bytes
+/// dictionary-compress far below that estimate — the outputs land well
+/// under target and only a later round can merge them onward.
+const MULTI_ROUND_DISTINCT_KEYS: u64 = 200;
+/// Converged bound for the multi-round fixture: the merged live bytes
+/// compress to at most two 1 MiB targets.
+const MULTI_ROUND_MAX_CONVERGED: usize = 2;
+
+/// One commit of the multi-round fixture: the same duplicate-heavy key
+/// universe every commit (ranges fully interleave), scrambled order,
+/// globally unique measures.
+fn multi_round_rows(commit: usize) -> Vec<Row> {
+    (0..MULTI_ROUND_ROWS_PER_COMMIT)
+        .map(|i| {
+            let slot = (i * 389) % MULTI_ROUND_ROWS_PER_COMMIT; // coprime scramble
+            (
+                Some(incompressible_key(slot as u64 % MULTI_ROUND_DISTINCT_KEYS)),
+                Some((slot % 7) as i64),
+                (commit * MULTI_ROUND_ROWS_PER_COMMIT + slot) as i64,
+            )
+        })
+        .collect()
+}
+
+/// The field failure this pins: a bulk load's superfile trail bigger
+/// than one selection round can finish, ONE optimize call, and the
+/// table must still converge — round outputs (far below target because
+/// the key sort compresses them past their input-byte estimate) are
+/// re-selected by later rounds until nothing mergeable remains. A
+/// single selection round leaves this exact shape at 4 files, each far
+/// below target and still mergeable — the non-converged end state this
+/// test pins against.
+#[test]
+fn one_optimize_call_converges_past_a_single_selection_round() {
+    let dir = TempDir::new().expect("tempdir");
+    let commits: Vec<Vec<Row>> = (0..MULTI_ROUND_COMMITS).map(multi_round_rows).collect();
+    let clustered = table_with_commits(
+        options_with_key(&["category"], 1).with_storage(local_storage(&dir)),
+        &commits,
+    );
+    let unclustered = table_with_commits(options_with_key(&[], 1), &commits);
+
+    let before = clustered.reader().n_superfiles();
+    assert_eq!(before, MULTI_ROUND_COMMITS);
+
+    clustered
+        .optimize(&convergence_optimize_opts())
+        .expect("one optimize call");
+
+    let after = clustered.reader().n_superfiles();
+    let rounds = clustered.last_compaction_rounds();
+    eprintln!("MULTI_ROUND_EVIDENCE: before={before} after={after} rounds={rounds}");
+    assert!(
+        after <= MULTI_ROUND_MAX_CONVERGED,
+        "one optimize call must converge {before} small files to \
+         <= {MULTI_ROUND_MAX_CONVERGED}, got {after}"
+    );
+    assert!(
+        rounds > 1,
+        "this shape must exercise the convergence loop past round 1, got {rounds}"
+    );
+
+    // Disjointness proof: the ordered declaration only fires when EVERY
+    // surviving file's key range chains without overlap.
+    let sql = "SELECT category, SUM(val) FROM supertable GROUP BY category";
+    let plan = explain(&clustered, sql);
+    assert!(
+        plan.contains("output_ordering") && plan.contains("ordering_mode=Sorted"),
+        "converged table must scan on the ordered path; plan was:\n{plan}"
+    );
+
+    let rows = sorted_rows(&clustered, "SELECT COUNT(*) FROM supertable");
+    let expected_rows = (MULTI_ROUND_COMMITS * MULTI_ROUND_ROWS_PER_COMMIT).to_string();
+    assert_eq!(rows, vec![expected_rows], "no rows lost across the rounds");
+    assert_same_results(&clustered, &unclustered);
+}
+
 /// Rows per commit in the big-commit breakdown shape — same total rows
 /// as the convergence fixture packed into far fewer commits, so the
 /// per-commit sort works on a field-like larger buffer.
@@ -960,6 +1044,12 @@ fn optimize_with_tiny_ceiling_leaves_unclustered_path_unchanged() {
     assert!(
         st.reader().n_superfiles() < before,
         "unclustered optimize must still merge superfiles"
+    );
+    assert_eq!(
+        st.last_compaction_rounds(),
+        1,
+        "the convergence loop is a clustered-table concern; an unclustered \
+         optimize runs exactly one selection round"
     );
 
     let sql = "SELECT category, SUM(val) FROM supertable GROUP BY category";
