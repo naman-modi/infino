@@ -110,6 +110,15 @@ pub(super) struct SupertableInner {
     /// written once per compaction call, read by tests proving the
     /// clustered convergence loop actually iterated.
     pub(super) last_compaction_rounds: AtomicUsize,
+    /// Whether the most recent compaction call ran the clustered
+    /// final full-table disjointness pass (see
+    /// [`crate::supertable::Supertable::compact_one_table`]). Reset to
+    /// `false` at the start of every call; set only when the convergence
+    /// rounds left the surviving data superfiles range-overlapping and
+    /// the extra full-table merge fired. Diagnostic only: read by tests
+    /// proving the final pass is taken exactly when the chain is broken
+    /// and skipped when it already holds.
+    pub(super) last_compaction_final_pass: AtomicBool,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, mints
     /// `batch.num_rows()` ids, and unlocks. The
@@ -567,6 +576,40 @@ impl Supertable {
     /// iterated past a single round.
     fn last_compaction_rounds(&self) -> usize {
         self.inner.last_compaction_rounds.load(Ordering::Relaxed)
+    }
+    }
+
+    test_visible! {
+    /// Whether the most recent compaction call ran the clustered final
+    /// full-table disjointness pass. Exposed only to tests proving the
+    /// pass fires on a range-overlapping survivor set and is skipped when
+    /// the surviving ranges already chain.
+    fn last_compaction_final_pass(&self) -> bool {
+        self.inner.last_compaction_final_pass.load(Ordering::Relaxed)
+    }
+    }
+
+    test_visible! {
+    /// Whether the current live data superfiles' clustering-key ranges
+    /// form a single globally non-overlapping chain — the exact
+    /// precondition the ordered SQL scan declares its sort order under
+    /// ([`crate::supertable::manifest::cluster_range::ChainStatus::Holds`]).
+    /// `false` for an unclustered table, an overlapping survivor set, or
+    /// any file lacking usable key stats. Exposed only to tests asserting
+    /// the global chain before and after an optimize.
+    fn cluster_chain_holds(&self) -> bool {
+        let key = self.inner.options.cluster_by.clone();
+        if key.is_empty() {
+            return false;
+        }
+        let manifest = self.inner.manifest.load();
+        matches!(
+            crate::supertable::manifest::cluster_range::cluster_chain_status(
+                manifest.get_all_superfiles(),
+                &key,
+            ),
+            crate::supertable::manifest::cluster_range::ChainStatus::Holds
+        )
     }
     }
 
@@ -1345,6 +1388,7 @@ async fn build_handle(
         writer_outstanding: AtomicBool::new(false),
         compaction_outstanding: AtomicBool::new(false),
         last_compaction_rounds: AtomicUsize::new(0),
+        last_compaction_final_pass: AtomicBool::new(false),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),

@@ -24,6 +24,7 @@
 
 pub mod aggregates;
 pub mod bloom;
+pub mod cluster_range;
 pub mod commit;
 pub mod disk_cache;
 pub mod encoding;

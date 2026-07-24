@@ -107,6 +107,7 @@ use parquet::{
 };
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -119,7 +120,12 @@ use crate::{
     },
     supertable::{
         SuperfileEntry,
-        manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
+        manifest::{
+            ManifestSnapshot, add_sum_arrays,
+            cluster_range::{ClusterKeyRange, cluster_key_range, disjoint_chain_order},
+            hll::HllSketch,
+            list::ScalarValueCounts,
+        },
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::CandidatePlan,
@@ -680,12 +686,41 @@ impl SupertableProvider {
             file.statistics = Some(Arc::new(stats));
         }
 
-        let ordering = self.cluster_key_ordering(key)?;
-        let ranges: Vec<ClusterKeyRange> = entries
-            .iter()
-            .map(|entry| cluster_key_range(entry, key))
-            .collect::<Option<_>>()?;
-        let groups = ordered_scan_groups(files, &ranges, target_partitions)?;
+        // Fallback diagnostics: each refusal names the branch that
+        // declined the ordering declaration, so a field fallback to the
+        // unordered scan is attributable at `debug` level (enable via the
+        // tracing subscriber, e.g. `RUST_LOG=infino=debug`).
+        let Some(ordering) = self.cluster_key_ordering(key) else {
+            debug!(
+                target: "infino::cluster_scan",
+                "clustered scan fallback: key column missing from scan schema"
+            );
+            return None;
+        };
+        let mut ranges: Vec<ClusterKeyRange> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match cluster_key_range(entry, key) {
+                Some(r) => ranges.push(r),
+                None => {
+                    debug!(
+                        target: "infino::cluster_scan",
+                        superfile_id = %entry.superfile_id,
+                        "clustered scan fallback: no usable key range \
+                         (missing or all-null key stats)"
+                    );
+                    return None;
+                }
+            }
+        }
+        let Some(groups) = ordered_scan_groups(files, &ranges, target_partitions) else {
+            debug!(
+                target: "infino::cluster_scan",
+                files = ranges.len(),
+                "clustered scan fallback: ranges not chain-disjoint \
+                 (overlap or incomparable bounds across files)"
+            );
+            return None;
+        };
         Some((groups, ordering))
     }
 
@@ -790,71 +825,6 @@ fn scalar_min_max(
     acc
 }
 
-/// One superfile's clustering-key range, lifted from the manifest's
-/// per-column skip stats for the ordered-scan grouping decision.
-///
-/// Column-wise bounds are valid lexicographic row bounds: every row has
-/// each column inside its per-column `[min, max]`, so the tuple of
-/// minima compares `<=` every row and the tuple of maxima `>=` every
-/// non-null row. The bounds may be loose (not attained by any row),
-/// which only makes the disjointness test more conservative — a safe
-/// direction, since looseness can at worst force the unordered
-/// fallback, never a false ordering.
-struct ClusterKeyRange {
-    /// Column-wise minima, in key order. Valid even for files with
-    /// nulls in the key: nulls sort last, so the min over non-null
-    /// values still lower-bounds every row.
-    min: Vec<ScalarValue>,
-    /// Column-wise maxima, in key order. An upper bound on the
-    /// *non-null* rows only — see `may_have_nulls`.
-    max: Vec<ScalarValue>,
-    /// Whether any key column holds nulls (or its null count is
-    /// unknown). Under the writer's nulls-last order a null key sorts
-    /// after every value, i.e. beyond `max` — so a null-bearing file
-    /// is ordered only as the *last* file of its scan partition, and
-    /// [`ordered_scan_groups`] forces a partition break after it.
-    may_have_nulls: bool,
-}
-
-/// Extract `entry`'s clustering-key range from its manifest stats.
-/// `None` when any key column lacks min/max (no stat recorded, or an
-/// all-null column) — the caller then falls back to the unordered scan.
-fn cluster_key_range(entry: &SuperfileEntry, key: &[String]) -> Option<ClusterKeyRange> {
-    let mut min = Vec::with_capacity(key.len());
-    let mut max = Vec::with_capacity(key.len());
-    let mut may_have_nulls = false;
-    for column in key {
-        let agg = entry.scalar_stats.get(column)?;
-        let lo = ScalarValue::try_from_array(&agg.min, 0).ok()?;
-        let hi = ScalarValue::try_from_array(&agg.max, 0).ok()?;
-        if lo.is_null() || hi.is_null() {
-            return None;
-        }
-        may_have_nulls |= agg.null_count.is_none_or(|n| n > 0);
-        min.push(lo);
-        max.push(hi);
-    }
-    Some(ClusterKeyRange {
-        min,
-        max,
-        may_have_nulls,
-    })
-}
-
-/// Lexicographic comparison of two key-bound tuples, column by column
-/// in key order. `None` when a pair of scalars isn't comparable (e.g.
-/// mismatched stat types across superfiles) — callers treat that as
-/// "cannot prove ordered" and fall back.
-fn cmp_key_bounds(a: &[ScalarValue], b: &[ScalarValue]) -> Option<cmp::Ordering> {
-    for (x, y) in a.iter().zip(b) {
-        match x.partial_cmp(y)? {
-            cmp::Ordering::Equal => {}
-            decided => return Some(decided),
-        }
-    }
-    Some(cmp::Ordering::Equal)
-}
-
 /// Group `files` into scan partitions whose key ranges are disjoint and
 /// whose files are appended in key order, or `None` when that cannot be
 /// proven from the manifest ranges (the unordered fallback).
@@ -871,12 +841,10 @@ fn cmp_key_bounds(a: &[ScalarValue], b: &[ScalarValue]) -> Option<cmp::Ordering>
 /// ```
 ///
 /// # How
-/// 1. Sort files by `(min, max)` bound. Any incomparable pair → `None`.
-/// 2. Verify the chain: each file's max must compare `<=` the next
-///    file's min (touching bounds are fine — a duplicate key value may
-///    legitimately span a shard boundary and the concatenation is still
-///    non-decreasing). Any overlap → `None`.
-/// 3. Slice the chain into up to `target_partitions` contiguous groups.
+/// 1. Order the files into a globally non-overlapping key chain via
+///    [`disjoint_chain_order`] (the shared range-disjointness core) —
+///    `None` when the ranges overlap or aren't comparable.
+/// 2. Slice the chain into up to `target_partitions` contiguous groups.
 ///    A group break is forced *after* any file that may hold nulls in
 ///    the key: its null rows sort past its recorded max, so no file may
 ///    follow it within the same partition.
@@ -889,30 +857,7 @@ fn ordered_scan_groups(
     ranges: &[ClusterKeyRange],
     target_partitions: usize,
 ) -> Option<Vec<FileGroup>> {
-    let mut order: Vec<usize> = (0..files.len()).collect();
-    let mut comparable = true;
-    order.sort_by(|&a, &b| {
-        let decided = match cmp_key_bounds(&ranges[a].min, &ranges[b].min) {
-            Some(cmp::Ordering::Equal) => cmp_key_bounds(&ranges[a].max, &ranges[b].max),
-            decided => decided,
-        };
-        decided.unwrap_or_else(|| {
-            comparable = false;
-            cmp::Ordering::Equal
-        })
-    });
-    if !comparable {
-        return None;
-    }
-
-    // Chain check over the min-sorted order: any overlap disproves a
-    // global key order across files, so no partitioning of these files
-    // (other than trivial reshuffles) is declared ordered — fall back.
-    for pair in order.windows(2) {
-        if cmp_key_bounds(&ranges[pair[0]].max, &ranges[pair[1]].min)? == cmp::Ordering::Greater {
-            return None;
-        }
-    }
+    let order = disjoint_chain_order(ranges)?;
 
     let n_groups = cmp::max(1, cmp::min(target_partitions, files.len()));
     let per_group = files.len().div_ceil(n_groups);
@@ -1834,7 +1779,7 @@ mod tests {
         superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             Supertable, SupertableOptions,
-            manifest::{ScalarStatsAgg, SuperfileUri},
+            manifest::{ScalarStatsAgg, SuperfileUri, cluster_range::cmp_key_bounds},
         },
         test_helpers::default_tokenizer,
     };

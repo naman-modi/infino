@@ -364,8 +364,13 @@ impl From<CompactionError> for OptimizeError {
             CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
             // Rendered into the commit-failure variant rather than widening
             // the public error surface: the stall is a commit-progress
-            // failure, and the message carries the full diagnosis.
-            e @ CompactionError::ConvergenceStalled { .. } => OptimizeError::Commit(e.to_string()),
+            // failure, and the message carries the full diagnosis. The
+            // final-pass disjointness stall is the same kind of loud
+            // progress failure, so it routes the same way.
+            e @ (CompactionError::ConvergenceStalled { .. }
+            | CompactionError::GlobalDisjointnessUnmet { .. }) => {
+                OptimizeError::Commit(e.to_string())
+            }
         }
     }
 }
@@ -436,6 +441,20 @@ pub(crate) enum CompactionError {
         files_before: usize,
         files_after: usize,
     },
+
+    /// A clustered table's final full-table disjointness pass ran but the
+    /// surviving data superfiles' key ranges still do not form a single
+    /// global non-overlapping chain. One full-table re-sort cuts
+    /// contiguous, disjoint outputs by construction, so this should be
+    /// unreachable; it is surfaced loudly rather than silently leaving the
+    /// ordered scan disabled behind a converged file count. (A concurrent
+    /// writer committing new superfiles between the pass and the re-check
+    /// can also trip it — rerun optimize once ingest quiesces.)
+    #[error(
+        "clustered final disjointness pass ran but {files} surviving superfile(s) still do not \
+         form a global non-overlapping key chain"
+    )]
+    GlobalDisjointnessUnmet { files: usize },
 }
 
 /// Errors raised by [`crate::supertable::Supertable::gc`].

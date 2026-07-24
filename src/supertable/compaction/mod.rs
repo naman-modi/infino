@@ -20,7 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use arrow_array::Float32Array;
@@ -50,8 +50,13 @@ use crate::{
         build::fanout_shards_in_pool_scope,
         compaction::streaming::streaming_clustered_merge,
         error::CompactionError,
-        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
-        manifest::list::{DrainedVersionRanges, PartitionStrategy},
+        handle::{
+            SupertableInner, hidden_vector_index_compaction_settings, is_hidden_vector_index_table,
+        },
+        manifest::{
+            cluster_range::{ChainStatus, cluster_chain_status},
+            list::{DrainedVersionRanges, PartitionStrategy},
+        },
         query::dispatch::open_compaction_input,
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
@@ -124,6 +129,44 @@ fn clustered_streaming_available(options: &SupertableOptions) -> bool {
             .vector_columns
             .iter()
             .any(|vc| vc.rerank_codec.is_sq8_residual_family())
+}
+
+/// Whether a partition strategy tolerates the clustered final pass, which
+/// merges across partition boundaries into one global key order. Only
+/// strategies where an output spanning the whole table is a legal
+/// partition assignment qualify: `IngestionTime` (bucketed by commit
+/// wall-clock, not by data) and the single-bucket `Hash` default. Strict
+/// range strategies (`TimeRange`, multi-bucket `Hash`, `ColumnRange`,
+/// `VectorCell`) deliberately shard by a column, so a cross-partition
+/// output would break their contract and a global cross-partition key
+/// order is not their goal — they keep the existing scan behavior.
+fn final_pass_partition_compatible(strategy: &PartitionStrategy) -> bool {
+    matches!(
+        strategy,
+        PartitionStrategy::IngestionTime { .. }
+            | PartitionStrategy::Hash {
+                n_buckets: 0 | 1,
+                ..
+            }
+    )
+}
+
+/// Whether the convergence rounds left a survivor set the final full-table
+/// merge can repair. Only a provable overlap (`Broken`) is worth the extra
+/// rewrite: `Holds` already declares the ordered scan (single-round /
+/// single-partition tables must not pay the pass), and `Indeterminate` (a
+/// file with no usable key stats) is a fallback no merge is guaranteed to
+/// fix, so the table is left as-is rather than rewritten.
+fn needs_final_disjoint_pass(status: ChainStatus) -> bool {
+    matches!(status, ChainStatus::Broken)
+}
+
+/// Whether the final pass achieved a global chain. Only `Holds` clears it;
+/// anything else after a full-table re-sort is a loud stall surfaced as
+/// [`CompactionError::GlobalDisjointnessUnmet`] rather than a silent
+/// fallback to the unordered scan.
+fn final_pass_cleared_chain(status: ChainStatus) -> bool {
+    matches!(status, ChainStatus::Holds)
 }
 
 /// Stats for one superfile. The caller fills these in.
@@ -338,6 +381,11 @@ impl Supertable {
             Err(_) => return Err(CompactionError::AlreadyCompacting),
         }
         let _slot = CompactionSlot(&inner.compaction_outstanding);
+        // Fresh per-call: set only if the clustered final disjointness pass
+        // below actually fires (see the marker's doc on the handle).
+        inner
+            .last_compaction_final_pass
+            .store(false, Ordering::Relaxed);
 
         // Phase 1 (split-then-merge): split every over-cap cell first, from the
         // live grid, before merge-job selection. An over-cap cell is thus never
@@ -407,6 +455,128 @@ impl Supertable {
             .last_compaction_rounds
             .store(rounds, Ordering::Relaxed);
 
+        // Final global disjointness pass. The convergence rounds shrink the
+        // file COUNT but each round's merge cuts disjoint outputs only WITHIN
+        // its own job (and never across partition boundaries), so a later
+        // round's outputs can span a key range an earlier round's surviving
+        // output already covers. The ordered SQL scan needs a single GLOBAL
+        // non-overlapping chain, which sequential-emission disjointness only
+        // guarantees for ONE job covering everything. So, using the exact
+        // predicate the scan uses, check the survivors: if the chain is broken
+        // by overlap, run one full-table clustered merge over ALL live data
+        // superfiles (bypassing selection), whose sequential cuts are globally
+        // disjoint by construction, then re-verify. A table whose chain
+        // already holds pays nothing — the common single-round / single-
+        // partition case skips the pass entirely.
+        if clustered && Self::final_pass_eligible(inner) {
+            let key = inner.options.cluster_by.clone();
+            let pre = cluster_chain_status(inner.manifest.load().get_all_superfiles(), &key);
+            if needs_final_disjoint_pass(pre) {
+                table.run_final_clustered_disjoint_pass(cfg).await?;
+                inner
+                    .last_compaction_final_pass
+                    .store(true, Ordering::Relaxed);
+                let post = cluster_chain_status(inner.manifest.load().get_all_superfiles(), &key);
+                if !final_pass_cleared_chain(post) {
+                    return Err(CompactionError::GlobalDisjointnessUnmet {
+                        files: inner.manifest.load().get_all_superfiles().len(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Whether a clustered table is a candidate for the final full-table
+    /// disjointness pass. The pass merges across partition boundaries into
+    /// one global key order, so it is confined to tables whose clustered
+    /// merges actually re-sort by key AND whose partition strategy accepts
+    /// an output spanning the whole table:
+    ///
+    ///   * **not** a hidden vector-index table, and **no** hidden sibling —
+    ///     a cross-watermark merge would strand undrained vectors (see
+    ///     [`split_stats_at_drain_watermark`]);
+    ///   * **not** cell-partitioned and **no** sq8-family vector column —
+    ///     those byte-splice vectors in row order and cannot re-sort
+    ///     ([`clustered_streaming_available`] also pins durable storage on,
+    ///     which the streaming path needs to admit an over-ceiling job); and
+    ///   * a partition strategy that tolerates a full-table output
+    ///     ([`final_pass_partition_compatible`]).
+    ///
+    /// Anything excluded here keeps exactly today's behavior: its scan
+    /// stays on whatever ordered/unordered path the survivors already
+    /// support, and no extra merge runs.
+    fn final_pass_eligible(inner: &Arc<SupertableInner>) -> bool {
+        let strategy = inner.manifest.load().get_partition_strategy();
+        let cell_partitioned = matches!(strategy, PartitionStrategy::VectorCell { .. });
+        !is_hidden_vector_index_table(&inner.options)
+            && inner.vector_index_table.is_none()
+            && !cell_partitioned
+            && clustered_streaming_available(&inner.options)
+            && final_pass_partition_compatible(&strategy)
+    }
+
+    /// One final full-table clustered merge over ALL live data superfiles,
+    /// bypassing selection. Builds a single [`CompactionJob`] spanning every
+    /// survivor and routes it through the same seal → merge → commit → refresh
+    /// machinery a round uses. Because the job covers everything, its input
+    /// bytes exceed the in-memory ceiling on any table large enough to have
+    /// fragmented, so [`Supertable::merge_superfiles`] engages the streaming
+    /// k-way merge (admission + cascade bounded by the ceiling); a table that
+    /// fits stays on the in-memory route. Either way the one global sort's
+    /// sequential cuts carry non-overlapping key ranges.
+    ///
+    /// # Write amplification
+    /// This pass rewrites every live row of the table exactly once more, on
+    /// top of the bytes the convergence rounds already wrote — so one
+    /// `optimize` on a table that needs it writes the dataset a bounded
+    /// `rounds + 1` times (the rounds are `O(log)` in the fragment count and
+    /// each strictly shrinks it; this adds a single constant pass). It runs at
+    /// most once per `optimize` call and only when the survivors are provably
+    /// range-overlapping, so a converged, already-disjoint table never pays
+    /// it. The cost buys the ordered scan for the whole table in one shot. The
+    /// cheaper alternative — teaching the per-round merge to cut on GLOBAL key
+    /// boundaries (range-aware rounds), so cross-round outputs never overlap
+    /// and no final rewrite is needed — is left as future work: it reworks the
+    /// round job-construction and output-cut math, whereas this pass reuses
+    /// the existing streaming machinery unchanged.
+    async fn run_final_clustered_disjoint_pass(
+        &self,
+        cfg: &CompactionSettings,
+    ) -> Result<(), CompactionError> {
+        let inner = self.inner();
+        let manifest = inner.manifest.load_full();
+        let entries = manifest.get_all_superfiles();
+        // Fewer than two files trivially form a chain; nothing to merge.
+        if entries.len() < 2 {
+            return Ok(());
+        }
+
+        let inputs: Vec<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+        // Raw input bytes size the output cut count, the same basis the
+        // per-round clustered jobs use. Ignoring tombstones only overestimates,
+        // so outputs land at or under target — never over.
+        let estimated_output_bytes: u64 = entries
+            .iter()
+            .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
+            .sum();
+        let job = CompactionJob {
+            partition_key: Vec::new(),
+            inputs,
+            estimated_output_bytes,
+        };
+
+        let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+        let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
+        let n_outputs = clustered_output_count(estimated_output_bytes, target_bytes);
+        let stale_seal_timeout = Duration::from_millis(cfg.stale_seal_timeout_ms);
+
+        self.run_compaction_job(job, n_outputs, stale_seal_timeout, max_memory_bytes)
+            .await?;
+        self.refresh()
+            .await
+            .map_err(|e| CompactionError::Refresh(e.to_string()))?;
         Ok(())
     }
 
@@ -4027,5 +4197,64 @@ mod tests {
                 .sum();
             assert_eq!(n, 16384, "term '{term}' should match exactly 16384 docs");
         }
+    }
+
+    // ---- final global disjointness pass: gate logic ----------------------
+
+    #[test]
+    fn final_pass_fires_only_on_a_broken_chain() {
+        // The pass exists solely to repair a provable overlap. A converged,
+        // already-disjoint table (`Holds`) must not pay the extra rewrite,
+        // and a table with no usable key stats (`Indeterminate`) is left on
+        // its unordered fallback because no merge is guaranteed to fix it.
+        assert!(needs_final_disjoint_pass(ChainStatus::Broken));
+        assert!(!needs_final_disjoint_pass(ChainStatus::Holds));
+        assert!(!needs_final_disjoint_pass(ChainStatus::Indeterminate));
+    }
+
+    #[test]
+    fn final_pass_clears_only_when_the_chain_holds() {
+        // After a full-table re-sort, anything short of `Holds` is a loud
+        // stall (`GlobalDisjointnessUnmet`), never a silent fallback.
+        assert!(final_pass_cleared_chain(ChainStatus::Holds));
+        assert!(!final_pass_cleared_chain(ChainStatus::Broken));
+        assert!(!final_pass_cleared_chain(ChainStatus::Indeterminate));
+    }
+
+    #[test]
+    fn only_full_table_tolerant_strategies_accept_the_pass() {
+        // The pass merges across partition boundaries into one global order,
+        // so only strategies where a whole-table output is a legal partition
+        // assignment qualify: ingestion-time buckets and the single-bucket
+        // hash default. Column-sharding strategies keep today's behavior.
+        assert!(final_pass_partition_compatible(
+            &PartitionStrategy::IngestionTime {
+                granularity_secs: 3600,
+            }
+        ));
+        assert!(final_pass_partition_compatible(&PartitionStrategy::Hash {
+            column: "c".into(),
+            n_buckets: 1,
+        }));
+        assert!(final_pass_partition_compatible(&PartitionStrategy::Hash {
+            column: "c".into(),
+            n_buckets: 0,
+        }));
+        assert!(!final_pass_partition_compatible(&PartitionStrategy::Hash {
+            column: "c".into(),
+            n_buckets: 8,
+        }));
+        assert!(!final_pass_partition_compatible(
+            &PartitionStrategy::TimeRange {
+                column: "ts".into(),
+                granularity_secs: 3600,
+            }
+        ));
+        assert!(!final_pass_partition_compatible(
+            &PartitionStrategy::ColumnRange {
+                column: "c".into(),
+                boundaries: vec![],
+            }
+        ));
     }
 }

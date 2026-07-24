@@ -611,6 +611,14 @@ fn optimize_multiple_outputs_carry_disjoint_ranges() {
         "multi-output optimize must keep the ordered path; plan was:\n{plan}"
     );
 
+    // No tax on the already-disjoint case: one fused job cuts its outputs
+    // sequentially, so the survivors chain by construction and the final
+    // full-table pass must NOT fire (it exists only to repair overlap).
+    assert!(
+        !st.last_compaction_final_pass(),
+        "a single-job optimize already yields disjoint outputs; the final pass must be skipped"
+    );
+
     let rows = sorted_rows(&st, "SELECT COUNT(*) FROM supertable");
     let expected_rows = (MULTI_OUTPUT_COMMITS * MULTI_OUTPUT_ROWS_PER_COMMIT).to_string();
     assert_eq!(rows, vec![expected_rows], "no rows lost across the split");
@@ -927,6 +935,18 @@ fn one_optimize_call_converges_past_a_single_selection_round() {
     assert!(
         plan.contains("output_ordering") && plan.contains("ordering_mode=Sorted"),
         "converged table must scan on the ordered path; plan was:\n{plan}"
+    );
+
+    // The invariant that matters end-to-end: the survivor set's key ranges
+    // chain without overlap across ALL files. Multi-round convergence does
+    // not guarantee this on its own (each round is disjoint only within its
+    // own job); reaching a globally-disjoint state is what enables the
+    // ordered scan. Whether that state is reached by converging to a single
+    // file (this dup-heavy shape) or by the final full-table pass repairing
+    // a multi-output overlap, the post-optimize chain must hold.
+    assert!(
+        clustered.cluster_chain_holds(),
+        "converged multi-round table must be globally range-disjoint"
     );
 
     let rows = sorted_rows(&clustered, "SELECT COUNT(*) FROM supertable");
