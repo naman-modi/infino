@@ -71,7 +71,7 @@ const MIN_BYTES_PER_CONNECTIVE: usize = 3;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    config::DEFAULT_CONNECTION_BUDGET_BYTES,
+    config::{self, DEFAULT_CONNECTION_BUDGET_BYTES},
     memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::{
@@ -1216,6 +1216,15 @@ fn build_options(
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
     let mut opts = SupertableOptions::new(schema, fts, vectors)?;
+    // The connect path does not run the full `apply_config`, so a table opened
+    // through the catalog otherwise keeps the built-in 64 MiB append-split
+    // default no matter what `config.yaml` sets. Honor the one sizing knob that
+    // governs how big a superfile lands at append, so a write-side consumer can
+    // size segments to its machine (e.g. one superfile per large append)
+    // without an optimize pass. Other config fields still take the apply_config
+    // path only.
+    opts =
+        opts.with_superfile_buffer_split_mb(config::global().supertable.superfile_buffer_split_mb);
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
