@@ -18,24 +18,31 @@
 //! GET. Disk (and budget) use grows with the bytes queries touch, not the object
 //! size, which is what lets the cache serve tables far larger than local disk.
 //!
-//! # A read never waits on the cache disk
+//! # A read never waits on the cache disk, and fetches a run once
 //!
 //! A query gets its bytes as soon as the GET returns. Writing them to the block
 //! file happens afterwards on a blocking thread, because a background download
-//! can keep the same disk busy for minutes:
+//! can keep the same disk busy for minutes. Reads that miss the same blocks at
+//! the same time share one GET:
 //!
 //! ```text
-//!   read ─► missing blocks ─► GET ─► bytes ──────────────────► back to the query
-//!                                     │
-//!                                     ├─► pending: later reads get them from memory
-//!                                     ▼
+//!   read ─► missing run ─► register it in `runs` ─► GET ─► bytes ──► back to the query
+//!     │                                                │
+//!     └─► run another read registered ─► same GET ─────┤ (whichever read polls it drives it)
+//!                                                      ├─► in memory: later reads get them from here
+//!                                                      ▼
 //!          wait for a block writer (a task, no thread)
-//!                                     ▼
-//!          blocking thread: write ─► mark filled ─► out of pending ─► fsync + index
+//!                                                      ▼
+//!          blocking thread: write ─► mark filled ─► out of memory ─► fsync + index
 //! ```
 //!
-//! - A read looks in pending first, then in the filled blocks; anything in
-//!   neither is fetched.
+//! - A run is in memory from its GET until its blocks are on the block file. A
+//!   read looks there first, then in the filled blocks; anything in neither it
+//!   registers and fetches.
+//! - The GET is a shared future: the read that registered it and every read
+//!   that needs its blocks meanwhile await the same one, so no read depends on
+//!   another being polled. It is cancelled only when all of them are dropped.
+//!   A prefetch and the sync read path do not register their runs.
 //! - The index on disk lists only blocks that were fsynced, so a crash loses at
 //!   most the blocks not synced yet, and later reads fetch them again.
 //! - Each store runs at most [`BLOCK_WRITERS`] writes at once, so a slow disk
@@ -71,14 +78,23 @@ use std::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::{StreamExt, stream};
+use futures::{
+    StreamExt,
+    future::{BoxFuture, FutureExt, Shared, WeakShared, join_all, try_join_all},
+    stream,
+};
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::{
+    select,
+    task::{JoinHandle, spawn_blocking},
+    time::timeout,
+};
 
 #[cfg(test)]
 use super::disk::BlockWriteTicket;
@@ -99,6 +115,13 @@ use crate::{
 pub(super) const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
 
 const IDX_HEADER: [u8; 8] = CACHE_BLOCK_BYTES.to_le_bytes();
+
+/// How long a read waits on another read's GET before it GETs the same blocks
+/// itself and keeps whichever lands first. Far above a normal GET (on GCS about
+/// 45 ms at p50 and under 140 ms at p90), far below a stalled one (one attempt
+/// can run to the store's 60 s request timeout): it costs nothing normally, and
+/// bounds how long one stuck GET holds the reads sharing it.
+const HEDGE_AFTER: Duration = Duration::from_secs(2);
 
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -146,9 +169,12 @@ pub(crate) struct BlockCachedSource {
     /// A handle to this source, so a queued write can keep it alive until the
     /// write is done.
     me: Weak<BlockCachedSource>,
-    /// Fetched runs not written to the block file yet, keyed by first block;
-    /// reads get their bytes from here meanwhile. Never held across await.
-    pending: Mutex<BTreeMap<u32, PendingRun>>,
+    /// Runs in memory, keyed by first block; see [`MemoryRun`]. Never held
+    /// across await, and never while a run's last fetch could drop: that drops
+    /// its [`Claim`], which takes this lock.
+    runs: Mutex<BTreeMap<u32, MemoryRun>>,
+    /// Source of [`MemoryRun::id`].
+    next_run_id: AtomicU64,
     /// Set when blocks are marked filled after the last index write. A failed
     /// fsync sets it again, so the next flush retries.
     dirty: AtomicBool,
@@ -174,7 +200,7 @@ enum Fill {
 /// [`BlockCachedSource::admit_run`]. While it exists it holds:
 /// - the disk budget reserved for its blocks,
 /// - its share of the store's cap on unwritten runs,
-/// - its entry in `pending`, so reads get the bytes from memory.
+/// - its entry in `runs`, so reads get the bytes from memory.
 ///
 /// [`Self::spawn_write`] writes it. Dropping it gives back whatever it still holds,
 /// whether the write worked, failed or never ran, and writes the index if the
@@ -182,6 +208,8 @@ enum Fill {
 struct FetchedRun {
     source: Arc<BlockCachedSource>,
     store: Arc<DiskCacheStore>,
+    /// Its entry in `runs`.
+    id: u64,
     first: u32,
     last: u32,
     bytes: Bytes,
@@ -236,13 +264,9 @@ impl FetchedRun {
 
 impl Drop for FetchedRun {
     fn drop(&mut self) {
-        // Out of pending only now, after `land` marked the blocks filled, so a
+        // Out of memory only now, after `land` marked the blocks filled, so a
         // read never finds them in neither place.
-        self.source
-            .pending
-            .lock()
-            .expect("pending runs mutex poisoned")
-            .remove(&self.first);
+        self.source.remove_run(self.first, self.id);
         self.store.release_write_behind(self.bytes.len() as u64);
 
         if self.unlanded > 0 {
@@ -255,26 +279,105 @@ impl Drop for FetchedRun {
     }
 }
 
-/// A fetched run waiting for its block-file write.
-struct PendingRun {
+/// A run's fetch, shared by every read that needs its blocks: the read that
+/// registered it and every read that finds it in `runs` await clones of one
+/// future, and whichever polls it drives the GET. Dropping the last clone
+/// cancels the GET.
+type RunFetch = Shared<BoxFuture<'static, Fetched>>;
+
+/// How a shared run fetch ends.
+#[derive(Clone)]
+enum Fetched {
+    /// The run's bytes, starting at its first block.
+    Bytes(Bytes),
+    /// Read elsewhere (the whole-file copy or object storage): the store is
+    /// gone, this source is no longer the live entry, the budget is full, or
+    /// the GET came back short.
+    Elsewhere,
+    /// The GET failed.
+    Failed(FetchError),
+}
+
+/// A failed GET, shared by every read of the run. The first read to take the
+/// error returns it; the others read elsewhere, which tries the GET once more
+/// each.
+#[derive(Clone)]
+struct FetchError(Arc<Mutex<Option<LazyByteSourceError>>>);
+
+impl FetchError {
+    fn new(error: LazyByteSourceError) -> Self {
+        Self(Arc::new(Mutex::new(Some(error))))
+    }
+
+    fn take(&self) -> Option<LazyByteSourceError> {
+        self.0.lock().expect("fetch error mutex poisoned").take()
+    }
+}
+
+/// A run of blocks in memory, in `runs` under its first block: from its
+/// registration until its blocks are on the block file.
+struct MemoryRun {
+    /// Tells this run from a later one under the same first block, so a guard
+    /// only ever removes its own.
+    id: u64,
     /// Last block of the run (inclusive).
     last: u32,
-    /// The run's bytes, starting at its first block.
-    bytes: Bytes,
+    bytes: RunBytes,
+}
+
+/// Where a [`MemoryRun`]'s bytes are.
+enum RunBytes {
+    /// Its GET is in flight. Weak, so `runs` never keeps a fetch alive: once
+    /// every read awaiting it is dropped, the GET is cancelled and its
+    /// [`Claim`] takes the entry out.
+    Fetching(WeakShared<BoxFuture<'static, Fetched>>),
+    /// Fetched, waiting for its block-file write. These are the run's bytes,
+    /// starting at its first block.
+    Fetched(Bytes),
+}
+
+/// The entry a read registered in `runs`, owned by the run's fetch. Unless
+/// [`BlockCachedSource::admit_run`] hands it to the run's [`FetchedRun`], the
+/// entry leaves `runs` when the claim drops: when the fetch ends without the
+/// run being cached, or is cancelled.
+struct Claim {
+    source: Arc<BlockCachedSource>,
+    first: u32,
+    id: u64,
+    handed_on: bool,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if !self.handed_on {
+            self.source.remove_run(self.first, self.id);
+        }
+    }
 }
 
 /// Where one stretch `[first, last]` of a read's blocks is right now.
 enum Segment {
     /// On the block file.
     Filled { first: u32, last: u32 },
-    /// In memory: fetched, not yet written. `bytes` start at block `run_first`.
-    Pending {
+    /// In memory, fetched. `bytes` start at block `run_first`.
+    InMemory {
         first: u32,
         last: u32,
         run_first: u32,
         bytes: Bytes,
     },
-    /// Neither: the read has to fetch it.
+    /// Being fetched in the run that starts at block `run_first`; `fetch` ends
+    /// with its bytes. `own` when this read registered the run, rather than
+    /// found another read's.
+    Fetching {
+        first: u32,
+        last: u32,
+        run_first: u32,
+        fetch: RunFetch,
+        own: bool,
+    },
+    /// None of the above, and not registered: only for callers that don't
+    /// register runs (a prefetch, the sync path), or a source being dropped.
     Missing { first: u32, last: u32 },
 }
 
@@ -282,7 +385,8 @@ impl Segment {
     fn blocks(&self) -> (u32, u32) {
         match *self {
             Self::Filled { first, last }
-            | Self::Pending { first, last, .. }
+            | Self::InMemory { first, last, .. }
+            | Self::Fetching { first, last, .. }
             | Self::Missing { first, last } => (first, last),
         }
     }
@@ -293,8 +397,23 @@ impl Segment {
 enum BlockAt {
     Filled,
     Missing,
-    /// In the pending run at this index of the snapshot.
-    Pending(usize),
+    /// In the fetched run at this index of the snapshot.
+    InMemory(usize),
+    /// In the run being fetched at this index of the snapshot.
+    Fetching(usize),
+}
+
+impl BlockAt {
+    /// Not readable yet: the read waits for it or fetches it.
+    fn is_unavailable(self) -> bool {
+        matches!(self, Self::Fetching(_) | Self::Missing)
+    }
+}
+
+/// A run in `runs` overlapping a read, as [`BlockCachedSource::segments`] found it.
+enum RunState {
+    Fetched(Bytes),
+    Fetching(RunFetch),
 }
 
 impl BlockCachedSource {
@@ -341,7 +460,8 @@ impl BlockCachedSource {
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
             me: me.clone(),
-            pending: Mutex::new(BTreeMap::new()),
+            runs: Mutex::new(BTreeMap::new()),
+            next_run_id: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             flushing: AtomicBool::new(false),
             #[cfg(test)]
@@ -607,14 +727,19 @@ impl BlockCachedSource {
             .then_some(store)
     }
 
-    /// Whether a fetched run is still waiting to be written. The idle sweep keeps
-    /// such an entry, because `filled_bytes` does not count the run until then.
-    pub(crate) fn has_pending_writes(&self) -> bool {
-        !self
-            .pending
-            .lock()
-            .expect("pending runs mutex poisoned")
-            .is_empty()
+    /// Whether a run is in memory: being fetched, or waiting to be written. The
+    /// idle sweep keeps such an entry, because `filled_bytes` does not count the
+    /// run until it is written.
+    pub(crate) fn has_runs_in_memory(&self) -> bool {
+        !self.runs.lock().expect("runs mutex poisoned").is_empty()
+    }
+
+    /// Takes run `id` out of `runs`, if it is still there under block `first`.
+    fn remove_run(&self, first: u32, id: u64) {
+        let mut runs = self.runs.lock().expect("runs mutex poisoned");
+        if runs.get(&first).is_some_and(|run| run.id == id) {
+            runs.remove(&first);
+        }
     }
 
     /// Marks `[b0, b1]` filled and flags the index for the next
@@ -673,56 +798,157 @@ impl BlockCachedSource {
         }
     }
 
-    /// Splits blocks `[b0, b1]` into stretches by where their bytes are: pending,
-    /// filled or missing. Pending is checked first, and a write marks its blocks
-    /// filled before leaving pending, so a block in neither really is missing.
-    fn segments(&self, b0: u32, b1: u32) -> Vec<Segment> {
-        let pending: Vec<(u32, u32, Bytes)> = self
-            .pending
-            .lock()
-            .expect("pending runs mutex poisoned")
+    /// Splits blocks `[b0, b1]` into stretches by where their bytes are. Each
+    /// block is, in this order: in a fetched run, on the block file, in a run
+    /// being fetched, or missing. A write marks its blocks filled before its run
+    /// leaves `runs`, so a block found in neither really is missing.
+    ///
+    /// With `register`, each missing stretch is registered in `runs`, under the
+    /// same lock as the check so two reads never both fetch it, and comes back
+    /// as `Fetching` with its new fetch.
+    ///
+    /// Waiting never costs more GETs than fetching: where runs being fetched
+    /// split the missing blocks of one unavailable stretch into several pieces,
+    /// the blocks from the first missing one to the last are fetched as one run,
+    /// with one GET, as they would be if nothing were being fetched:
+    ///
+    /// ```text
+    ///   found:    [fetching][missing][fetching][missing][fetching]
+    ///   fetched:  [fetching][        one new run        ][fetching]
+    /// ```
+    fn segments(&self, b0: u32, b1: u32, register: bool) -> Vec<Segment> {
+        let mut runs = self.runs.lock().expect("runs mutex poisoned");
+        // Fetched runs first, so a block also in a run being fetched is read
+        // from the one already back. A fetch every read dropped is no run.
+        let mut snapshot: Vec<(u32, u32, RunState)> = runs
             .range(..=b1)
             .filter(|(_, run)| run.last >= b0)
-            .map(|(&first, run)| (first, run.last, run.bytes.clone()))
+            .filter_map(|(&first, run)| {
+                let state = match &run.bytes {
+                    RunBytes::Fetched(bytes) => RunState::Fetched(bytes.clone()),
+                    RunBytes::Fetching(fetch) => RunState::Fetching(fetch.upgrade()?),
+                };
+                Some((first, run.last, state))
+            })
             .collect();
+        snapshot.sort_by_key(|(_, _, state)| matches!(state, RunState::Fetching(_)));
 
         let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
-
-        let at = |b: u32| match pending
-            .iter()
-            .position(|&(first, last, _)| first <= b && b <= last)
-        {
-            Some(i) => BlockAt::Pending(i),
-            None if filled.contains(b) => BlockAt::Filled,
-            None => BlockAt::Missing,
+        let at = |b: u32| {
+            let run = snapshot
+                .iter()
+                .position(|&(first, last, _)| first <= b && b <= last);
+            match run {
+                Some(i) if matches!(snapshot[i].2, RunState::Fetched(_)) => BlockAt::InMemory(i),
+                _ if filled.contains(b) => BlockAt::Filled,
+                Some(i) => BlockAt::Fetching(i),
+                None => BlockAt::Missing,
+            }
         };
-
-        let segment = |first: u32, last: u32, at: BlockAt| match at {
-            BlockAt::Filled => Segment::Filled { first, last },
-            BlockAt::Missing => Segment::Missing { first, last },
-            BlockAt::Pending(i) => Segment::Pending {
-                first,
-                last,
-                run_first: pending[i].0,
-                bytes: pending[i].2.clone(),
-            },
-        };
-
-        let mut segments = Vec::new();
-
-        let (mut first, mut current) = (b0, at(b0));
-
-        for b in b0.saturating_add(1)..=b1 {
+        let mut pieces: Vec<(u32, u32, BlockAt)> = Vec::new();
+        for b in b0..=b1 {
             let here = at(b);
-            if here != current {
-                segments.push(segment(first, b - 1, current));
-                (first, current) = (b, here);
+            match pieces.last_mut() {
+                Some((_, last, current)) if *current == here => *last = b,
+                _ => pieces.push((b, b, here)),
+            }
+        }
+        drop(filled);
+
+        let mut merged = Vec::with_capacity(pieces.len());
+        for stretch in pieces.chunk_by(|a, b| a.2.is_unavailable() == b.2.is_unavailable()) {
+            let missing = |piece: &(u32, u32, BlockAt)| piece.2 == BlockAt::Missing;
+            match (
+                stretch.iter().position(missing),
+                stretch.iter().rposition(missing),
+            ) {
+                (Some(a), Some(z)) if a < z => {
+                    merged.extend_from_slice(&stretch[..a]);
+                    merged.push((stretch[a].0, stretch[z].1, BlockAt::Missing));
+                    merged.extend_from_slice(&stretch[z + 1..]);
+                }
+                _ => merged.extend_from_slice(stretch),
             }
         }
 
-        segments.push(segment(first, b1, current));
+        let segments = merged
+            .into_iter()
+            .map(|(first, last, at)| match at {
+                BlockAt::Filled => Segment::Filled { first, last },
+                BlockAt::InMemory(i) | BlockAt::Fetching(i) => {
+                    let run_first = snapshot[i].0;
+                    match &snapshot[i].2 {
+                        RunState::Fetched(bytes) => Segment::InMemory {
+                            first,
+                            last,
+                            run_first,
+                            bytes: bytes.clone(),
+                        },
+                        RunState::Fetching(fetch) => Segment::Fetching {
+                            first,
+                            last,
+                            run_first,
+                            fetch: fetch.clone(),
+                            own: false,
+                        },
+                    }
+                }
+                BlockAt::Missing => match register.then(|| self.register(&mut runs, first, last)) {
+                    Some(Some(fetch)) => Segment::Fetching {
+                        first,
+                        last,
+                        run_first: first,
+                        fetch,
+                        own: true,
+                    },
+                    _ => Segment::Missing { first, last },
+                },
+            })
+            .collect();
 
+        // The snapshot's fetches may be the last of some run's; drop them only
+        // once `runs` is unlocked.
+        drop(runs);
+        drop(snapshot);
         segments
+    }
+
+    /// Registers missing run `[first, last]` in `runs` and returns its new
+    /// fetch, not started: the caller's first poll starts the GET. `None` while
+    /// this source is being dropped.
+    fn register(
+        &self,
+        runs: &mut BTreeMap<u32, MemoryRun>,
+        first: u32,
+        last: u32,
+    ) -> Option<RunFetch> {
+        let source = self.me.upgrade()?;
+        let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let claim = Claim {
+            source: Arc::clone(&source),
+            first,
+            id,
+            handed_on: false,
+        };
+        let fetch = async move {
+            match source.block_file() {
+                Some(bf) => source.fetch_now(bf, first, last, Some(claim)).await,
+                None => Fetched::Elsewhere,
+            }
+        }
+        .boxed()
+        .shared();
+        // Replaces at most a run every read dropped (`segments` saw no run here),
+        // whose claim then finds its id gone.
+        runs.insert(
+            first,
+            MemoryRun {
+                id,
+                last,
+                bytes: RunBytes::Fetching(fetch.downgrade().expect("a fetch not polled yet")),
+            },
+        );
+        Some(fetch)
     }
 
     /// Builds `[start, start + len)` from `segments`. `None` if a segment is
@@ -743,13 +969,13 @@ impl BlockCachedSource {
             let e = ((u64::from(last) + 1) * CACHE_BLOCK_BYTES).min(end);
             pieces.push(match segment {
                 Segment::Filled { .. } => self.read_local(bf, s, e - s)?,
-                Segment::Pending {
+                Segment::InMemory {
                     run_first, bytes, ..
                 } => {
                     let base = u64::from(*run_first) * CACHE_BLOCK_BYTES;
                     bytes.slice((s - base) as usize..(e - base) as usize)
                 }
-                Segment::Missing { .. } => return None,
+                Segment::Fetching { .. } | Segment::Missing { .. } => return None,
             });
         }
 
@@ -774,13 +1000,12 @@ impl BlockCachedSource {
     }
 
     /// Serves a read that is not fully on the block file: filled blocks from the
-    /// file, pending ones from memory, and each missing run with one GET, then
-    /// queued for writing. `None` sends the read to the whole-file copy or to
-    /// object storage, when:
-    /// - the store is gone, or this source is no longer the live entry,
-    /// - the budget is full,
-    /// - the GET came back short,
-    /// - a local read failed.
+    /// file, fetched runs from memory, and every other run through its shared
+    /// fetch, its own or another read's (hedged past [`HEDGE_AFTER`]). It awaits
+    /// all of them at once, so it takes as long as the slowest, not their sum. `None` sends the read to the
+    /// whole-file copy or to object storage, when one of those fetches did (see
+    /// [`Fetched::Elsewhere`]), another read already returned the GET error, or a
+    /// local read failed.
     async fn read_through(
         &self,
         bf: &BlockFile,
@@ -788,32 +1013,91 @@ impl BlockCachedSource {
         len: u64,
     ) -> Result<Option<Bytes>, LazyByteSourceError> {
         let (b0, b1) = Self::block_span(start, len);
+        let segments = self.segments(b0, b1, true);
 
-        let mut segments = self.segments(b0, b1);
-
-        for segment in &mut segments {
-            let Segment::Missing { first, last } = *segment else {
-                continue;
-            };
-
-            let Some((bytes, run)) = self.fetch_missing(bf, first, last, Fill::Read).await? else {
-                return Ok(None);
-            };
-
-            if let Some(run) = run {
-                // Don't wait for the write: the query already has its bytes.
-                drop(run.spawn_write());
-            }
-
-            *segment = Segment::Pending {
+        // The first run that ends without bytes stops the read, and drops its
+        // other fetches: a fetch this read alone was awaiting is cancelled,
+        // while one that already got its bytes has queued them for writing.
+        let segments = try_join_all(segments.into_iter().map(|segment| async move {
+            let Segment::Fetching {
                 first,
                 last,
-                run_first: first,
-                bytes,
+                run_first,
+                fetch,
+                own,
+            } = segment
+            else {
+                return Ok(segment);
             };
-        }
+            let (run_first, fetched) = if own {
+                (run_first, fetch.await)
+            } else {
+                self.wait_or_hedge(bf, first, last, run_first, fetch).await
+            };
+            match fetched {
+                Fetched::Bytes(bytes) => Ok(Segment::InMemory {
+                    first,
+                    last,
+                    run_first,
+                    bytes,
+                }),
+                stopped => Err(stopped),
+            }
+        }))
+        .await;
 
-        Ok(self.assemble(bf, start, len, &segments))
+        match segments {
+            Ok(segments) => Ok(self.assemble(bf, start, len, &segments)),
+            Err(Fetched::Failed(error)) => error.take().map_or(Ok(None), Err),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Waits for another read's fetch of blocks `[first, last]`, in the run that
+    /// starts at block `run_first`. Past [`HEDGE_AFTER`] it also GETs those
+    /// blocks itself and keeps whichever lands first; a hedge that ends without
+    /// bytes is dropped and the wait goes on. Returns the block the bytes start
+    /// at, and how the fetch ended.
+    async fn wait_or_hedge(
+        &self,
+        bf: &BlockFile,
+        first: u32,
+        last: u32,
+        run_first: u32,
+        mut fetch: RunFetch,
+    ) -> (u32, Fetched) {
+        if let Ok(fetched) = timeout(HEDGE_AFTER, &mut fetch).await {
+            return (run_first, fetched);
+        }
+        select! {
+            fetched = &mut fetch => (run_first, fetched),
+            hedged = self.fetch_now(bf, first, last, None) => match hedged {
+                Fetched::Bytes(_) => (first, hedged),
+                _ => (run_first, fetch.await),
+            },
+        }
+    }
+
+    /// Fetches blocks `[first, last]` and queues them for writing without
+    /// waiting for the write; see [`Self::fetch_missing`].
+    async fn fetch_now(
+        &self,
+        bf: &BlockFile,
+        first: u32,
+        last: u32,
+        claim: Option<Claim>,
+    ) -> Fetched {
+        match self.fetch_missing(bf, first, last, Fill::Read, claim).await {
+            Ok(Some((bytes, run))) => {
+                if let Some(run) = run {
+                    // Don't wait for the write: the reads already have their bytes.
+                    drop(run.spawn_write());
+                }
+                Fetched::Bytes(bytes)
+            }
+            Ok(None) => Fetched::Elsewhere,
+            Err(error) => Fetched::Failed(FetchError::new(error)),
+        }
     }
 
     /// Fetches blocks `[first, last]` with one GET, reserving their budget
@@ -825,12 +1109,15 @@ impl BlockCachedSource {
     ///   unwritten runs is full, or a run starting at the same block is queued.
     ///
     /// If the caller is dropped mid-GET, the reservation gives its bytes back.
+    /// `claim` is the run's entry in `runs` when a read registered it; see
+    /// [`Self::admit_run`].
     async fn fetch_missing(
         &self,
         bf: &BlockFile,
         first: u32,
         last: u32,
         fill: Fill,
+        claim: Option<Claim>,
     ) -> Result<Option<(Bytes, Option<FetchedRun>)>, LazyByteSourceError> {
         let Some(store) = self.store_if_current() else {
             return Ok(None);
@@ -855,14 +1142,16 @@ impl BlockCachedSource {
             return Ok(None);
         }
 
-        let run = self.admit_run(&store, first, last, &bytes, reservation, fill);
+        let run = self.admit_run(&store, first, last, &bytes, reservation, fill, claim);
         Ok(Some((bytes, run)))
     }
 
     /// Queues fetched run `[first, last]` for writing: takes its share of the
-    /// store's cap on unwritten runs, puts it in `pending`, and hands it the
-    /// reserved budget. `None` (the reservation is given back) if a read finds
-    /// the cap full, or a run starting at the same block is already waiting.
+    /// store's cap on unwritten runs, keeps its bytes in `runs`, and hands it the
+    /// reserved budget. A registered run keeps the `claim`'s entry; an
+    /// unregistered one (a prefetch's) gets a new entry. `None` (the reservation
+    /// is given back, and a registered run leaves `runs`) if a read finds the
+    /// cap full, or an unregistered run finds another run starting at `first`.
     fn admit_run(
         &self,
         store: &Arc<DiskCacheStore>,
@@ -871,6 +1160,7 @@ impl BlockCachedSource {
         bytes: &Bytes,
         reservation: Option<Reservation<'_>>,
         fill: Fill,
+        claim: Option<Claim>,
     ) -> Option<FetchedRun> {
         let source = self.me.upgrade()?;
 
@@ -884,25 +1174,34 @@ impl BlockCachedSource {
             Fill::Prefetch => store.admit_write_behind(run_len),
         }
 
-        match self
-            .pending
-            .lock()
-            .expect("pending runs mutex poisoned")
-            .entry(first)
-        {
-            // That run owns this key until it is written, so this one is served
-            // but not cached.
-            Entry::Occupied(_) => {
-                store.release_write_behind(run_len);
-                return None;
+        let mut runs = self.runs.lock().expect("runs mutex poisoned");
+        let id = match claim {
+            Some(mut claim) => {
+                if let Some(run) = runs.get_mut(&first).filter(|run| run.id == claim.id) {
+                    run.bytes = RunBytes::Fetched(bytes.clone());
+                }
+                claim.handed_on = true;
+                claim.id
             }
-            Entry::Vacant(slot) => {
-                slot.insert(PendingRun {
-                    last,
-                    bytes: bytes.clone(),
-                });
-            }
-        }
+            None => match runs.entry(first) {
+                // That run owns this key until it is written, so this one is
+                // served but not cached.
+                Entry::Occupied(_) => {
+                    store.release_write_behind(run_len);
+                    return None;
+                }
+                Entry::Vacant(slot) => {
+                    let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+                    slot.insert(MemoryRun {
+                        id,
+                        last,
+                        bytes: RunBytes::Fetched(bytes.clone()),
+                    });
+                    id
+                }
+            },
+        };
+        drop(runs);
 
         let unlanded = reservation.map_or(0, |reserved| {
             reserved.commit();
@@ -914,6 +1213,7 @@ impl BlockCachedSource {
             #[cfg(test)]
             _ticket: store.block_write_started(),
             store: Arc::clone(store),
+            id,
             first,
             last,
             bytes: bytes.clone(),
@@ -986,9 +1286,12 @@ impl BlockCachedSource {
     }
 
     /// One chunk of [`Self::prefetch`]: fetches every block of `[b0, b1]` that is
-    /// neither filled nor pending, and waits for it to be written. It reserves
-    /// only free budget, so a prefetch never evicts what queries use. A run
-    /// another fill queued first is left to it. `false` stops the prefetch, when:
+    /// neither filled nor in memory, and waits for it to be written. It reserves
+    /// only free budget, so a prefetch never evicts what queries use. It first
+    /// waits for runs reads are fetching (driving their GETs), then fetches what
+    /// is still missing, so a run a read did not cache is filled too. A run
+    /// another fill queued, or that a read registered after that, is left to
+    /// it. `false` stops the prefetch, when:
     /// - the budget is full,
     /// - this source is no longer the live entry, or the store is gone,
     /// - the GET came back short, or the write failed.
@@ -998,12 +1301,24 @@ impl BlockCachedSource {
         b0: u32,
         b1: u32,
     ) -> Result<bool, LazyByteSourceError> {
-        for segment in self.segments(b0, b1) {
+        let fetching =
+            self.segments(b0, b1, false)
+                .into_iter()
+                .filter_map(|segment| match segment {
+                    Segment::Fetching { fetch, .. } => Some(fetch),
+                    _ => None,
+                });
+        join_all(fetching).await;
+
+        for segment in self.segments(b0, b1, false) {
             let Segment::Missing { first, last } = segment else {
                 continue;
             };
 
-            let Some((_, run)) = self.fetch_missing(bf, first, last, Fill::Prefetch).await? else {
+            let Some((_, run)) = self
+                .fetch_missing(bf, first, last, Fill::Prefetch, None)
+                .await?
+            else {
                 return Ok(false);
             };
 
@@ -1125,9 +1440,10 @@ impl LazyByteSource for BlockCachedSource {
         if self.all_filled(b0, b1) {
             return self.read_local(bf, start, len);
         }
-        // Pending blocks come from memory. A missing block, or a failed local
-        // read, sends the read to the inner source.
-        self.assemble(bf, start, len, &self.segments(b0, b1))
+        // Blocks in memory come from there. A block missing or still being
+        // fetched (this read can't wait), or a failed local read, sends the read
+        // to the inner source.
+        self.assemble(bf, start, len, &self.segments(b0, b1, false))
             .or_else(|| self.inner.try_get_range_sync(start, len))
     }
 
@@ -1146,16 +1462,18 @@ mod tests {
     use std::{
         future::pending,
         path::Path,
+        pin::pin,
         sync::{atomic::AtomicUsize, mpsc},
+        task::Poll,
         thread,
         time::Duration,
     };
 
-    use futures::FutureExt;
+    use futures::{FutureExt, poll};
     use tempfile::tempdir;
     use tokio::{
-        sync::{Barrier, Notify},
-        time::{sleep, timeout},
+        sync::Notify,
+        time::{Instant, advance, sleep, timeout},
     };
 
     use super::*;
@@ -2043,18 +2361,18 @@ mod tests {
         let bf = src.block_file().expect("block file");
 
         let (_, run) = src
-            .fetch_missing(bf, 0, 0, Fill::Read)
+            .fetch_missing(bf, 0, 0, Fill::Read, None)
             .await
             .expect("GET")
             .expect("fetched");
         let run = run.expect("queued");
         assert_eq!(store.stats().current_bytes, b, "the run holds its charge");
-        assert!(src.has_pending_writes());
+        assert!(src.has_runs_in_memory());
 
         drop(run);
         assert_eq!(store.stats().current_bytes, 0);
         assert_eq!(store.write_behind_in_use(), 0);
-        assert!(!src.has_pending_writes());
+        assert!(!src.has_runs_in_memory());
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
         assert!(!src.idx_path().exists());
         store.remove_block_entry_for_test(&uri);
@@ -2149,17 +2467,15 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// Two reads miss the same run at once and both GET it. It is still cached
-    /// once: reserved once, written once, and the cap is given back in full.
+    /// Two reads that miss the same run at once fetch it once: the second waits
+    /// for the first's GET. The run is reserved once, written once, and the cap
+    /// is given back in full.
     #[tokio::test]
-    async fn racing_reads_of_one_run_cache_it_once() {
+    async fn racing_reads_of_one_run_fetch_it_once() {
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
-        let inner = Arc::new(GatedSource {
-            inner: CountingSource::new(2 * b as usize),
-            gate: Barrier::new(2),
-        });
+        let inner = held_source(2 * b as usize, false);
         let (uri, src) = installed_source(
             dir.path(),
             &store,
@@ -2167,10 +2483,17 @@ mod tests {
         );
 
         let stall = src.stall_writes();
-        let (one, two) = tokio::join!(src.range(0, 64), src.range(10, 64));
+        let mut one = pin!(src.range(0, 64));
+        let mut two = pin!(src.range(10, 64));
+        assert!(poll!(one.as_mut()).is_pending(), "the first read GETs");
+        assert!(poll!(two.as_mut()).is_pending(), "the second read waits");
+        inner.release();
+        let (one, two) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(one, two) })
+            .await
+            .expect("both reads finish");
         assert_eq!(one.expect("first read"), inner.inner.blob.slice(0..64));
         assert_eq!(two.expect("second read"), inner.inner.blob.slice(10..74));
-        assert_eq!(inner.inner.calls(), 2, "both missed, so both fetched");
+        assert_eq!(inner.inner.calls(), 1, "one GET for both reads");
         assert_eq!(store.write_behind_in_use(), b, "only one run is queued");
         assert_eq!(store.stats().current_bytes, b, "only one is charged");
 
@@ -2183,6 +2506,349 @@ mod tests {
             0,
             "its share of the cap came back"
         );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Many small reads of one block, issued together, cost one GET.
+    #[tokio::test]
+    async fn parallel_small_reads_of_one_block_fetch_it_once() {
+        const READS: u64 = 8;
+        const READ_LEN: u64 = 50;
+        const READ_STRIDE: u64 = 100;
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut reads: Vec<_> = (0..READS)
+            .map(|i| Box::pin(src.range(i * READ_STRIDE, READ_LEN)))
+            .collect();
+        for read in &mut reads {
+            assert!(poll!(read.as_mut()).is_pending(), "one GET, the rest wait");
+        }
+        inner.release();
+        let got = timeout(NO_WAIT_DEADLINE, join_all(reads))
+            .await
+            .expect("every read finishes");
+        for (i, bytes) in (0..READS).zip(got) {
+            let s = (i * READ_STRIDE) as usize;
+            assert_eq!(
+                bytes.expect("read"),
+                inner.inner.blob.slice(s..s + READ_LEN as usize)
+            );
+        }
+        assert_eq!(inner.inner.calls(), 1, "one GET for all of them");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read dropped mid-GET leaves the GET to the read still waiting on it,
+    /// which drives it to the end: one GET, and the run is cached.
+    #[tokio::test]
+    async fn a_dropped_fetcher_leaves_its_get_to_a_waiting_read() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut one = Box::pin(src.range(0, 64));
+        let mut two = pin!(src.range(10, 64));
+        assert!(poll!(one.as_mut()).is_pending(), "the first read GETs");
+        assert!(poll!(two.as_mut()).is_pending(), "the second read waits");
+        drop(one);
+        inner.release();
+        let two = timeout(NO_WAIT_DEADLINE, two)
+            .await
+            .expect("the second read finishes");
+        assert_eq!(two.expect("second read"), inner.inner.blob.slice(10..74));
+        assert_eq!(inner.inner.calls(), 1, "the first read's GET, finished");
+
+        store.block_writes_settled().await;
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), b);
+        assert_eq!(store.stats().current_bytes, b, "cached once");
+        assert_eq!(store.write_behind_in_use(), 0);
+        assert!(!src.has_runs_in_memory());
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read nobody polls any more can't hold up a read waiting on its GET:
+    /// the waiting read drives it.
+    #[tokio::test]
+    async fn a_waiting_read_does_not_need_its_fetcher_polled() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut parked = pin!(src.range(0, 64));
+        let mut waiting = pin!(src.range(10, 64));
+        assert!(poll!(parked.as_mut()).is_pending(), "the first read GETs");
+        assert!(
+            poll!(waiting.as_mut()).is_pending(),
+            "the second read waits"
+        );
+        inner.release();
+        let waiting = timeout(NO_WAIT_DEADLINE, waiting)
+            .await
+            .expect("finishes with the first read never polled again");
+        assert_eq!(
+            waiting.expect("second read"),
+            inner.inner.blob.slice(10..74)
+        );
+        assert_eq!(inner.inner.calls(), 1);
+        assert_eq!(
+            poll!(parked.as_mut()).map(|bytes| bytes.expect("first read")),
+            Poll::Ready(inner.inner.blob.slice(0..64)),
+            "the parked read finds its bytes when polled",
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Every read of a run dropped mid-GET cancels it: nothing stays charged or
+    /// in memory.
+    #[tokio::test]
+    async fn dropping_every_read_of_a_run_cancels_its_get() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::new(HangingSource {
+                size: 2 * CACHE_BLOCK_BYTES,
+            }) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut one = Box::pin(src.range(0, 64));
+        let mut two = Box::pin(src.range(10, 64));
+        assert!(poll!(one.as_mut()).is_pending());
+        assert!(poll!(two.as_mut()).is_pending());
+        assert!(src.has_runs_in_memory(), "the run is registered");
+        drop((one, two));
+        assert!(!src.has_runs_in_memory(), "and gone with its last read");
+        assert_eq!(store.stats().current_bytes, 0, "its budget is given back");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A failed GET reaches one of the reads waiting on it as its error. The
+    /// other reads straight from the source instead, uncached.
+    #[tokio::test]
+    async fn a_failed_get_errors_one_read_and_the_other_reads_elsewhere() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * CACHE_BLOCK_BYTES as usize, true);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut one = pin!(src.range(0, 64));
+        let mut two = pin!(src.range(10, 64));
+        assert!(poll!(one.as_mut()).is_pending(), "the first read GETs");
+        assert!(poll!(two.as_mut()).is_pending(), "the second read waits");
+        inner.release();
+        let (one, two) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(one, two) })
+            .await
+            .expect("both reads finish");
+        let (err, ok, want) = match (one, two) {
+            (Err(e), Ok(bytes)) => (e, bytes, inner.inner.blob.slice(10..74)),
+            (Ok(bytes), Err(e)) => (e, bytes, inner.inner.blob.slice(0..64)),
+            other => panic!("one error and one read expected, got {other:?}"),
+        };
+        assert!(matches!(err, LazyByteSourceError::OutOfBounds { .. }));
+        assert_eq!(ok, want);
+        assert_eq!(inner.inner.calls(), 1, "the other read's own GET");
+
+        store.block_writes_settled().await;
+        assert_eq!(store.stats().current_bytes, 0, "nothing was cached");
+        assert_eq!(store.write_behind_in_use(), 0);
+        assert!(!src.has_runs_in_memory());
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Waiting never costs more GETs than fetching: a read whose missing blocks
+    /// sit on both sides of a run in flight GETs them with the run, in one GET,
+    /// as it would if nothing were in flight.
+    #[tokio::test]
+    async fn a_run_in_flight_never_splits_a_read_into_more_gets() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(3 * b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut middle = pin!(src.range(b + 10, 10));
+        assert!(poll!(middle.as_mut()).is_pending(), "block 1 is in flight");
+        let all = timeout(NO_WAIT_DEADLINE, src.range(0, 3 * b))
+            .await
+            .expect("the wide read doesn't wait")
+            .expect("wide read");
+        assert_eq!(all, inner.inner.blob.slice(0..(3 * b) as usize));
+        assert_eq!(inner.inner.calls(), 1, "one GET for blocks 0 to 2");
+
+        inner.release();
+        let middle = timeout(NO_WAIT_DEADLINE, middle)
+            .await
+            .expect("the held read finishes")
+            .expect("middle read");
+        assert_eq!(
+            middle,
+            inner.inner.blob.slice((b + 10) as usize..(b + 20) as usize)
+        );
+        assert_eq!(inner.inner.calls(), 2, "as many GETs as without waiting");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read whose run sits at the edge of a run in flight waits for that run
+    /// and GETs only the rest.
+    #[tokio::test]
+    async fn a_read_fetches_only_what_is_not_in_flight() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut first = pin!(src.range(10, 10));
+        let mut both = pin!(src.range(0, 2 * b));
+        assert!(poll!(first.as_mut()).is_pending(), "block 0 is in flight");
+        assert!(
+            poll!(both.as_mut()).is_pending(),
+            "the wide read waits for it"
+        );
+        assert_eq!(inner.inner.calls(), 1, "and GETs block 1 alone");
+        inner.release();
+        let (first, both) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(first, both) })
+            .await
+            .expect("both reads finish");
+        assert_eq!(first.expect("first read"), inner.inner.blob.slice(10..20));
+        assert_eq!(
+            both.expect("wide read"),
+            inner.inner.blob.slice(0..(2 * b) as usize)
+        );
+        assert_eq!(inner.inner.calls(), 2, "one GET per block");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A prefetch waits for a run a read is fetching, then fetches only the rest.
+    #[tokio::test]
+    async fn prefetch_waits_for_a_run_a_read_is_fetching() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let bf = src.block_file().expect("block file");
+
+        let mut read = pin!(src.range(0, 10));
+        assert!(
+            poll!(read.as_mut()).is_pending(),
+            "block 0 is being fetched"
+        );
+        let mut chunk = pin!(src.prefetch_chunk(bf, 0, 1));
+        assert!(
+            poll!(chunk.as_mut()).is_pending(),
+            "the prefetch waits for it"
+        );
+        assert_eq!(inner.inner.calls(), 0, "without a GET of its own yet");
+
+        inner.release();
+        let chunk = timeout(NO_WAIT_DEADLINE, chunk)
+            .await
+            .expect("the prefetch finishes")
+            .expect("prefetch chunk");
+        assert!(chunk, "the prefetch goes on");
+        assert_eq!(inner.inner.calls(), 2, "block 0 by the read, block 1 by it");
+        let read = timeout(NO_WAIT_DEADLINE, read)
+            .await
+            .expect("the read finishes")
+            .expect("read");
+        assert_eq!(read, inner.inner.blob.slice(0..10));
+
+        store.block_writes_settled().await;
+        assert!(src.all_filled(0, 1));
+        assert_eq!(store.stats().current_bytes, 2 * b);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A run a read fetched but could not cache (the cap was full) is filled by
+    /// a prefetch waiting on it.
+    #[tokio::test]
+    async fn prefetch_fills_a_run_a_read_left_uncached() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let bf = src.block_file().expect("block file");
+        let mut taken = 0;
+        while store.try_admit_write_behind(b) {
+            taken += b;
+        }
+
+        let mut read = pin!(src.range(0, 10));
+        assert!(
+            poll!(read.as_mut()).is_pending(),
+            "block 0 is being fetched"
+        );
+        let mut chunk = pin!(src.prefetch_chunk(bf, 0, 0));
+        assert!(
+            poll!(chunk.as_mut()).is_pending(),
+            "the prefetch waits for it"
+        );
+        inner.release();
+        let (read, chunk) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(read, chunk) })
+            .await
+            .expect("both finish");
+        assert_eq!(read.expect("read"), inner.inner.blob.slice(0..10));
+        assert!(chunk.expect("prefetch chunk"));
+        assert_eq!(
+            inner.inner.calls(),
+            2,
+            "the read's GET, then the prefetch's"
+        );
+
+        store.block_writes_settled().await;
+        assert!(src.all_filled(0, 0), "the prefetch filled it");
+        store.release_write_behind(taken);
         store.remove_block_entry_for_test(&uri);
     }
 
@@ -2210,7 +2876,7 @@ mod tests {
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
         assert_eq!(store.stats().current_bytes, 0, "nothing stays charged");
         assert_eq!(store.write_behind_in_use(), 0);
-        assert!(!src.has_pending_writes());
+        assert!(!src.has_runs_in_memory());
         store.remove_block_entry_for_test(&uri);
     }
 
@@ -2336,12 +3002,7 @@ mod tests {
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
-        let inner = Arc::new(HeldSource {
-            inner: CountingSource::new(2 * b as usize),
-            first: AtomicBool::new(true),
-            held: AtomicBool::new(false),
-            release: Notify::new(),
-        });
+        let inner = held_source(2 * b as usize, false);
         let (uri, src) = installed_source(
             dir.path(),
             &store,
@@ -2351,9 +3012,13 @@ mod tests {
 
         let stall = src.stall_writes();
         let read_meanwhile = async {
-            wait_until(|| inner.held.load(Ordering::Acquire), "the prefetch GETs").await;
+            wait_until(
+                || inner.held.load(Ordering::Acquire) > 0,
+                "the prefetch GETs",
+            )
+            .await;
             let _ = src.range(0, 10).await.expect("the read queues block 0");
-            inner.release.notify_one();
+            inner.release();
         };
         let (chunk, ()) = timeout(NO_WAIT_DEADLINE, async {
             tokio::join!(src.prefetch_chunk(bf, 0, 0), read_meanwhile)
@@ -2374,33 +3039,319 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// Holds every `range` until two are in flight, so two reads both miss.
-    struct GatedSource {
+    /// Where runs being fetched split a read's missing blocks, the blocks from
+    /// the first missing one to the last are one new run, with one GET, and it
+    /// is cached, even when the read starts on a run being fetched.
+    #[tokio::test]
+    async fn a_merged_run_next_to_runs_being_fetched_is_cached() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_sources(4 * b as usize, 2, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut zero = pin!(src.range(10, 10));
+        let mut two = pin!(src.range(2 * b + 10, 10));
+        assert!(
+            poll!(zero.as_mut()).is_pending(),
+            "block 0 is being fetched"
+        );
+        assert!(poll!(two.as_mut()).is_pending(), "block 2 is being fetched");
+        let mut all = pin!(src.range(0, 4 * b));
+        assert!(
+            poll!(all.as_mut()).is_pending(),
+            "the wide read waits for block 0"
+        );
+        assert_eq!(inner.inner.calls(), 1, "and GETs blocks 1 to 3 in one go");
+
+        inner.release();
+        let (zero, two, all) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(zero, two, all) })
+            .await
+            .expect("every read finishes");
+        assert_eq!(zero.expect("block 0"), inner.inner.blob.slice(10..20));
+        let two_at = (2 * b + 10) as usize;
+        assert_eq!(
+            two.expect("block 2"),
+            inner.inner.blob.slice(two_at..two_at + 10)
+        );
+        assert_eq!(all.expect("wide read"), inner.inner.blob.slice(..));
+        assert_eq!(inner.inner.calls(), 3, "one GET per run");
+
+        store.block_writes_settled().await;
+        assert!(src.all_filled(0, 3), "every block is cached");
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 4 * b);
+        assert_eq!(
+            store.stats().current_bytes,
+            4 * b,
+            "each block charged once"
+        );
+        assert_eq!(store.write_behind_in_use(), 0);
+        assert!(!src.has_runs_in_memory());
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read waiting on a run that starts before its first block slices its
+    /// bytes at the right offset.
+    #[tokio::test]
+    async fn a_waiting_read_slices_a_longer_run_at_its_offset() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(3 * b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut wide = pin!(src.range(10, 2 * b));
+        let (start, len) = (b + 5, b + 100);
+        let mut inside = pin!(src.range(start, len));
+        assert!(
+            poll!(wide.as_mut()).is_pending(),
+            "blocks 0 to 2 are being fetched"
+        );
+        assert!(poll!(inside.as_mut()).is_pending(), "the read inside waits");
+        inner.release();
+        let inside = timeout(NO_WAIT_DEADLINE, inside)
+            .await
+            .expect("the read inside finishes")
+            .expect("read inside");
+        assert_eq!(
+            inside,
+            inner
+                .inner
+                .blob
+                .slice(start as usize..(start + len) as usize)
+        );
+        assert_eq!(inner.inner.calls(), 1);
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A run the cap on unwritten runs refuses still reaches the reads waiting
+    /// on it; only later reads GET it again.
+    #[tokio::test]
+    async fn a_run_the_cap_refuses_still_reaches_its_waiting_reads() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(b as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let mut taken = 0;
+        while store.try_admit_write_behind(b) {
+            taken += b;
+        }
+
+        let mut one = pin!(src.range(0, 64));
+        let mut two = pin!(src.range(10, 64));
+        assert!(poll!(one.as_mut()).is_pending());
+        assert!(poll!(two.as_mut()).is_pending());
+        inner.release();
+        let (one, two) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(one, two) })
+            .await
+            .expect("both reads finish");
+        assert_eq!(one.expect("first read"), inner.inner.blob.slice(0..64));
+        assert_eq!(two.expect("second read"), inner.inner.blob.slice(10..74));
+        assert_eq!(inner.inner.calls(), 1, "one GET for both");
+        assert!(!src.has_runs_in_memory(), "the run was not kept");
+        assert_eq!(store.stats().current_bytes, 0);
+        assert_eq!(store.write_behind_in_use(), taken);
+
+        let _ = src.range(0, 64).await.expect("a later read");
+        assert_eq!(inner.inner.calls(), 2, "GETs it again");
+        store.release_write_behind(taken);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// The sync path never waits for a run being fetched: it passes the read on.
+    #[tokio::test]
+    async fn the_sync_path_passes_on_a_run_being_fetched() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * CACHE_BLOCK_BYTES as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut read = pin!(src.range(0, 64));
+        assert!(
+            poll!(read.as_mut()).is_pending(),
+            "block 0 is being fetched"
+        );
+        assert!(src.try_get_range_sync(10, 64).is_none(), "passed on");
+        assert!(src.has_runs_in_memory(), "the run is still being fetched");
+        inner.release();
+        let read = timeout(NO_WAIT_DEADLINE, read)
+            .await
+            .expect("the read finishes")
+            .expect("read");
+        assert_eq!(read, inner.inner.blob.slice(0..64));
+        assert_eq!(
+            src.try_get_range_sync(10, 64),
+            Some(inner.inner.blob.slice(10..74)),
+            "now from memory or the block file",
+        );
+        assert_eq!(inner.inner.calls(), 1);
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A run that comes back short stops the read before its other runs GET, so
+    /// it costs what reading one run at a time would: that GET, then the read
+    /// from the source.
+    #[tokio::test]
+    async fn a_short_run_stops_the_read_before_its_other_runs() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = Arc::new(ShortAt {
+            inner: CountingSource::new(3 * b as usize),
+            start: 0,
+        });
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let _ = src.range(b + 10, 10).await.expect("fill block 1");
+        store.block_writes_settled().await;
+
+        let calls = inner.inner.calls();
+        let _ = src.range(0, 3 * b).await;
+        assert_eq!(inner.inner.calls() - calls, 2, "run 0, then the source");
+        assert!(!src.has_runs_in_memory(), "run 2 never started");
+        store.block_writes_settled().await;
+        assert_eq!(store.stats().current_bytes, b, "only block 1 is cached");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Returns one byte less than asked for a range starting at `start`, as if
+    /// that part of the object were replaced by a shorter one.
+    struct ShortAt {
         inner: CountingSource,
-        gate: Barrier,
+        start: u64,
     }
 
     #[async_trait]
-    impl LazyByteSource for GatedSource {
+    impl LazyByteSource for ShortAt {
         fn size(&self) -> u64 {
             self.inner.size()
         }
 
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-            timeout(NO_WAIT_DEADLINE, self.gate.wait())
-                .await
-                .expect("both reads reach the GET");
-            self.inner.range(start, len).await
+            let bytes = self.inner.range(start, len).await?;
+            Ok(if start == self.start {
+                bytes.slice(..bytes.len().saturating_sub(1))
+            } else {
+                bytes
+            })
         }
     }
 
-    /// Holds the first `range` until `release`, so another fill can queue the
-    /// same run meanwhile. `held` is set while it waits.
+    /// A read stuck behind another read's GET for longer than `HEDGE_AFTER` GETs
+    /// the blocks itself, so one stuck GET can't hold it.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_read_hedges_a_stuck_get() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * CACHE_BLOCK_BYTES as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut stuck = pin!(src.range(0, 64));
+        assert!(
+            poll!(stuck.as_mut()).is_pending(),
+            "the first read's GET is stuck"
+        );
+        let started = Instant::now();
+        let hedged = src.range(10, 64).await.expect("the waiting read");
+        assert_eq!(hedged, inner.inner.blob.slice(10..74));
+        assert!(started.elapsed() >= HEDGE_AFTER, "it waited first");
+        assert_eq!(inner.inner.calls(), 1, "then GET the block itself");
+
+        inner.release();
+        assert_eq!(
+            stuck.await.expect("the first read"),
+            inner.inner.blob.slice(0..64)
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read whose wait ends under `HEDGE_AFTER` sends no GET of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_read_does_not_hedge_a_get_that_lands_in_time() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * CACHE_BLOCK_BYTES as usize, false);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut one = pin!(src.range(0, 64));
+        let mut two = pin!(src.range(10, 64));
+        assert!(poll!(one.as_mut()).is_pending());
+        assert!(poll!(two.as_mut()).is_pending());
+        advance(HEDGE_AFTER - Duration::from_millis(1)).await;
+        assert!(poll!(two.as_mut()).is_pending(), "still waiting");
+        inner.release();
+        let (one, two) = tokio::join!(one, two);
+        assert_eq!(one.expect("first read"), inner.inner.blob.slice(0..64));
+        assert_eq!(two.expect("second read"), inner.inner.blob.slice(10..74));
+        assert_eq!(inner.inner.calls(), 1, "one GET for both");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Holds its first `hold` ranges until [`Self::release`]; `held` counts the
+    /// ones holding. With `fails`, a held range fails once let go instead of
+    /// reading.
     struct HeldSource {
         inner: CountingSource,
-        first: AtomicBool,
-        held: AtomicBool,
-        release: Notify,
+        hold: AtomicUsize,
+        held: AtomicUsize,
+        released: AtomicBool,
+        let_go: Notify,
+        fails: bool,
+    }
+
+    impl HeldSource {
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.let_go.notify_waiters();
+        }
+    }
+
+    /// A [`HeldSource`] over an `obj`-byte blob that holds its first range.
+    fn held_source(obj: usize, fails: bool) -> Arc<HeldSource> {
+        held_sources(obj, 1, fails)
+    }
+
+    /// A [`HeldSource`] over an `obj`-byte blob that holds its first `hold` ranges.
+    fn held_sources(obj: usize, hold: usize, fails: bool) -> Arc<HeldSource> {
+        Arc::new(HeldSource {
+            inner: CountingSource::new(obj),
+            hold: AtomicUsize::new(hold),
+            held: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
+            let_go: Notify::new(),
+            fails,
+        })
     }
 
     #[async_trait]
@@ -2410,11 +3361,26 @@ mod tests {
         }
 
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-            if self.first.swap(false, Ordering::AcqRel) {
-                self.held.store(true, Ordering::Release);
-                timeout(NO_WAIT_DEADLINE, self.release.notified())
-                    .await
-                    .expect("the held GET is let go");
+            let held = self
+                .hold
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok();
+            if held {
+                self.held.fetch_add(1, Ordering::AcqRel);
+                let mut let_go = pin!(self.let_go.notified());
+                let_go.as_mut().enable();
+                if !self.released.load(Ordering::Acquire) {
+                    timeout(NO_WAIT_DEADLINE, let_go)
+                        .await
+                        .expect("the held GET is let go");
+                }
+                if self.fails {
+                    return Err(LazyByteSourceError::OutOfBounds {
+                        start,
+                        len,
+                        size: 0,
+                    });
+                }
             }
             self.inner.range(start, len).await
         }
