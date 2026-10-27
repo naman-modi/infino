@@ -224,6 +224,11 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// the ceiling order changes nothing there; pruning begins where tables have
 /// more superfiles than that, which is where it pays.
 const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 64;
+/// Default for [`SupertableOptions::scan_open_concurrency`]. High enough that
+/// it never throttles the opens of a few hundred files, which are small reads
+/// bound by round-trip latency; it is a guard against a scan over thousands of
+/// files dialing and buffering all of them at once.
+const DEFAULT_SCAN_OPEN_CONCURRENCY: usize = 256;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -380,6 +385,10 @@ pub struct SupertableOptions {
     /// I/O concurrency, deliberately independent of the reader pool's CPU
     /// width: a one-thread pool must not serialize fifteen superfile opens.
     pub bound_ordered_open_window: usize,
+    /// Superfiles a SQL scan opens at once. An open reads a file's footer and
+    /// index headers; past this many in flight the next waits for one to
+    /// finish. It limits only the opens, never the data reads that follow.
+    pub scan_open_concurrency: usize,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -790,6 +799,7 @@ impl SupertableOptions {
             disk_cache: None,
             manifest_disk_cache: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
+            scan_open_concurrency: DEFAULT_SCAN_OPEN_CONCURRENCY,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -944,6 +954,13 @@ impl SupertableOptions {
     /// (see [`Self::bound_ordered_open_window`]).
     pub fn with_bound_ordered_open_window(mut self, window: usize) -> Self {
         self.bound_ordered_open_window = window.max(1);
+        self
+    }
+
+    /// Set how many superfiles a SQL scan opens at once (see
+    /// [`Self::scan_open_concurrency`]).
+    pub fn with_scan_open_concurrency(mut self, concurrency: usize) -> Self {
+        self.scan_open_concurrency = concurrency.max(1);
         self
     }
 

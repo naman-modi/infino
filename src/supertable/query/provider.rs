@@ -80,7 +80,6 @@ use datafusion::{
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
-use futures::future::try_join_all;
 use object_store::ObjectStore as OsObjectStore;
 use parquet::{
     arrow::{
@@ -113,6 +112,7 @@ use crate::{
         query::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
+            dispatch::try_join_bounded,
             exec::{
                 common::{BoundPredicate, PushedPredicate, take_rows},
                 metered_exec::MeteredExec,
@@ -1228,13 +1228,22 @@ impl TableProvider for SupertableProvider {
         let plan_locations = &plan_locations;
 
         // Opening every survivor: the part of a scan that pays for a cache
-        // miss. The span says how many files each tier served, so a cold
-        // scan is legible from one line.
+        // miss. At most `scan_open_concurrency` files are mid-open at once,
+        // so a scan over thousands of survivors does not hold thousands of
+        // opens' buffers and connections; the data reads after the opens
+        // are not limited by it. The span says how many files each tier
+        // served, so a cold scan is legible from one line.
+        let open_concurrency = self.manifest.options.scan_open_concurrency;
         let open_span = tiered_span!("scan.open_files", files = survivors.len());
-        let prepared_files =
-            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
-                .instrument(open_span.clone())
-                .await?;
+        let prepared_files = try_join_bounded(
+            survivor_entries
+                .iter()
+                .cloned()
+                .map(|entry| async move { self.prepared_scan_file(&entry).await }),
+            open_concurrency,
+        )
+        .instrument(open_span.clone())
+        .await?;
         // The tally is a pass over the files; without the feature the span
         // is `none` and would drop the counts, so skip the pass too.
         if cfg!(feature = "detailed-tracing") {
@@ -1269,18 +1278,19 @@ impl TableProvider for SupertableProvider {
         let exact_slots = &exact_slots;
 
         // Pass 1 (per superfile), fanned out: every survivor resolves its
-        // candidate rows in its own future and `try_join_all` drives them
-        // together, so one superfile's dictionary fetch overlaps another's
-        // walk on the reader pool and a third's posting reads, instead of
-        // each superfile waiting for the one before it. The futures share
-        // this task rather than being spawned — the CPU is on the pool and
-        // the I/O is awaited, so the task only polls, and nothing here is
-        // `'static`. `try_join_all` keeps survivor order, so the file list
-        // below stays deterministic in manifest order, and the first
-        // error (in time) ends the scan.
-        let superfiles: Vec<SuperfileScan> = try_join_all(
-            survivors
+        // candidate rows in its own future and `try_join_bounded` drives up
+        // to `scan_open_concurrency` of them together, so one superfile's
+        // dictionary fetch overlaps another's walk on the reader pool and a
+        // third's posting reads, instead of each superfile waiting for the
+        // one before it. The futures share this task rather than being
+        // spawned — the CPU is on the pool and the I/O is awaited, so the
+        // task only polls, and nothing here is `'static`. Results come back
+        // in survivor order, so the file list below stays deterministic in
+        // manifest order, and the first error (in time) ends the scan.
+        let superfiles: Vec<SuperfileScan> = try_join_bounded(
+            survivor_entries
                 .iter()
+                .cloned()
                 .zip(prepared_files)
                 .map(|(entry, prepared)| {
                     let candidate_plan = &candidate_plan;
@@ -1410,6 +1420,7 @@ impl TableProvider for SupertableProvider {
                         })
                     }
                 }),
+            open_concurrency,
         )
         // The per-superfile predicate work above: index candidate plans,
         // their evaluation, and the tombstone overlay. Distinct from opening
