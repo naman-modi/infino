@@ -132,11 +132,14 @@ mod tests {
 
     use crate::{
         memory::{ConnectionMemoryBudget, budgeted_session_context},
-        supertable::query::{
-            df_object_store::SuperfileObjectStore,
-            exec::metered_exec::MeteredExec,
-            read_ahead::ScanReadAhead,
-            read_ahead_rule::{RULE_NAME, ReadAheadOff},
+        supertable::{
+            options::DEFAULT_SUPERFILES_IN_FLIGHT,
+            query::{
+                df_object_store::SuperfileObjectStore,
+                exec::metered_exec::MeteredExec,
+                read_ahead::ScanReadAhead,
+                read_ahead_rule::{RULE_NAME, ReadAheadOff},
+            },
         },
     };
 
@@ -164,6 +167,8 @@ mod tests {
             Arc::new(SuperfileObjectStore::new()),
             ConnectionMemoryBudget::measured(),
             schema(),
+            Arc::default(),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
         let meter: Arc<dyn ExecutionPlan> =
             Arc::new(MeteredExec::new(input, None).with_read_ahead(Arc::clone(&scan)));

@@ -53,7 +53,6 @@ use datafusion::{
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
     physical_expr::{PhysicalExpr, PhysicalSortExpr},
-    physical_expr_adapter::PhysicalExprAdapterFactory,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
         SendableRecordBatchStream, SortOrderPushdownResult,
@@ -341,12 +340,12 @@ impl ExecutionPlan for MeteredExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        // The plan is final now, so hand read-ahead the filter the scan prunes
-        // row groups with (join filters included).
+        // The plan is final now, so start read-ahead with the scan's filter
+        // (join filters included) and its files.
         if let Some(read_ahead) = &self.read_ahead
-            && let Some((predicate, adapter)) = scan_predicate(&self.input)
+            && let Some(scan) = file_scan(&self.input)
         {
-            read_ahead.set_predicate(predicate, adapter);
+            read_ahead.start(scan);
         }
         let inner = self.input.execute(partition, context)?;
         Ok(Box::pin(MeteredStream {
@@ -357,18 +356,16 @@ impl ExecutionPlan for MeteredExec {
     }
 }
 
-/// The filter of the file scan `plan`, if it is one and has a filter, with the
-/// scan's adapter from the table's schema to a file's.
-fn scan_predicate(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<(
-    Arc<dyn PhysicalExpr>,
-    Option<Arc<dyn PhysicalExprAdapterFactory>>,
-)> {
-    let scan = plan.downcast_ref::<DataSourceExec>()?;
-    let config = scan.data_source().downcast_ref::<FileScanConfig>()?;
-    let predicate = config.file_source().filter()?;
-    Some((predicate, config.expr_adapter_factory.clone()))
+/// The file scan at or below `plan`, through nodes of one input each: the
+/// optimizer can put a repartition between the meter and the scan.
+fn file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
+    if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
+        return scan.data_source().downcast_ref::<FileScanConfig>();
+    }
+    match plan.children()[..] {
+        [input] => file_scan(input),
+        _ => None,
+    }
 }
 
 /// Per-poll CPU bracket around one partition's stream.

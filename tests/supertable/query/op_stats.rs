@@ -1368,13 +1368,12 @@ fn sql_work_stats_are_deterministic_across_cache_temperature() {
 #[test]
 fn sql_work_stats_do_not_depend_on_reader_open_shape() {
     // A predicated scan makes DataFusion consult the Parquet page index.
-    // An eagerly-opened reader's footer parse already carries it; a cold
-    // disk-cache open serves the query through a lazy reader whose
-    // open-time parse is footer-only. The provider must serve DataFusion
-    // an index-complete parse loaded through the reader's own byte
-    // source — otherwise the opener fetches the index bytes through the
-    // metered store on the lazy shape only, and the same query prices
-    // differently depending on how its readers happened to be opened.
+    // An eagerly-opened reader parses it out of the bytes it holds; a cold
+    // disk-cache open serves the query through a lazy reader, which reads
+    // it through its own byte source. Either way the scan must hand
+    // DataFusion the index before it opens the file: otherwise the opener
+    // fetches the index bytes through the metered store, and the same query
+    // could price differently depending on how its readers were opened.
     //
     // The writer connection populates only its own in-memory reader
     // tier, so the cache-backed connection's first query really takes

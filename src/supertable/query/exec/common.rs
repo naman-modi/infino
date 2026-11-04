@@ -2080,8 +2080,9 @@ pub(crate) async fn take_rows_byte_source(
             }
         }
     }
+    // A take filters nothing, so it needs no column index.
     let metadata = reader
-        .parquet_metadata_with_page_index()
+        .parquet_metadata_with_page_index(&[])
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
@@ -2491,7 +2492,11 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, thread::sleep, time::Duration};
+    use std::{
+        sync::{Mutex, atomic::AtomicBool},
+        thread::sleep,
+        time::Duration,
+    };
 
     use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray, StructArray};
     use arrow_schema::Field;
@@ -2512,7 +2517,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::{LocalFsStorageProvider, StorageProvider},
+        error::{InfinoError, datafusion_error},
+        storage::{LocalFsStorageProvider, StorageError, StorageProvider},
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::{Bm25SearchOptions, BoolMode},
@@ -2521,7 +2527,13 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            query::{fts::TIE_NARROW_BATCH, read_ahead::fixture::Superfile},
+            query::{
+                fts::TIE_NARROW_BATCH,
+                read_ahead::{
+                    FileFooter,
+                    fixture::{Superfile, columns_with_column_index},
+                },
+            },
             reader_cache::{
                 ColdFetchMode, DiskCacheConfig, DiskCacheStore,
                 disk::test_support::RecordingStorage,
@@ -3541,7 +3553,7 @@ mod tests {
         let source: Arc<dyn LazyByteSource> = Arc::new(RecordingSource::new(bytes));
         let reader = SuperfileReader::open_lazy(source).await.expect("open lazy");
         let metadata = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&[])
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");
@@ -3579,6 +3591,83 @@ mod tests {
         );
     }
 
+    /// A source whose reads fail once `fail` is set.
+    struct FailingSource {
+        blob: Bytes,
+        fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for FailingSource {
+        fn size(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(LazyByteSourceError::Storage(StorageError::NotFound {
+                    uri: "gone".to_owned(),
+                }));
+            }
+            Ok(self.blob.slice(start as usize..(start + len) as usize))
+        }
+    }
+
+    /// The store goes away between a file's open and its page-index load:
+    ///  - the error is a query error, as when planning loaded the index.
+    ///  - it maps to a failed read, not an engine fault.
+    #[tokio::test]
+    async fn a_failed_page_index_load_is_a_failed_read() {
+        let source = Arc::new(FailingSource {
+            blob: titled_superfile_bytes(),
+            fail: AtomicBool::new(false),
+        });
+        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+            .await
+            .expect("open lazy");
+        source.fail.store(true, Ordering::Relaxed);
+        let error = FileFooter::with_page_index(&reader, &[])
+            .await
+            .expect_err("the store is gone");
+        let ParquetError::External(cause) = &error else {
+            panic!("a failed load is the reader's error: {error}");
+        };
+        assert!(cause.is::<QueryError>(), "{error}");
+        let error = DataFusionError::ParquetError(Box::new(error));
+        assert!(
+            matches!(datafusion_error(&error), InfinoError::Io(_)),
+            "{error}"
+        );
+    }
+
+    /// A take (the row fetch of a search, a vector query or a point lookup)
+    /// loads the offset index and no column index.
+    #[tokio::test]
+    async fn a_lazy_take_loads_the_offset_index_and_no_column_index() {
+        let source = Superfile::new(titled_superfile_bytes(), false);
+        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+            .await
+            .expect("open lazy");
+        let batch = take_rows_byte_source(&reader, &[3, 0], &["title"], None, None)
+            .await
+            .expect("take");
+        assert_eq!(titles_of(&batch), vec!["delta", "alpha"]);
+        let meta = reader.parquet_metadata();
+        assert!(
+            meta.offset_index().is_some(),
+            "the take read through the offset index"
+        );
+        assert!(
+            meta.column_index().is_some(),
+            "both parts are present, or DataFusion loads the index itself"
+        );
+        assert_eq!(
+            columns_with_column_index(&meta),
+            Vec::<usize>::new(),
+            "a take must keep no column index"
+        );
+    }
+
     /// A take reserves its prefetch from the connection's budget and gives it
     /// back when done; with no room there it streams instead. With no room
     /// in the cache's write queue it still prefetches. The same rows either
@@ -3590,7 +3679,7 @@ mod tests {
             .await
             .expect("open lazy");
         let metadata = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&[])
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");

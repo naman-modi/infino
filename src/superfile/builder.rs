@@ -8766,7 +8766,7 @@ mod tests {
         let footer_only = SuperfileReader::open(bytes.clone()).expect("open source");
         let indexed = SuperfileReader::open(bytes).expect("open source");
         let loaded = indexed
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&[])
             .await
             .expect("load the page index");
         assert!(

@@ -101,6 +101,9 @@ const TIE_BROKEN_TOP_K_MAX_ROWS: f64 = 100.0;
 /// Fewest rows a scan of `qty > 200` reads with no index: every row the
 /// range holds (49 values, about 22 live rows each).
 const TIE_BROKEN_TOP_K_SCAN_MIN_ROWS: f64 = 500.0;
+/// A range of a few rows per superfile, more than the one page each column
+/// has there and fewer than the share of rows the index takes on its own.
+const SCATTERED_RANGE: &str = "SELECT seq FROM {t} WHERE qty = 7";
 /// Where an analyzed plan names the scan, and how it counts what it read.
 const SCAN_OPERATOR: &str = "DataSourceExec";
 const OUTPUT_ROWS: &str = "output_rows=";
@@ -474,6 +477,18 @@ fn one_row_superfiles_answer_as_a_scan_does() {
         ranged.append(&one).expect("append ranged");
     }
     assert_same_answers(&db, QUERIES, "over one-row superfiles");
+}
+
+/// A range that matches more rows than its file's columns have pages is
+/// left to the scan, even on a table no query has read yet: the page counts
+/// are read when they decide, not kept from an earlier scan.
+#[test]
+fn a_range_matching_more_rows_than_pages_is_scanned_on_a_fresh_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    create(&db);
+    let plan = answer(&db, &format!("EXPLAIN ANALYZE {SCATTERED_RANGE}"), "ranged");
+    assert_eq!(scan_rows(&plan), (ROWS_PER_FILE * FILES) as f64, "{plan}");
 }
 
 #[test]

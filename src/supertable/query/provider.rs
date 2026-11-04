@@ -100,6 +100,7 @@ use parquet::{
         async_reader::AsyncFileReader,
     },
     file::metadata::ParquetMetaData,
+    schema::types::SchemaDescPtr,
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
@@ -137,7 +138,7 @@ use crate::{
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
-            read_ahead::ScanReadAhead,
+            read_ahead::{FileFooter, ScanReadAhead, stored_columns},
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
             superfile_reader::{
@@ -201,25 +202,49 @@ struct PreparedScanFile {
     /// [`rows_end`]); `None` hands it the whole file.
     rows_end: Option<u64>,
     row_counts: Arc<[u32]>,
-    /// Each column's data pages across the row groups, by name, from the
-    /// page index; empty when the file carries none.
-    pages: HashMap<String, u64>,
     /// Which cache tier the first open of this file was served from. A
     /// later scan of the same provider reuses the prepared file and reports
     /// the same tier: what it paid, not what it would pay now.
     tier: OpenTier,
 }
 
-impl PreparedScanFile {
-    /// The average data pages of `columns` in this file; `None` when the
-    /// page index names none of them.
-    fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
-        let pages: Vec<u64> = columns
-            .iter()
-            .filter_map(|column| self.pages.get(*column).copied())
-            .collect();
-        (!pages.is_empty()).then(|| pages.iter().sum::<u64>() / pages.len() as u64)
+/// The average data pages of `columns` across the row groups, from the
+/// offset index; `None` when there is none or it names none of them.
+fn pages_per_column(meta: &ParquetMetaData, columns: &[&str]) -> Option<u64> {
+    let offsets = meta.offset_index()?;
+    let counts: Vec<u64> = columns
+        .iter()
+        .map(|&column| stored_columns(meta, |name| name == column))
+        .filter(|stored| !stored.is_empty())
+        .map(|stored| {
+            offsets
+                .iter()
+                .flat_map(|row_group| stored.iter().filter_map(|&leaf| row_group.get(leaf)))
+                .map(|chunk| chunk.page_locations().len() as u64)
+                .sum()
+        })
+        .collect();
+    (!counts.is_empty()).then(|| counts.iter().sum::<u64>() / counts.len() as u64)
+}
+
+/// Whether a range matching `est` rows of `reader` matches more rows than
+/// the columns read have pages: then nearly every page holds one, and the
+/// scan beats the selection. A column has a page per row group at least, so
+/// the offset index is read only when `est` passes that, together with the
+/// column index of the filter's columns, which the scan reads next.
+async fn more_rows_than_pages(
+    reader: &SuperfileReader,
+    est: u64,
+    read_columns: &[&str],
+    filter_columns: &HashSet<&str>,
+) -> Result<bool, QueryError> {
+    let footer = reader.parquet_metadata();
+    if est <= footer.num_row_groups() as u64 {
+        return Ok(false);
     }
+    let filtered = stored_columns(&footer, |name| filter_columns.contains(name));
+    let meta = reader.parquet_metadata_with_page_index(&filtered).await?;
+    Ok(pages_per_column(&meta, read_columns).is_some_and(|pages| est > pages))
 }
 
 /// Register an opened superfile with the scan's store and footers, which
@@ -231,11 +256,11 @@ fn prepare_scan_file(
     entry: &SuperfileEntry,
     reader: Arc<SuperfileReader>,
     tier: OpenTier,
-    parquet_meta: Arc<ParquetMetaData>,
 ) -> Arc<PreparedScanFile> {
     let path = ObjPath::from(entry.storage_path());
     let source = reader.byte_source();
     let size = source.size();
+    let parquet_meta = reader.parquet_metadata();
     let row_counts: Arc<[u32]> = parquet_meta
         .row_groups()
         .iter()
@@ -243,26 +268,17 @@ fn prepare_scan_file(
         .collect::<Vec<_>>()
         .into();
     let rows_end = rows_end(&reader, &parquet_meta);
-    let mut pages: HashMap<String, u64> = HashMap::new();
-    if let Some(offsets) = parquet_meta.offset_index() {
-        let leaves = parquet_meta.file_metadata().schema_descr();
-        for row_group in offsets {
-            for (leaf, chunk) in row_group.iter().enumerate() {
-                if let Some(name) = leaves.column(leaf).path().parts().first() {
-                    *pages.entry(name.clone()).or_default() += chunk.page_locations().len() as u64;
-                }
-            }
-        }
-    }
     scan_store.insert_source(path.clone(), source);
-    scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
+    scan_footers.insert(
+        path.clone(),
+        Arc::new(ScanFooter::new(Arc::clone(&reader) as Arc<dyn FileFooter>)),
+    );
     Arc::new(PreparedScanFile {
         reader,
         path,
         size,
         rows_end,
         row_counts,
-        pages,
         tier,
     })
 }
@@ -776,7 +792,7 @@ impl SupertableProvider {
             }
         }
         let budget = &self.manifest.options.connection_memory_budget;
-        let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
+        let mut scan_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
         for (column, needles) in by_column {
             let (rows, column_work) = prepared
                 .reader
@@ -793,7 +809,7 @@ impl SupertableProvider {
                 )));
             }
             work.merge(column_work);
-            leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
+            scan_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
         }
         // Every leaf the tree reads has its rows; checked up front so the
         // lookup below cannot miss.
@@ -801,7 +817,7 @@ impl SupertableProvider {
             .filter
             .leaves()
             .into_iter()
-            .find(|leaf| !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
+            .find(|leaf| !scan_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
         {
             return Err(DataFusionError::Internal(format!(
                 "exact rows of column {:?}: no result for needle {:?}",
@@ -809,7 +825,7 @@ impl SupertableProvider {
             )));
         }
         let mut rows = check.filter.rows(&|leaf| {
-            leaf_rows
+            scan_rows
                 .get(&(leaf.column.as_str(), leaf.needle.as_str()))
                 .cloned()
                 .unwrap_or_default()
@@ -1184,12 +1200,15 @@ impl SupertableProvider {
     /// is not cached, so the next query retries a transient storage failure.
     ///
     /// A file an earlier scan of this provider prepared is ready at once, and
-    /// so is one this process already holds in memory with its page indexes
-    /// loaded. Any other is opened on a task of its own, because its footer
-    /// and page-index decodes are CPU work that would otherwise run one file
-    /// after another on the scan's task; the task runs on the query runtime,
-    /// as DataFusion's own Parquet decodes do, and is aborted if the returned
-    /// future is dropped. The future does nothing until it is first polled.
+    /// so is one this process already holds in memory. Any other is opened on
+    /// a task of its own, because its footer decode is CPU work that would
+    /// otherwise run one file after another on the scan's task; the task runs
+    /// on the query runtime, as DataFusion's own Parquet decodes do, and is
+    /// aborted if the returned future is dropped. The future does nothing
+    /// until it is first polled.
+    ///
+    /// Planning reads no page index: the scan loads what each file needs when
+    /// it starts ([`ScanReadAhead::start`]).
     fn prepared_scan_file(
         &self,
         entry: Arc<SuperfileEntry>,
@@ -1214,67 +1233,47 @@ impl SupertableProvider {
             // memory on this task keeps a warm scan over thousands of files
             // from paying a task each. It still goes through the cell, so a
             // file is registered with the scan's store once.
-            let resident = superfile_reader_in_memory(
+            if let Some(reader) = superfile_reader_in_memory(
                 &store,
                 disk_cache.as_ref(),
                 storage.as_ref(),
                 &entry.uri,
                 &entry.storage_path(),
                 open_intent,
-            );
-            if let Some(reader) = &resident
-                && let Some(parquet_meta) = reader.loaded_parquet_metadata_with_page_index()
-            {
+            ) {
                 let prepared = cell
-                    .get_or_try_init(|| async {
-                        Ok::<_, DataFusionError>(prepare_scan_file(
+                    .get_or_init(|| async {
+                        prepare_scan_file(
                             &scan_store,
                             &scan_footers,
                             &entry,
-                            Arc::clone(reader),
+                            reader,
                             OpenTier::Memory,
-                            parquet_meta,
-                        ))
+                        )
                     })
-                    .await?;
+                    .await;
                 return Ok(Arc::clone(prepared));
             }
             let open = async move {
                 let prepared = cell
                     .get_or_try_init(|| async {
-                        // A reader already in memory only lacks its page
-                        // indexes; reuse it rather than walk the tiers again.
-                        let (reader, tier) = match resident {
-                            Some(reader) => (reader, OpenTier::Memory),
-                            None => superfile_reader_tiered(
-                                &store,
-                                disk_cache.as_ref(),
-                                storage.as_ref(),
-                                &entry.uri,
-                                &entry.storage_path(),
-                                entry.subsection_offsets.as_ref(),
-                                open_intent,
-                            )
-                            .await
-                            .map_err(QueryError::store)?,
-                        };
-                        // Index-complete metadata (column + offset page indexes),
-                        // loaded through the reader's own byte source. Serving
-                        // DataFusion a footer-only parse would make its opener
-                        // fetch the page-index bytes through the metered store on
-                        // predicated scans — but only for lazily-opened readers,
-                        // making `sql_page_bytes` depend on reader-cache state.
-                        let parquet_meta = reader
-                            .parquet_metadata_with_page_index()
-                            .await
-                            .map_err(QueryError::from)?;
+                        let (reader, tier) = superfile_reader_tiered(
+                            &store,
+                            disk_cache.as_ref(),
+                            storage.as_ref(),
+                            &entry.uri,
+                            &entry.storage_path(),
+                            entry.subsection_offsets.as_ref(),
+                            open_intent,
+                        )
+                        .await
+                        .map_err(QueryError::store)?;
                         Ok::<_, DataFusionError>(prepare_scan_file(
                             &scan_store,
                             &scan_footers,
                             &entry,
                             reader,
                             tier,
-                            parquet_meta,
                         ))
                     })
                     .await?;
@@ -1675,14 +1674,19 @@ pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ScanFooter>>;
 /// A file's Parquet footer, and how many bytes each column takes in it.
 #[derive(Debug)]
 pub(crate) struct ScanFooter {
-    meta: Arc<ParquetMetaData>,
+    /// Where the scan reads the file's metadata. Asked each time, not kept
+    /// here, so a later page-index load doesn't leave a second copy behind.
+    file: Arc<dyn FileFooter>,
+    /// The file's Parquet schema, shared with its metadata.
+    schema: SchemaDescPtr,
     /// Bytes per column before compression. Added up once when the file is
     /// opened, so planning a query doesn't have to.
     leaf_bytes: Box<[u64]>,
 }
 
 impl ScanFooter {
-    fn new(meta: Arc<ParquetMetaData>) -> Self {
+    fn new(file: Arc<dyn FileFooter>) -> Self {
+        let meta = file.metadata();
         let mut leaf_bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
         for row_group in meta.row_groups() {
             for (bytes, chunk) in leaf_bytes.iter_mut().zip(row_group.columns()) {
@@ -1690,15 +1694,21 @@ impl ScanFooter {
             }
         }
         Self {
-            meta,
+            schema: meta.file_metadata().schema_descr_ptr(),
+            file,
             leaf_bytes: leaf_bytes.into(),
         }
+    }
+
+    /// Where the scan reads the file's metadata.
+    pub(crate) fn file(&self) -> Arc<dyn FileFooter> {
+        Arc::clone(&self.file)
     }
 
     /// `(column name, bytes)` for each column in the file. A list or struct
     /// column is stored in parts, and each part comes back under its name.
     pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, u64)> {
-        let leaves = self.meta.file_metadata().schema_descr().columns();
+        let leaves = self.schema.columns();
         leaves
             .iter()
             .zip(&self.leaf_bytes)
@@ -1952,6 +1962,12 @@ impl TableProvider for SupertableProvider {
         // task only polls, and nothing here is `'static`. Results come back
         // in survivor order, so the file list below stays deterministic in
         // manifest order, and the first error (in time) ends the scan.
+        // The columns the filters name, whose column index the scan reads.
+        let filter_columns: HashSet<&str> = filters
+            .iter()
+            .flat_map(Expr::column_refs)
+            .map(|column| column.name.as_str())
+            .collect();
         // The columns the scan decodes, whose pages a selection may skip.
         let read_columns: Vec<&str> = match projection {
             Some(indices) => indices
@@ -1977,6 +1993,7 @@ impl TableProvider for SupertableProvider {
                 .map(|(entry, prepared)| {
                     let candidate_plan = &candidate_plan;
                     let read_columns = &read_columns;
+                    let filter_columns = &filter_columns;
                     async move {
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
@@ -2046,12 +2063,7 @@ impl TableProvider for SupertableProvider {
                         // A file with no page index keeps the fraction.
                         let index_gate = match plan.only_ranges() {
                             true => {
-                                let fraction = (prepared.reader.n_docs() as f64
-                                    * PUSHDOWN_MAX_FRACTION)
-                                    as u64;
-                                prepared
-                                    .pages_per_column(read_columns)
-                                    .map_or(fraction, |pages| pages.min(fraction))
+                                (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64
                             }
                             false => gate,
                         };
@@ -2072,7 +2084,17 @@ impl TableProvider for SupertableProvider {
                             // index put first; a superfile none of them is in
                             // reads nothing.
                             Some(rows.get(&entry.superfile_id).cloned().unwrap_or_default())
-                        } else if est > index_gate || est >= density_cap {
+                        } else if est > index_gate
+                            || est >= density_cap
+                            || (plan.only_ranges()
+                                && more_rows_than_pages(
+                                    &prepared.reader,
+                                    est,
+                                    read_columns,
+                                    filter_columns,
+                                )
+                                .await?)
+                        {
                             None
                         } else {
                             let memos = memos_from_plan_locations(
@@ -2220,24 +2242,22 @@ impl TableProvider for SupertableProvider {
         // `FilterExec` predicate for statistics pruning, and as a row filter
         // only under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        // Serve DataFusion's opener the index-complete footers the
-        // readers already parsed — without this the opener re-reads +
-        // re-parses every superfile's footer on every query (~half the
-        // warm flat cost at 256 superfiles), and on predicated scans it
-        // would fetch page-index bytes through the metered store for
-        // lazily-opened readers (a cache-state-dependent priced counter).
+        // Serve DataFusion's opener the footers the readers already parsed, so
+        // it never reads a footer or a page index itself, which would cost a
+        // read per file per query.
         //
-        // The factory also sends byte reads through read-ahead. The meter
-        // hands it the scan's final filter when the scan runs, and
-        // `ReadAheadOff` turns it off under a LIMIT that can stop the scan.
+        // The factory also sends byte reads through read-ahead, which the meter
+        // starts when the scan runs (see `ScanReadAhead::start`). `ReadAheadOff`
+        // turns it off under a LIMIT that can stop the scan.
         let read_ahead = Arc::new(ScanReadAhead::new(
             Arc::clone(&self.scan_store),
             Arc::clone(&self.manifest.options.connection_memory_budget),
             Arc::clone(&self.schema),
+            Arc::clone(&self.scan_footers),
+            self.manifest.options.superfiles_in_flight,
         ));
         source = source.with_parquet_file_reader_factory(Arc::new(ScanReaderFactory {
             read_ahead: Arc::clone(&read_ahead),
-            footers: Arc::clone(&self.scan_footers),
         }));
 
         // ManifestSnapshot-derived statistics for the scan node. Exact only
@@ -2482,23 +2502,16 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
 }
 
 /// Gives DataFusion's Parquet opener the footer each [`SuperfileReader`]
-/// parsed at open, so a scan never reads a footer twice. Byte reads go
+/// parsed at open, with the page index the scan needs, so a scan never reads
+/// a footer twice. Byte reads go
 /// through a [`ReadAhead`] per file and partition, which reads the
 /// [`SuperfileObjectStore`] and downloads the next row groups on cold files.
 ///
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
+#[derive(Debug)]
 struct ScanReaderFactory {
-    /// The scan's store, budget and filter, shared by every reader.
+    /// The scan's store, budget, filter and footers, shared by every reader.
     read_ahead: Arc<ScanReadAhead>,
-    footers: Arc<ScanFooters>,
-}
-
-impl fmt::Debug for ScanReaderFactory {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ScanReaderFactory")
-            .field("superfiles", &self.footers.len())
-            .finish()
-    }
 }
 
 impl ParquetFileReaderFactory for ScanReaderFactory {
@@ -2512,12 +2525,9 @@ impl ParquetFileReaderFactory for ScanReaderFactory {
         _metrics: &ExecutionPlanMetricsSet,
     ) -> DfResult<Box<dyn AsyncFileReader + Send>> {
         let location = &partitioned_file.object_meta.location;
-        let footer = self
-            .footers
-            .get(location)
-            .map(|footer| Arc::clone(&footer.meta));
+        let footer = self.read_ahead.footer(location);
         Ok(match footer {
-            Some(meta) => Box::new(self.read_ahead.reader(partitioned_file, meta)),
+            Some(file) => Box::new(self.read_ahead.reader(partitioned_file, file)),
             // No footer from open: read it like DataFusion's own reader does.
             // Without it there's no plan, so no read-ahead.
             None => Box::new(
@@ -2992,12 +3002,17 @@ mod tests {
         prelude::{SessionContext, cast, col, lit},
         scalar::ScalarValue,
     };
+    use futures::{FutureExt, future::BoxFuture};
     use object_store::OBJECT_STORE_COALESCE_DEFAULT;
-    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    use parquet::{
+        arrow::arrow_reader::{RowSelection, RowSelector},
+        errors::Result as ParquetResult,
+        file::{metadata::ParquetMetaData, page_index::column_index::ColumnIndexMetaData},
+    };
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
-    use tokio::runtime;
+    use tokio::{runtime, sync::Barrier, time::timeout};
 
     use super::*;
     use crate::{
@@ -3006,7 +3021,8 @@ mod tests {
         runtime_metrics::op_stats::{current, with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
-            builder::FtsConfig,
+            LazyByteSource,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             fts::{
                 analysis::{Stemmer, Stopwords, chain_tokenizer},
                 tokenize::StandardTokenizer,
@@ -3017,13 +3033,15 @@ mod tests {
             Supertable, SupertableOptions,
             hydrate::hydrate_from_reader,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
+            options::DEFAULT_SUPERFILES_IN_FLIGHT,
             query::{
                 read_ahead::{PAGE_READ_THROUGH_BYTES, fixture},
                 sql::sql_session_context,
             },
+            schema::change::{FieldPatch, SchemaPatch},
         },
         test_helpers::{
-            build_title_batch, default_supertable_options, default_tokenizer, fid,
+            build_title_batch, decimal128_ids, default_supertable_options, default_tokenizer, fid,
             lazy_foreground_disk_cache,
         },
     };
@@ -4213,6 +4231,366 @@ mod tests {
         assert_eq!(doc_maps_read(&provider), [true], "a match read no map");
     }
 
+    // ---- Which part of the page index a scan loads -------------------
+
+    /// Rows of the page-index fixture.
+    const PAGED_ROWS: i64 = 6_000;
+    /// Bytes of padding on each `s` value, so the column spans several pages.
+    const PAGED_PADDING: usize = 1_000;
+    /// The row the filters pick.
+    const PAGED_NEEDLE: i64 = 3_000;
+    /// Rows per row group in the page-index fixture: three row groups.
+    const PAGED_ROW_GROUP_ROWS: usize = 2_000;
+    /// Partitions the page-index tests plan for, whatever the host's cores.
+    /// More than the fixture's one file, so the planner puts a repartition
+    /// between the meter and the scan, as on a production host.
+    const PAGED_PARTITIONS: usize = 4;
+
+    /// The `s` value of row `k`, sorted with `k`, so a filter on `s` skips
+    /// most pages.
+    fn paged_value(k: i64) -> String {
+        format!("{k:06}{}", "x".repeat(PAGED_PADDING))
+    }
+
+    /// The page-index fixture's columns: `k`, and `s` sorted with it.
+    fn paged_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    /// Options over the table in `storage_dir`, with no disk cache, so files
+    /// open as lazy readers that nothing promotes. Each call gets its own
+    /// reader cache.
+    fn paged_options(storage_dir: &TempDir) -> SupertableOptions {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(paged_schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage);
+        options.row_group_size = Some(PAGED_ROW_GROUP_ROWS);
+        options
+    }
+
+    /// A table of one file of [`PAGED_ROWS`] rows (see [`paged_options`]).
+    fn paged_table(storage_dir: &TempDir) -> Supertable {
+        let schema = paged_schema();
+        let table = Supertable::create(paged_options(storage_dir)).expect("create");
+        let ks: Vec<i64> = (0..PAGED_ROWS).collect();
+        let values: Vec<String> = ks.iter().map(|&k| paged_value(k)).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ks)),
+                Arc::new(LargeStringArray::from(values)),
+            ],
+        )
+        .expect("batch");
+        let mut writer = table.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        table
+    }
+
+    /// Run `sql` as a query does. Returns the rows, the rows the scans
+    /// decoded, and the provider.
+    async fn run_paged(table: &Supertable, sql: &str) -> (usize, usize, Arc<SupertableProvider>) {
+        let reader = table.reader().expect("reader");
+        let provider = Arc::new(SupertableProvider::new(
+            reader.sql_schemas().scan().clone(),
+            &reader,
+        ));
+        let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
+        ctx.register_table(TABLE_NAME, Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register");
+        ctx.sql(&format!(
+            "SET datafusion.execution.target_partitions = {PAGED_PARTITIONS}"
+        ))
+        .await
+        .expect("set partitions");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let rows = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("run")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        (rows, scan_rows(&plan), provider)
+    }
+
+    /// Rows the plan's scans produced: the rows of the pages they kept.
+    fn scan_rows(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        if plan.children().is_empty() {
+            return plan
+                .metrics()
+                .and_then(|metrics| metrics.output_rows())
+                .unwrap_or(0);
+        }
+        plan.children().into_iter().map(scan_rows).sum()
+    }
+
+    /// The page-index fixture's one reader, as the provider opened it.
+    fn paged_reader(provider: &SupertableProvider) -> Arc<SuperfileReader> {
+        let files: Vec<_> = provider
+            .prepared_scan_files
+            .iter()
+            .filter_map(|cell| cell.value().get().map(|file| Arc::clone(&file.reader)))
+            .collect();
+        assert_eq!(files.len(), 1, "the fixture is one file");
+        files.into_iter().next().expect("one file")
+    }
+
+    /// Whether every row group of `meta` has a real column index for `name`.
+    fn column_index_in_every_row_group(meta: &ParquetMetaData, name: &str) -> bool {
+        let leaves = meta.file_metadata().schema_descr().columns();
+        let leaf = leaves
+            .iter()
+            .position(|leaf| leaf.name() == name)
+            .expect("the column");
+        meta.num_row_groups() > 1
+            && meta.column_index().is_some_and(|index| {
+                index
+                    .iter()
+                    .all(|row_group| !matches!(row_group[leaf], ColumnIndexMetaData::NONE))
+            })
+    }
+
+    /// The names of the columns `meta` has a real column index for.
+    fn column_index_columns(meta: &ParquetMetaData) -> Vec<String> {
+        let leaves = meta.file_metadata().schema_descr().columns();
+        fixture::columns_with_column_index(meta)
+            .into_iter()
+            .map(|leaf| leaves[leaf].name().to_owned())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filtered_scan_loads_the_column_index_of_only_its_filter_column() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        let sql = format!(
+            "SELECT k FROM {TABLE_NAME} WHERE s = '{}'",
+            paged_value(PAGED_NEEDLE)
+        );
+        let (rows, decoded, provider) = run_paged(&table, &sql).await;
+        assert_eq!(rows, 1);
+        assert!(
+            decoded < PAGED_ROWS as usize / 2,
+            "the filter column's pages were not skipped: {decoded} of {PAGED_ROWS} rows decoded"
+        );
+        let meta = paged_reader(&provider).parquet_metadata();
+        assert_eq!(column_index_columns(&meta), ["s"]);
+        assert!(column_index_in_every_row_group(&meta, "s"));
+        assert!(meta.offset_index().is_some());
+    }
+
+    /// Rename `s` to `t`, then filter on `t`:
+    ///  - the file still stores the column as `s`, so `s`'s column index loads.
+    ///  - pages are still skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filter_on_a_renamed_column_loads_its_stored_columns_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        let id = table.table_schema().id_of("s").expect("s has an id");
+        table
+            .apply_schema(
+                &SchemaPatch::new(vec![FieldPatch::named("t").with_id(id)]),
+                None,
+            )
+            .expect("rename s to t");
+        let sql = format!(
+            "SELECT k FROM {TABLE_NAME} WHERE t = '{}'",
+            paged_value(PAGED_NEEDLE)
+        );
+        let (rows, decoded, provider) = run_paged(&table, &sql).await;
+        assert_eq!(rows, 1);
+        assert!(
+            decoded < PAGED_ROWS as usize / 2,
+            "the renamed column's pages were not skipped: {decoded} of {PAGED_ROWS} rows decoded"
+        );
+        assert_eq!(
+            column_index_columns(&paged_reader(&provider).parquet_metadata()),
+            ["s"]
+        );
+    }
+
+    /// `ORDER BY s LIMIT 1` filters the scan on `s` as rows arrive, so the
+    /// file loads `s`'s column index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_top_k_scan_loads_the_column_index_of_its_sort_column() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        let sql = format!("SELECT k FROM {TABLE_NAME} ORDER BY s LIMIT 1");
+        let (rows, _, provider) = run_paged(&table, &sql).await;
+        assert_eq!(rows, 1);
+        assert_eq!(
+            column_index_columns(&paged_reader(&provider).parquet_metadata()),
+            ["s"]
+        );
+    }
+
+    /// A [`FileFooter`] whose load waits until every file's load has started,
+    /// so loads run one after another never finish.
+    #[derive(Debug)]
+    struct GatedFooter {
+        meta: Arc<ParquetMetaData>,
+        gate: Arc<Barrier>,
+    }
+
+    impl FileFooter for GatedFooter {
+        fn metadata(&self) -> Arc<ParquetMetaData> {
+            Arc::clone(&self.meta)
+        }
+
+        fn with_page_index<'a>(
+            &'a self,
+            _filter_columns: &'a [usize],
+        ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+            async move {
+                self.gate.wait().await;
+                Ok(Arc::clone(&self.meta))
+            }
+            .boxed()
+        }
+    }
+
+    /// Files in the parallel-load test.
+    const GATED_FILES: usize = 8;
+    /// How long the parallel-load test waits before it fails.
+    const GATED_LOADS_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Start a scan as a `LIMIT` gate does: the first file as a scan of its
+    /// own, then the rest.
+    ///  - every file's load starts at once, not one per open.
+    ///  - the second scan's files load too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_starts_every_files_page_index_load_at_once() {
+        let (_, meta) = fixture::small_file();
+        let gate = Arc::new(Barrier::new(GATED_FILES + 1));
+        let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
+        let schema = fixture::schema();
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let scan_of = |files: Vec<PartitionedFile>| {
+            let source = Arc::new(ParquetSource::new(Arc::clone(&schema)));
+            files
+                .into_iter()
+                .fold(
+                    FileScanConfigBuilder::new(url.clone(), source),
+                    |scan, file| scan.with_file_group(FileGroup::new(vec![file])),
+                )
+                .build()
+        };
+        let mut files: Vec<PartitionedFile> = (0..GATED_FILES)
+            .map(|f| {
+                let path = ObjPath::from(format!("t/{f}.parquet"));
+                let footer: Arc<dyn FileFooter> = Arc::new(GatedFooter {
+                    meta: Arc::clone(&meta),
+                    gate: Arc::clone(&gate),
+                });
+                footers.insert(path.clone(), Arc::new(ScanFooter::new(footer)));
+                // Reading some rows needs the page index, even with no filter.
+                let mut plan = ParquetAccessPlan::new_all(meta.num_row_groups());
+                plan.scan_selection(0, RowSelection::from(vec![RowSelector::select(1)]));
+                PartitionedFile::new(path.to_string(), 0).with_extension(plan)
+            })
+            .collect();
+        let rest = files.split_off(1);
+        let (first, rest) = (scan_of(files), scan_of(rest));
+        let read_ahead = Arc::new(ScanReadAhead::new(
+            Arc::new(SuperfileObjectStore::new()),
+            ConnectionMemoryBudget::measured(),
+            Arc::clone(&schema),
+            footers,
+            GATED_FILES,
+        ));
+        read_ahead.start(&first);
+        read_ahead.start(&rest);
+        timeout(GATED_LOADS_TIMEOUT, gate.wait())
+            .await
+            .expect("the scan's page-index loads ran one at a time, or a node never started");
+    }
+
+    /// A join on `s` skips the probe side's pages through `s`'s column index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_join_filter_skips_probe_pages_through_its_column_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        let sql = format!(
+            "SELECT t.k FROM {TABLE_NAME} t JOIN (VALUES ('{}')) AS b(s) ON t.s = b.s",
+            paged_value(PAGED_NEEDLE)
+        );
+        let (rows, decoded, provider) = run_paged(&table, &sql).await;
+        assert_eq!(rows, 1);
+        assert!(
+            decoded < PAGED_ROWS as usize / 2,
+            "the join filter skipped no probe page: {decoded} of {PAGED_ROWS} rows decoded"
+        );
+        assert_eq!(
+            column_index_columns(&paged_reader(&provider).parquet_metadata()),
+            ["s"]
+        );
+    }
+
+    /// A scan with no filter and no deleted rows loads no page index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_with_no_filter_loads_no_page_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        let sql = format!("SELECT s FROM {TABLE_NAME}");
+        let (rows, _, provider) = run_paged(&table, &sql).await;
+        assert_eq!(rows, PAGED_ROWS as usize);
+        let meta = paged_reader(&provider).parquet_metadata();
+        assert!(meta.offset_index().is_none() && meta.column_index().is_none());
+    }
+
+    /// A scan with deleted rows and no filter loads the offset index only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_skipping_deleted_rows_loads_only_the_offset_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        table
+            .delete(col("k").lt(lit(PAGED_NEEDLE)))
+            .expect("delete");
+        // The delete ran a filtered scan of its own; reopen so this test sees
+        // only what the next scan loads.
+        let table = Supertable::open(paged_options(&dir)).expect("reopen");
+        let sql = format!("SELECT s FROM {TABLE_NAME}");
+        let (rows, _, provider) = run_paged(&table, &sql).await;
+        assert_eq!(rows, (PAGED_ROWS - PAGED_NEEDLE) as usize);
+        let meta = paged_reader(&provider).parquet_metadata();
+        assert!(meta.offset_index().is_some());
+        assert_eq!(column_index_columns(&meta), Vec::<String>::new());
+    }
+
+    /// A filter on `s`, then one on `k`: the reader keeps both columns' index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_query_filtering_another_column_adds_its_column_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = paged_table(&dir);
+        let on_s = format!(
+            "SELECT k FROM {TABLE_NAME} WHERE s = '{}'",
+            paged_value(PAGED_NEEDLE)
+        );
+        let on_k = format!("SELECT s FROM {TABLE_NAME} WHERE k = {PAGED_NEEDLE}");
+        let (rows, _, first) = run_paged(&table, &on_s).await;
+        assert_eq!(rows, 1);
+        let (rows, _, second) = run_paged(&table, &on_k).await;
+        assert_eq!(rows, 1);
+        let reader = paged_reader(&second);
+        assert!(
+            Arc::ptr_eq(&reader, &paged_reader(&first)),
+            "the second query must reuse the reader the first opened"
+        );
+        assert_eq!(column_index_columns(&reader.parquet_metadata()), ["k", "s"]);
+    }
+
     // ---- Scalar aggregate helpers over a numeric column -------------
 
     fn num_schema() -> SchemaRef {
@@ -4610,20 +4988,26 @@ mod tests {
         });
         store.insert_source(path.clone(), source);
         let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
-        footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
+        footers.insert(
+            path.clone(),
+            Arc::new(ScanFooter::new(Arc::new(fixture::Footer(Arc::clone(
+                &meta,
+            ))))),
+        );
         let schema = fixture::schema();
         let budget = ConnectionMemoryBudget::measured();
         let read_ahead_state = Arc::new(ScanReadAhead::new(
             Arc::clone(&store),
             Arc::clone(&budget),
             Arc::clone(&schema),
+            footers,
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
         if !read_ahead {
             read_ahead_state.disable();
         }
         let factory = ScanReaderFactory {
             read_ahead: Arc::clone(&read_ahead_state),
-            footers,
         };
         let mut parquet = ParquetSource::new(Arc::clone(&schema))
             .with_parquet_file_reader_factory(Arc::new(factory));
@@ -5112,6 +5496,8 @@ mod tests {
             Arc::new(SuperfileObjectStore::new()),
             ConnectionMemoryBudget::measured(),
             Arc::clone(&schema),
+            Arc::default(),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
         let predicate =
@@ -5147,8 +5533,9 @@ mod tests {
                 Arc::new(SuperfileObjectStore::new()),
                 ConnectionMemoryBudget::measured(),
                 Arc::new(Schema::empty()),
+                Arc::default(),
+                DEFAULT_SUPERFILES_IN_FLIGHT,
             )),
-            footers: Arc::new(DashMap::new()),
         };
         let file = PartitionedFile::new("t/missing.parquet", FOOTERLESS_FILE_BYTES);
         assert!(
@@ -5168,13 +5555,80 @@ mod tests {
                 Arc::new(SuperfileObjectStore::new()),
                 ConnectionMemoryBudget::measured(),
                 Arc::new(Schema::empty()),
+                Arc::default(),
+                DEFAULT_SUPERFILES_IN_FLIGHT,
             )),
-            footers: Arc::new(DashMap::new()),
         };
         let dbg = format!("{factory:?}");
         assert!(
             dbg.contains("ScanReaderFactory") && dbg.contains("superfiles: 0"),
             "Debug missing fields: {dbg}"
+        );
+    }
+
+    /// Rows of the range check's superfile: few enough for one row group,
+    /// with one page per column.
+    const RANGE_CHECK_ROWS: u64 = 100;
+
+    /// A superfile of `doc_id` and a number `qty`, in one row group.
+    fn number_superfile() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        let opts = BuilderOptions::new(Arc::clone(&schema), "doc_id", vec![], vec![]);
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let qty = Int64Array::from_iter_values(0..RANGE_CHECK_ROWS as i64);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(decimal128_ids(0..RANGE_CHECK_ROWS)), Arc::new(qty)],
+        )
+        .expect("batch");
+        builder.add_batch(&batch, &[]).expect("add batch");
+        Bytes::from(builder.finish().expect("finish"))
+    }
+
+    /// The range check on a cold file:
+    ///  - a range of no more rows than the file has row groups decides with
+    ///    no read.
+    ///  - a larger one reads the page index once, with the column index of
+    ///    the filter's columns, so the scan that follows reads nothing more.
+    #[tokio::test]
+    async fn the_range_check_reads_the_page_index_once_and_only_when_it_decides() {
+        let source = fixture::Superfile::new(number_superfile(), false);
+        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+            .await
+            .expect("lazy open");
+        let footer = reader.parquet_metadata();
+        let row_groups = footer.num_row_groups() as u64;
+        let filter_columns = HashSet::from(["qty"]);
+        let reads = || source.reads().len();
+        let opened = reads();
+
+        let within = more_rows_than_pages(&reader, row_groups, &["qty"], &filter_columns)
+            .await
+            .expect("check");
+        assert!(
+            !within,
+            "a range within the row groups is never above the pages"
+        );
+        assert_eq!(reads(), opened, "and is decided without a read");
+
+        let above = more_rows_than_pages(&reader, row_groups + 1, &["qty"], &filter_columns)
+            .await
+            .expect("check");
+        assert!(above, "one page per column, so two rows are above it");
+        assert_eq!(reads(), opened + 1, "the check reads the page index once");
+
+        let qty = stored_columns(&footer, |name| name == "qty");
+        reader
+            .parquet_metadata_with_page_index(&qty)
+            .await
+            .expect("the scan's load");
+        assert_eq!(
+            reads(),
+            opened + 1,
+            "the scan finds the filter's column index already loaded"
         );
     }
 }
