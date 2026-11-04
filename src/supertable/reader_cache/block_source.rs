@@ -24,7 +24,8 @@
 //! ```text
 //!   where the missing run lies         what its GET covers
 //!   ──────────────────────────         ──────────────────────────────────────────────
-//!   wholly inside the FTS hole         the read's exact bytes; no blocks are filled
+//!   wholly inside the FTS hole (from   the read's exact bytes; no blocks are filled
+//!   the postings on, once known)
 //!   in a 512 KiB group touching the    that whole group, aligned to file offset 0,
 //!   aligned region (vector             less the group's leading blocks already
 //!   subsection, or a file of           cached
@@ -223,7 +224,9 @@ pub(crate) struct SourceLayout {
     /// to a block over-fetches many times on a wide OR. Blocks already there
     /// still serve it: those [`BlockCachedSource::prefetch`] filled, or the
     /// leading ones a short GET just before the hole covered. A read only partly
-    /// inside behaves as anywhere else.
+    /// inside behaves as anywhere else. Once the FTS header is read the hole
+    /// starts at the postings: the term dictionary before them fills blocks
+    /// (see [`BlockCachedSource::set_fts_postings_start`]).
     pub(crate) fts_hole: Option<(u64, u64)>,
     /// The vector subsection. A GET for a run in a group of [`ALIGNED_GET_BYTES`]
     /// that touches it covers that whole group, so a group at either edge also
@@ -270,6 +273,9 @@ pub(crate) struct BlockCachedSource {
     owns_accounting: bool,
     /// Where this file's FTS hole and aligned region lie.
     layout: SourceLayout,
+    /// Where the FTS postings start, set once the FTS header is read: the
+    /// hole begins there (see [`Self::fts_hole`]).
+    fts_postings: OnceLock<u64>,
     /// Where the last [`READ_ENDS`] reads ended, `u64::MAX` in unused slots,
     /// written round robin from `next_read_end`. Several readers share one
     /// source (a query's partitions each scan a byte range of the file, and
@@ -733,6 +739,7 @@ impl BlockCachedSource {
                 fts_hole: layout.fts_hole.filter(|&(_, len)| len > 0),
                 aligned_region: layout.aligned_region.filter(|&(_, len)| len > 0),
             },
+            fts_postings: OnceLock::new(),
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
             state: OnceLock::new(),
@@ -750,9 +757,30 @@ impl BlockCachedSource {
         })
     }
 
+    /// Record the file offset where the FTS postings start, once the FTS
+    /// header is read. Every query reads the term dictionary before them
+    /// whole, so it fills blocks and a repeat is local; only the postings,
+    /// read in small scattered pieces, keep the hole's exact reads. The first
+    /// call wins.
+    pub(crate) fn set_fts_postings_start(&self, offset: u64) {
+        let _ = self.fts_postings.set(offset);
+    }
+
+    /// The FTS hole as `(offset, len)`: from the postings on once their start
+    /// is known, else the whole FTS subsection.
+    fn fts_hole(&self) -> Option<(u64, u64)> {
+        let (off, len) = self.layout.fts_hole?;
+        let end = off + len;
+        let start = self
+            .fts_postings
+            .get()
+            .map_or(off, |&postings| postings.clamp(off, end));
+        Some((start, end - start))
+    }
+
     /// Whether `[start, start + len)` lies fully inside the FTS hole.
     fn in_fts_hole(&self, start: u64, len: u64) -> bool {
-        match self.layout.fts_hole {
+        match self.fts_hole() {
             Some((off, hole_len)) => start >= off && start + len <= off + hole_len,
             None => false,
         }
@@ -1106,10 +1134,10 @@ impl BlockCachedSource {
         } else {
             // When the FTS hole starts inside the window, after the start of the
             // read's first block (the read ends before it or runs into it), all of the window
-            // goes ahead: the term dictionary at the hole's start is read
-            // forwards, one lookup after another, so blocks behind the read would
-            // only take its place.
-            let hole_ahead = self.layout.fts_hole.is_some_and(|(off, _)| {
+            // goes ahead: the term dictionary, at the hole's start or (once the postings
+            // start is known) just before it, is read forwards, so blocks behind the
+            // read would only take its place.
+            let hole_ahead = self.fts_hole().is_some_and(|(off, _)| {
                 let window_end = u64::from(first) + u64::from(MIN_GET_BLOCKS);
                 u64::from(first) * CACHE_BLOCK_BYTES < off && off < window_end * CACHE_BLOCK_BYTES
             });
@@ -3013,6 +3041,64 @@ mod tests {
             .expect("sync hole read from disk");
         assert_eq!(sync, got);
         assert_eq!(inner.calls(), 6, "prefetched hole reads need no GETs");
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Blocks in the dictionary test's file.
+    const DICTIONARY_FILE_BLOCKS: u64 = 32;
+    /// Blocks of the dictionary test's FTS hole, which starts a little into
+    /// block 2.
+    const DICTIONARY_HOLE_BLOCKS: u64 = 24;
+    /// How far into its first block the dictionary test's hole starts.
+    const DICTIONARY_HOLE_SKEW: u64 = 100;
+    /// Blocks of term dictionary at the hole's start, before the postings.
+    const DICTIONARY_BLOCKS: u64 = 3;
+    /// How far past the postings start the test reads a posting: beyond the
+    /// window the dictionary's read filled.
+    const FAR_POSTING_BLOCKS: u64 = 12;
+    /// Bytes of that posting read.
+    const POSTING_READ_BYTES: u64 = 1000;
+    /// Times each read repeats.
+    const REPEATS: usize = 3;
+
+    /// Once the postings start is known, the dictionary before them is read
+    /// like anywhere else: one GET, then local. A postings read past the
+    /// dictionary's window still passes through exact and fills nothing.
+    #[tokio::test]
+    async fn the_dictionary_fills_blocks_once_the_postings_start_is_known() {
+        let b = CACHE_BLOCK_BYTES;
+        let hole = (2 * b + DICTIONARY_HOLE_SKEW, DICTIONARY_HOLE_BLOCKS * b);
+        let postings = hole.0 + DICTIONARY_BLOCKS * b;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let obj = (DICTIONARY_FILE_BLOCKS * b) as usize;
+        let (uri, inner, src) = holed_source(dir.path(), &store, obj, hole);
+        src.set_fts_postings_start(postings);
+
+        let (start, len) = (hole.0, postings - hole.0);
+        for _ in 0..REPEATS {
+            let got = src.range(start, len).await.expect("dictionary read");
+            assert_eq!(
+                got,
+                inner.blob.slice(start as usize..(start + len) as usize)
+            );
+        }
+        assert_eq!(inner.calls(), 1, "the dictionary is one GET, then local");
+
+        let far = postings + FAR_POSTING_BLOCKS * b;
+        let calls = inner.calls();
+        for _ in 0..REPEATS {
+            let _ = src
+                .range(far, POSTING_READ_BYTES)
+                .await
+                .expect("postings read");
+        }
+        assert_eq!(
+            inner.calls(),
+            calls + REPEATS,
+            "postings reads pass through"
+        );
 
         store.remove_block_entry_for_test(&uri);
     }

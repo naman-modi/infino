@@ -127,6 +127,9 @@ use crate::{
     },
 };
 
+/// Each term leaf's df in one superfile, by `(column, token)`.
+type TermDfs<'p> = HashMap<(&'p str, &'p str), u64>;
+
 /// What a SQL `WHERE` pushed into a search TVF admits, resolved once per
 /// query against the pinned snapshot and shared by every retriever the
 /// query runs (`hybrid_search` runs two): the superfiles that may hold a
@@ -652,30 +655,74 @@ impl CandidatePlan {
         pool: Option<&'a ThreadPool>,
     ) -> BoxFuture<'a, Result<(u64, MatchWork), ReadError>> {
         Box::pin(async move {
+            // One df lookup per column for all its term leaves, so an `IN` of
+            // ten values reads its term headers in one fetch, not ten.
+            let mut leaves: HashMap<&str, HashSet<&str>> = HashMap::new();
+            self.term_leaves(&mut leaves);
+            let mut dfs: TermDfs<'_> = HashMap::new();
+            let mut work = MatchWork::default();
+            for (column, tokens) in leaves {
+                let tokens: Vec<&str> = tokens.into_iter().collect();
+                let (found, lookup_work) = reader.term_dfs(column, &tokens).await?;
+                work.merge(lookup_work);
+                dfs.extend(tokens.into_iter().map(|token| (column, token)).zip(found));
+            }
+            let (rows, plan_work) = self.estimate_with(reader, pool, &dfs).await?;
+            work.merge(plan_work);
+            Ok((rows, work))
+        })
+    }
+
+    /// The tokens of every term leaf, by column, outside `LIKE` leaves,
+    /// which name their terms only once expanded.
+    fn term_leaves<'s>(&'s self, leaves: &mut HashMap<&'s str, HashSet<&'s str>>) {
+        match self {
+            CandidatePlan::TermsAll {
+                column,
+                tokens: terms,
+            }
+            | CandidatePlan::TermsAny { column, terms } => leaves
+                .entry(column.as_str())
+                .or_default()
+                .extend(terms.iter().map(String::as_str)),
+            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                for child in children {
+                    child.term_leaves(leaves);
+                }
+            }
+            CandidatePlan::TermsLike { .. }
+            | CandidatePlan::Range { .. }
+            | CandidatePlan::Unbounded => {}
+        }
+    }
+
+    /// [`Self::estimate`] with every term leaf's df already in `dfs`.
+    fn estimate_with<'a>(
+        &'a self,
+        reader: &'a SuperfileReader,
+        pool: Option<&'a ThreadPool>,
+        dfs: &'a TermDfs<'a>,
+    ) -> BoxFuture<'a, Result<(u64, MatchWork), ReadError>> {
+        Box::pin(async move {
             let n_docs = reader.n_docs();
+            let df = |column: &str, token: &str| dfs.get(&(column, token)).copied().unwrap_or(0);
             match self {
                 CandidatePlan::Unbounded => Ok((n_docs, MatchWork::default())),
+                // Intersection ≤ the rarest token's df.
                 CandidatePlan::TermsAll { column, tokens } => {
-                    if tokens.is_empty() {
-                        return Ok((n_docs, MatchWork::default()));
-                    }
-                    // Intersection ≤ the rarest token's df — resolved with one
-                    // batched df lookup (single dictionary parse + coalesced
-                    // header fetch) rather than one parse + fetch per token.
-                    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let (dfs, work) = reader.term_dfs(column, &refs).await?;
-                    let min_df = dfs.into_iter().min().unwrap_or(u64::MAX);
-                    Ok((min_df.min(n_docs), work))
+                    let min_df = tokens.iter().map(|t| df(column, t.as_str())).min();
+                    Ok((
+                        min_df.map_or(n_docs, |m| m.min(n_docs)),
+                        MatchWork::default(),
+                    ))
                 }
+                // Union ≤ the sum of the terms' dfs.
                 CandidatePlan::TermsAny { column, terms } => {
-                    if terms.is_empty() {
-                        return Ok((0, MatchWork::default()));
-                    }
-                    // Union ≤ the sum of the terms' dfs.
-                    let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                    let (dfs, work) = reader.term_dfs(column, &refs).await?;
-                    let sum = dfs.into_iter().fold(0u64, u64::saturating_add);
-                    Ok((sum.min(n_docs), work))
+                    let sum = terms
+                        .iter()
+                        .map(|t| df(column, t.as_str()))
+                        .fold(0u64, u64::saturating_add);
+                    Ok((sum.min(n_docs), MatchWork::default()))
                 }
                 CandidatePlan::TermsLike {
                     column,
@@ -705,7 +752,7 @@ impl CandidatePlan {
                     let mut m = n_docs;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader, pool).await?;
+                        let (child, child_work) = c.estimate_with(reader, pool, dfs).await?;
                         work.merge(child_work);
                         m = m.min(child);
                     }
@@ -715,7 +762,7 @@ impl CandidatePlan {
                     let mut sum: u64 = 0;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader, pool).await?;
+                        let (child, child_work) = c.estimate_with(reader, pool, dfs).await?;
                         work.merge(child_work);
                         sum = sum.saturating_add(child);
                     }
@@ -1661,7 +1708,9 @@ fn collect_like_leaves(
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::DataType;
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
     use datafusion::{
         logical_expr::expr::InList,
         prelude::{cast, col, lit},
@@ -1669,13 +1718,61 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::superfile::{
-        fts::{
-            analysis::{Stemmer, Stopwords, chain_tokenizer},
-            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
+    use crate::{
+        superfile::{
+            LazyByteSource,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            fts::{
+                analysis::{Stemmer, Stopwords, chain_tokenizer},
+                tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
+            },
+            vector::layout::VectorLayout,
         },
-        vector::layout::VectorLayout,
+        supertable::query::read_ahead::fixture::Superfile,
+        test_helpers::decimal128_ids,
     };
+
+    /// Titles of the estimate's superfile: each word in several rows, so
+    /// each has postings to read, not an inline df.
+    const ESTIMATE_TITLES: [&str; 6] = [
+        "alpha beta gamma",
+        "alpha beta",
+        "beta gamma",
+        "gamma alpha",
+        "alpha beta gamma",
+        "beta",
+    ];
+
+    /// A superfile of `ESTIMATE_TITLES` with `title` FTS-indexed, opened
+    /// over a source that counts its reads, and the reads its open made.
+    async fn cold_title_reader() -> (Arc<Superfile>, SuperfileReader, usize) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids(0..ESTIMATE_TITLES.len() as u64)),
+                Arc::new(LargeStringArray::from(ESTIMATE_TITLES.to_vec())),
+            ],
+        )
+        .expect("batch");
+        builder.add_batch(&batch, &[]).expect("add batch");
+        let source = Superfile::new(Bytes::from(builder.finish().expect("finish")), false);
+        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+            .await
+            .expect("lazy open");
+        let opened = source.reads().len();
+        (source, reader, opened)
+    }
 
     fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
@@ -2743,6 +2840,34 @@ mod tests {
         assert_eq!(
             ExactFilter::Or(vec![ExactFilter::And(vec![a.clone(), b]), a]).rows(&leaf_rows),
             rows(&[1, 2], &[3])
+        );
+    }
+
+    /// An `OR` of one-term leaves on a column (an `IN` list) estimates with
+    /// the reads of one lookup of all its terms, not one lookup per leaf.
+    #[tokio::test]
+    async fn an_in_list_estimates_with_one_lookup_per_column() {
+        let words = ["alpha", "beta", "gamma"];
+        let leaf = |word: &str| CandidatePlan::TermsAny {
+            column: "title".to_owned(),
+            terms: vec![word.to_owned()],
+        };
+        let in_list = CandidatePlan::Or(words.iter().map(|word| leaf(word)).collect());
+        let one_lookup = CandidatePlan::TermsAny {
+            column: "title".to_owned(),
+            terms: words.iter().map(|word| (*word).to_owned()).collect(),
+        };
+
+        let mut runs = Vec::new();
+        for plan in [&in_list, &one_lookup] {
+            let (source, reader, opened) = cold_title_reader().await;
+            let (rows, _) = plan.estimate(&reader, None).await.expect("estimate");
+            runs.push((rows, source.reads().len() - opened));
+        }
+        assert!(runs[1].1 > 0, "the lookup reads the dictionary: {runs:?}");
+        assert_eq!(
+            runs[0], runs[1],
+            "(rows, reads) of the IN list vs one lookup"
         );
     }
 }

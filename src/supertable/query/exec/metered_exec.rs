@@ -41,7 +41,10 @@
 use std::{
     fmt,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -84,6 +87,9 @@ pub(crate) struct MeteredExec {
     /// Read-ahead for the table scan below, if it is one. `ReadAheadOff`
     /// turns it off under a `LIMIT`.
     read_ahead: Option<Arc<ScanReadAhead>>,
+    /// Whether a partition of this node started the scan's page-index loads.
+    /// A rewritten plan gets a new node, and starts them again for its scan.
+    loads_started: AtomicBool,
     /// Whether the planner may carry a `LIMIT` fetch past this node into
     /// the child. The one place this is `false` is the meter the table
     /// provider wraps around a scan that carries filters — see
@@ -105,6 +111,7 @@ impl MeteredExec {
             op_stats,
             footers: None,
             read_ahead: None,
+            loads_started: AtomicBool::new(false),
             limit_pushdown: true,
         }
     }
@@ -129,6 +136,7 @@ impl MeteredExec {
             op_stats,
             footers: None,
             read_ahead: None,
+            loads_started: AtomicBool::new(false),
             limit_pushdown: false,
         }
     }
@@ -167,6 +175,7 @@ impl MeteredExec {
             op_stats: self.op_stats.clone(),
             footers: self.footers.clone(),
             read_ahead: self.read_ahead.clone(),
+            loads_started: AtomicBool::new(false),
             limit_pushdown: self.limit_pushdown,
         })
     }
@@ -340,12 +349,19 @@ impl ExecutionPlan for MeteredExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        // The plan is final now, so start read-ahead with the scan's filter
-        // (join filters included) and its files.
+        // The plan is final now. Every partition hands read-ahead the scan's
+        // filter (join filters included) before it opens a file, since
+        // partitions start side by side; the first also starts the files'
+        // page-index loads.
         if let Some(read_ahead) = &self.read_ahead
             && let Some(scan) = file_scan(&self.input)
         {
-            read_ahead.start(scan);
+            if let Some(predicate) = scan.file_source().filter() {
+                read_ahead.set_predicate(predicate, scan.expr_adapter_factory.clone());
+            }
+            if !self.loads_started.swap(true, Ordering::AcqRel) {
+                read_ahead.load_page_indexes(scan);
+            }
         }
         let inner = self.input.execute(partition, context)?;
         Ok(Box::pin(MeteredStream {

@@ -729,6 +729,11 @@ impl DiskCacheStore {
                 OpenOptions { verify_crc: false },
             )
             .await?;
+            // The FTS hole leaves the dictionary out once the header says
+            // where the postings start.
+            if let (Some((fts_offset, _)), Some(fts)) = (offsets.fts, lazy_reader.fts()) {
+                block_source_arc.set_fts_postings_start(fts_offset + fts.postings_start());
+            }
             (lazy_reader, total_size, whole_file, block_source_arc)
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
@@ -1742,6 +1747,7 @@ mod tests {
                     EntryAccounting, fetch::*, sources::mmap_readonly_with_handle, test_support::*,
                 },
             },
+            writer::build_subsection_offsets,
         },
         test_helpers::fault_storage::{FaultOp, FaultStorage},
     };
@@ -3300,6 +3306,35 @@ mod tests {
         assert_eq!(tier, OpenTier::Lazy, "the next open rides the entry");
         assert!(Arc::ptr_eq(&first, &second), "the same reader");
         assert_eq!(store.stats().n_cold_fetches, 1, "one cold fetch for both");
+    }
+
+    /// A known-size lazy open learns where the FTS postings start, so the term
+    /// dictionary before them fills blocks: a second read of it makes no GET.
+    #[tokio::test]
+    async fn a_lazy_open_reads_the_fts_dictionary_once() {
+        let (_dir, store, recording) = store_over_recording();
+        let uri = SuperfileUri::new_v4();
+        let bytes = fts_superfile_bytes();
+        let mut offsets = build_subsection_offsets(&bytes).expect("offsets");
+        offsets.open_blob.clear();
+        put_superfile(&store, &uri, bytes).await;
+        let reader = store
+            .open_for_query(
+                &uri,
+                &uri.storage_path(),
+                Some(&offsets),
+                None,
+                ReadIntent::Stream,
+            )
+            .await
+            .expect("lazy open");
+        let fts = reader.fts().expect("an FTS index");
+        let before = recording.n_ranges();
+        fts.dict_bytes_async().await.expect("dictionary");
+        let first = recording.n_ranges();
+        assert!(first > before, "the first read fetches the dictionary");
+        fts.dict_bytes_async().await.expect("dictionary again");
+        assert_eq!(recording.n_ranges(), first, "the second read is local");
     }
 
     #[tokio::test]

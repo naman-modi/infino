@@ -21,7 +21,7 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     thread::available_parallelism,
 };
 
@@ -579,6 +579,16 @@ pub struct FtsReader {
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
     verify_crc: bool,
+    /// The dictionary while a caller holds a [`DictionaryScope`]: every
+    /// dictionary read meanwhile shares one fetch. Shared by every clone.
+    dictionary: Arc<Mutex<Weak<OnceCell<Bytes>>>>,
+}
+
+/// Keeps a reader's dictionary while held (see
+/// [`FtsReader::dictionary_scope`]); the bytes go when the last scope on the
+/// reader drops.
+pub(crate) struct DictionaryScope {
+    _dictionary: Arc<OnceCell<Bytes>>,
 }
 
 /// The error for a short-form term body the decoder refuses.
@@ -1119,6 +1129,7 @@ impl FtsReader {
             doc_map,
             doc_map_region,
             verify_crc: opts.verify_crc,
+            dictionary: Arc::default(),
         })
     }
 
@@ -1340,7 +1351,50 @@ impl FtsReader {
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
     /// runtime (no sync bridge).
+    ///
+    /// While a [`DictionaryScope`] is held, every call shares one fetch: a
+    /// query plan reads the dictionary once per term leaf, and a cold file
+    /// would pay a GET for each.
     pub(crate) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
+        let scoped = self
+            .dictionary
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade();
+        match scoped {
+            Some(dictionary) => dictionary
+                .get_or_try_init(|| self.fetch_dict())
+                .await
+                .cloned(),
+            None => self.fetch_dict().await,
+        }
+    }
+
+    /// Share one dictionary fetch among this reader's dictionary reads until
+    /// the scope is dropped. Nothing is read until a read needs it, and a
+    /// failed read is not kept.
+    pub(crate) fn dictionary_scope(&self) -> DictionaryScope {
+        let mut slot = self
+            .dictionary
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dictionary = slot.upgrade().unwrap_or_else(|| {
+            let dictionary = Arc::new(OnceCell::new());
+            *slot = Arc::downgrade(&dictionary);
+            dictionary
+        });
+        DictionaryScope {
+            _dictionary: dictionary,
+        }
+    }
+
+    /// Where the postings start, as an offset into the FTS blob (not the
+    /// file); the header and term dictionary lie before them.
+    pub(crate) fn postings_start(&self) -> u64 {
+        self.postings_range.start as u64
+    }
+
+    async fn fetch_dict(&self) -> Result<Bytes, FtsError> {
         self.source
             .range_async(self.dict_range.clone())
             .await
@@ -4788,6 +4842,34 @@ mod tests {
             0,
             "the norms are resident"
         );
+    }
+
+    /// While a dictionary scope is held, every dictionary read of the reader
+    /// and its clones shares one fetch. Once it is dropped, nothing is kept.
+    #[tokio::test]
+    async fn a_dictionary_scope_shares_one_fetch_until_dropped() {
+        let (blob, json) = build_blob();
+        let recording = Arc::new(RecordingSource {
+            inner: BytesLazyByteSource::new(blob),
+            ranges: Mutex::new(Vec::new()),
+        });
+        let src: Arc<dyn LazyByteSource> = recording.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        let dictionary = r.dict_range.clone();
+        let reads = || recording.touches(0, &dictionary);
+
+        let scope = r.dictionary_scope();
+        let clone = r.clone();
+        for reader in [&r, &clone, &r] {
+            reader.term_dfs("body", &["rust"]).await.expect("dfs");
+        }
+        assert_eq!(reads(), 1, "one fetch serves the scope");
+
+        drop(scope);
+        r.term_dfs("body", &["rust"]).await.expect("dfs");
+        assert_eq!(reads(), 2, "the scope kept nothing");
     }
 
     /// The term-index pass reads the dictionary once per superfile: the

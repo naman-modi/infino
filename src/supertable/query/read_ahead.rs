@@ -74,7 +74,6 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
-use dashmap::DashMap;
 use datafusion::{
     common::runtime::SpawnedTask,
     datasource::{
@@ -88,9 +87,7 @@ use datafusion::{
         },
     },
     object_store::path::Path as ObjPath,
-    physical_expr::{
-        PhysicalExpr, PhysicalExprSimplifier, expressions::Column, utils::collect_columns,
-    },
+    physical_expr::{PhysicalExpr, PhysicalExprSimplifier},
     physical_expr_adapter::{DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory},
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::metrics::ExecutionPlanMetricsSet,
@@ -176,12 +173,9 @@ pub(crate) trait FileFooter: fmt::Debug + Send + Sync {
     /// The footer, with whatever page index earlier reads loaded.
     fn metadata(&self) -> Arc<ParquetMetaData>;
 
-    /// The footer with the page index a read filtering `filter_columns`
-    /// needs (see [`SuperfileReader::parquet_metadata_with_page_index`]).
-    fn with_page_index<'a>(
-        &'a self,
-        filter_columns: &'a [usize],
-    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>>;
+    /// The footer with its page index, loaded on first use (see
+    /// [`SuperfileReader::parquet_metadata_with_page_index`]).
+    fn with_page_index(&self) -> BoxFuture<'_, ParquetResult<Arc<ParquetMetaData>>>;
 }
 
 impl FileFooter for SuperfileReader {
@@ -189,12 +183,9 @@ impl FileFooter for SuperfileReader {
         self.parquet_metadata()
     }
 
-    fn with_page_index<'a>(
-        &'a self,
-        filter_columns: &'a [usize],
-    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+    fn with_page_index(&self) -> BoxFuture<'_, ParquetResult<Arc<ParquetMetaData>>> {
         async move {
-            self.parquet_metadata_with_page_index(filter_columns)
+            self.parquet_metadata_with_page_index()
                 .await
                 // A query error, so a failed read maps to the same public
                 // error as when planning loaded the index.
@@ -209,16 +200,15 @@ impl FileFooter for SuperfileReader {
 pub(crate) struct ScanReadAhead {
     store: Arc<SuperfileObjectStore>,
     budget: Arc<ConnectionMemoryBudget>,
+    /// The scan's filter, shared with the page-index loads [`Self::load_page_indexes`]
+    /// spawns.
     filter: Arc<ScanFilter>,
     /// The footers of the files the scan reads, by path.
     footers: Arc<ScanFooters>,
-    /// Most page-index loads [`Self::start`] runs at once.
+    /// Most page-index loads [`Self::load_page_indexes`] runs at once.
     loads_in_flight: usize,
-    /// The scan nodes [`Self::start`] ran for, by address: one per node, but
-    /// a `LIMIT` gate runs the first file as a node of its own.
-    started: Mutex<Vec<usize>>,
-    /// The page-index loads [`Self::start`] runs. Dropping the scan drops
-    /// them, which stops what is still loading.
+    /// The page-index loads [`Self::load_page_indexes`] runs. Dropping the
+    /// scan drops them, which stops what is still loading.
     loads: Mutex<Vec<SpawnedTask<()>>>,
     /// Turned off by [`ReadAheadOff`] when a `LIMIT` or top-k can stop the
     /// scan early.
@@ -264,11 +254,9 @@ impl ScanReadAhead {
             filter: Arc::new(ScanFilter {
                 predicate: OnceLock::new(),
                 schema,
-                files: DashMap::new(),
             }),
             footers,
             loads_in_flight,
-            started: Mutex::new(Vec::new()),
             loads: Mutex::new(Vec::new()),
             enabled: AtomicBool::new(true),
             held: AtomicUsize::new(0),
@@ -306,10 +294,10 @@ impl ScanReadAhead {
         self.footers.get(path).map(|footer| footer.file())
     }
 
-    /// Start the scan `scan` once its plan is final: hand readers its filter,
-    /// and load the page index of every file it reads, `loads_in_flight` at a
-    /// time. DataFusion opens a partition's files one after another, so a
-    /// load left to each open would wait a round trip per file:
+    /// Load the page index of every file `scan` reads that needs one, once
+    /// its plan is final, `loads_in_flight` at a time. DataFusion opens a
+    /// partition's files one after another, so a load left to each open
+    /// would wait a round trip per file:
     ///
     /// ```text
     ///   left to each open           started here
@@ -319,30 +307,21 @@ impl ScanReadAhead {
     ///                               open 1: read, open 2: read, ...
     /// ```
     ///
-    /// Each open finds its load done or in flight. Later calls for the same
-    /// scan node only hand over the filter.
-    pub(crate) fn start(&self, scan: &FileScanConfig) {
-        // Partitions start side by side, so each hands over the filter before
-        // it opens a file, not only the first.
-        if let Some(predicate) = scan.file_source().filter() {
-            self.set_predicate(predicate, scan.expr_adapter_factory.clone());
-        }
-        let node = scan as *const FileScanConfig as usize;
-        {
-            let mut started = self.started.lock().unwrap_or_else(PoisonError::into_inner);
-            if started.contains(&node) {
-                return;
-            }
-            started.push(node);
-        }
+    /// Each open finds its load done or in flight. The loads go in the order
+    /// the partitions open files: each one's first file, then each one's
+    /// second, so no partition waits behind another's whole group.
+    pub(crate) fn load_page_indexes(&self, scan: &FileScanConfig) {
+        // Outside a runtime (a plan run by a sync caller) nothing can be
+        // spawned; each open then loads its own file's page index.
         if Handle::try_current().is_err() {
             return;
         }
+        let groups: Vec<&[PartitionedFile]> =
+            scan.file_groups.iter().map(|group| group.files()).collect();
+        let longest = groups.iter().map(|files| files.len()).max().unwrap_or(0);
         let mut seen = HashSet::new();
-        let files: Vec<(PartitionedFile, Arc<dyn FileFooter>)> = scan
-            .file_groups
-            .iter()
-            .flat_map(|group| group.iter())
+        let files: Vec<(PartitionedFile, Arc<dyn FileFooter>)> = (0..longest)
+            .flat_map(|nth| groups.iter().filter_map(move |files| files.get(nth)))
             .filter(|file| self.filter.reads_page_index(file))
             .filter(|file| seen.insert(&file.object_meta.location))
             .filter_map(|file| Some((file.clone(), self.footer(&file.object_meta.location)?)))
@@ -437,16 +416,13 @@ impl ScanReadAhead {
         }
     }
 
-    /// The row-group pruning for the file at `path`. `None` without a filter,
-    /// or if it doesn't convert. Then the scan may skip row groups this
-    /// reader planned, and read-ahead turns off when the reads go out of
-    /// order.
-    fn pruning(
-        &self,
-        path: &ObjPath,
-        meta: &ParquetMetaData,
-    ) -> Option<(PruningPredicate, SchemaRef)> {
-        self.filter.on(path, meta).pruning()
+    /// The row-group pruning for one file ([`file_pruning`] of the filter
+    /// handed over). `None` without a filter, or if it doesn't convert. Then
+    /// the scan may skip row groups this reader planned, and read-ahead turns
+    /// off when the reads go out of order.
+    fn pruning(&self, meta: &ParquetMetaData) -> Option<(PruningPredicate, SchemaRef)> {
+        let (predicate, adapter) = self.filter.predicate.get()?;
+        file_pruning(predicate, adapter, &self.filter.schema, meta)
     }
 
     /// Reserve `bytes`, or `None` if that takes the budget past
@@ -482,65 +458,41 @@ impl ScanReadAhead {
     }
 }
 
-/// A scan's filter, and what it is on each file. Shared by the scan's readers
-/// and its page-index loads.
+/// A scan's filter, shared by the scan's readers and its page-index loads.
 struct ScanFilter {
     /// The scan's filter (including a join's filter that fills in while the
     /// join runs), and the adapter that maps it onto each file's schema. Set
-    /// when the scan starts, see [`ScanReadAhead::start`]; unset without one.
+    /// when the scan runs, see [`ScanReadAhead::set_predicate`]; unset without
+    /// one.
     predicate: OnceLock<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExprAdapterFactory>)>,
     /// The table's schema, which the filter is written against.
     schema: SchemaRef,
-    /// The filter on each file, worked out once per file.
-    files: DashMap<ObjPath, Arc<FileFilter>>,
-}
-
-/// The scan's filter on one file.
-struct FileFilter {
-    /// The filter written against the file's own schema (a renamed column
-    /// under its old name), and that schema. `None` without a filter.
-    mapped: Option<(Arc<dyn PhysicalExpr>, SchemaRef)>,
-    /// The file's stored columns the filter names; their column index lets
-    /// the scan skip pages.
-    columns: Box<[usize]>,
 }
 
 impl ScanFilter {
     /// Whether a read of `file` needs its page index: a filter can skip
     /// pages, and so can reading only some rows (index candidates, deleted
-    /// rows). A read of whole row groups needs none.
+    /// rows). A read of whole row groups needs none, and neither does a file
+    /// whose access plan reads no row group (no index candidate in it).
     fn reads_page_index(&self, file: &PartitionedFile) -> bool {
-        self.predicate.get().is_some() || selects_rows(file)
+        let accesses = file
+            .extension::<ParquetAccessPlan>()
+            .map(ParquetAccessPlan::inner);
+        match accesses {
+            Some(accesses) if accesses.iter().all(|a| matches!(a, RowGroupAccess::Skip)) => false,
+            Some(accesses)
+                if accesses
+                    .iter()
+                    .any(|a| matches!(a, RowGroupAccess::Selection(_))) =>
+            {
+                true
+            }
+            _ => self.predicate.get().is_some(),
+        }
     }
 
-    /// The filter on the file at `path`, worked out the first time it is
-    /// asked for.
-    fn on(&self, path: &ObjPath, meta: &ParquetMetaData) -> Arc<FileFilter> {
-        let filter = self
-            .files
-            .entry(path.clone())
-            .or_insert_with(|| Arc::new(self.map_onto(meta)));
-        Arc::clone(&filter)
-    }
-
-    /// The filter on the file `meta` describes. If the filter doesn't fit the
-    /// file's schema, DataFusion can't skip its pages either, so it names no
-    /// columns.
-    fn map_onto(&self, meta: &ParquetMetaData) -> FileFilter {
-        let mapped = self.predicate.get().and_then(|(predicate, adapter)| {
-            file_predicate(predicate, adapter, &self.schema, meta)
-        });
-        let named = mapped
-            .as_ref()
-            .map(|(mapped, _)| collect_columns(mapped))
-            .unwrap_or_default();
-        let named: HashSet<&str> = named.iter().map(Column::name).collect();
-        let columns = stored_columns(meta, |name| named.contains(name)).into();
-        FileFilter { mapped, columns }
-    }
-
-    /// `file`'s metadata with the page index its read needs, or `None` when
-    /// it needs none.
+    /// `file`'s metadata with its page index, or `None` when its read needs
+    /// none.
     async fn page_index(
         &self,
         file: &PartitionedFile,
@@ -549,16 +501,7 @@ impl ScanFilter {
         if !self.reads_page_index(file) {
             return Ok(None);
         }
-        let filter = self.on(&file.object_meta.location, &footer.metadata());
-        footer.with_page_index(&filter.columns).await.map(Some)
-    }
-}
-
-impl FileFilter {
-    /// [`file_pruning`] of this filter, reusing the mapping already made.
-    fn pruning(&self) -> Option<(PruningPredicate, SchemaRef)> {
-        let (mapped, schema) = self.mapped.as_ref()?;
-        pruning_of(Arc::clone(mapped), Arc::clone(schema))
+        footer.with_page_index().await.map(Some)
     }
 }
 
@@ -932,7 +875,7 @@ impl AsyncFileReader for ReadAhead {
     }
 
     /// The footer, with the page index if this read needs one. Usually the
-    /// load already ran, started with the scan ([`ScanReadAhead::start`]).
+    /// load already ran, started with the scan ([`ScanReadAhead::load_page_indexes`]).
     fn get_metadata<'a>(
         &'a mut self,
         _options: Option<&'a ArrowReaderOptions>,
@@ -1348,28 +1291,6 @@ pub(crate) fn file_pruning(
     table: &SchemaRef,
     meta: &ParquetMetaData,
 ) -> Option<(PruningPredicate, SchemaRef)> {
-    let (mapped, schema) = file_predicate(predicate, adapter, table, meta)?;
-    pruning_of(mapped, schema)
-}
-
-/// The pruning of a filter already mapped onto a file's `schema`.
-fn pruning_of(
-    mapped: Arc<dyn PhysicalExpr>,
-    schema: SchemaRef,
-) -> Option<(PruningPredicate, SchemaRef)> {
-    let simplified = PhysicalExprSimplifier::new(&schema).simplify(mapped).ok()?;
-    let pruning = PruningPredicate::try_new(simplified, Arc::clone(&schema)).ok()?;
-    Some((pruning, schema))
-}
-
-/// The filter mapped onto the schema of the file `meta` describes, and that
-/// schema.
-fn file_predicate(
-    predicate: &Arc<dyn PhysicalExpr>,
-    adapter: &Arc<dyn PhysicalExprAdapterFactory>,
-    table: &SchemaRef,
-    meta: &ParquetMetaData,
-) -> Option<(Arc<dyn PhysicalExpr>, SchemaRef)> {
     let file_meta = meta.file_metadata();
     let file_schema = Arc::new(
         parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata()).ok()?,
@@ -1381,35 +1302,9 @@ fn file_predicate(
         .ok()?
         .rewrite(Arc::clone(predicate))
         .ok()?;
-    Some((mapped, schema))
-}
-
-/// The stored columns of the file `meta` describes under the columns `named`
-/// picks. A list or struct column is stored as several, all under its name.
-pub(crate) fn stored_columns(meta: &ParquetMetaData, named: impl Fn(&str) -> bool) -> Vec<usize> {
-    meta.file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(_, stored)| {
-            stored
-                .path()
-                .parts()
-                .first()
-                .is_some_and(|name| named(name))
-        })
-        .map(|(column, _)| column)
-        .collect()
-}
-
-/// Whether `file`'s access plan reads only some rows of a row group.
-fn selects_rows(file: &PartitionedFile) -> bool {
-    file.extension::<ParquetAccessPlan>().is_some_and(|plan| {
-        plan.inner()
-            .iter()
-            .any(|access| matches!(access, RowGroupAccess::Selection(_)))
-    })
+    let simplified = PhysicalExprSimplifier::new(&schema).simplify(mapped).ok()?;
+    let pruning = PruningPredicate::try_new(simplified, Arc::clone(&schema)).ok()?;
+    Some((pruning, schema))
 }
 
 /// `plan` with the row groups of the file `meta` describes, at `location`,
@@ -1445,7 +1340,7 @@ fn planned_order(scan: &ScanReadAhead, file: &PartitionedFile, meta: &ParquetMet
         .unwrap_or_else(|| ParquetAccessPlan::new_all(groups.len()));
     let file_meta = meta.file_metadata();
     let location = file.object_meta.location.as_ref();
-    let pruning = scan.pruning(&file.object_meta.location, meta);
+    let pruning = scan.pruning(meta);
     let mut plan = match &pruning {
         Some(pruning) => statistics_pruned(plan, meta, pruning, location),
         None => plan,
@@ -1643,7 +1538,6 @@ pub(crate) mod fixture {
         errors::Result as ParquetResult,
         file::{
             metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
-            page_index::column_index::ColumnIndexMetaData,
             properties::WriterProperties,
         },
         schema::types::ColumnPath,
@@ -1666,23 +1560,8 @@ pub(crate) mod fixture {
         },
     };
 
-    /// The stored columns `meta` has a real column index for.
-    pub(crate) fn columns_with_column_index(meta: &ParquetMetaData) -> Vec<usize> {
-        let Some(index) = meta.column_index() else {
-            return Vec::new();
-        };
-        (0..meta.file_metadata().schema_descr().num_columns())
-            .filter(|&column| {
-                index
-                    .iter()
-                    .any(|row_group| !matches!(row_group[column], ColumnIndexMetaData::NONE))
-            })
-            .collect()
-    }
-
-    /// A plain Parquet file's metadata, served the way a superfile reader
-    /// serves it: the whole offset index, and the column index of only the
-    /// columns asked for.
+    /// A plain Parquet file's metadata, page index included, served as a
+    /// superfile reader serves its own.
     #[derive(Debug)]
     pub(crate) struct Footer(pub(crate) Arc<ParquetMetaData>);
 
@@ -1691,22 +1570,8 @@ pub(crate) mod fixture {
             Arc::clone(&self.0)
         }
 
-        fn with_page_index<'a>(
-            &'a self,
-            filter_columns: &'a [usize],
-        ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-            let mut builder = self.0.as_ref().clone().into_builder();
-            let column_index = builder.take_column_index().map(|mut row_groups| {
-                for row_group in &mut row_groups {
-                    for (column, cell) in row_group.iter_mut().enumerate() {
-                        if !filter_columns.contains(&column) {
-                            *cell = ColumnIndexMetaData::NONE;
-                        }
-                    }
-                }
-                row_groups
-            });
-            let served = Arc::new(builder.set_column_index(column_index).build());
+        fn with_page_index(&self) -> BoxFuture<'_, ParquetResult<Arc<ParquetMetaData>>> {
+            let served = Arc::clone(&self.0);
             async move { Ok(served) }.boxed()
         }
     }

@@ -755,7 +755,7 @@ pub(crate) mod test_support {
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             BytesLazyByteSource, LazyByteSource,
-            builder::{BuilderOptions, SuperfileBuilder},
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         },
         supertable::{
             manifest::SuperfileUri,
@@ -996,6 +996,39 @@ pub(crate) mod test_support {
         let titles = LargeStringArray::from(vec!["alpha"]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Rows in [`fts_superfile_bytes`], each with its own word, so the term
+    /// dictionary spans several cache blocks.
+    const FTS_ROWS: u64 = 20_000;
+
+    /// A superfile with `title` FTS-indexed, every row a word of its own and
+    /// one shared word.
+    pub(crate) fn fts_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let titles: Vec<String> = (0..FTS_ROWS)
+            .map(|i| format!("word{i:05} shared"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids((1..=FTS_ROWS).collect::<Vec<u64>>())),
+                Arc::new(LargeStringArray::from(titles)),
+            ],
+        )
+        .expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }
